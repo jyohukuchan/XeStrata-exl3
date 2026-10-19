@@ -258,6 +258,41 @@ int main(int argc, char** argv) {
                         item.output_axis.transform == strata::artifact::exl3::AxisTransform::slices)
                         indexer_split = true;
                 useful = indexer_split && has_nontrivial_v_map(map, strata::artifact::exl3::ProjectionKind::gdn_out);
+                if (useful) {
+                    // Qwen3.8 MTP is a separate one-layer map.  Build it from
+                    // the trunk metadata without enabling the legacy public
+                    // include_mtp switch (that switch remains Qwen3.5-only).
+                    strata::artifact::exl3::ModelMap mtp;
+                    std::string mtp_err;
+                    const bool mtp_built = strata::artifact::exl3::build_qwen38_mtp_map(archive, map, mtp, mtp_err);
+                    size_t experts = 0, fc_count = 0, qsa_count = 0, hc_count = 0, add_one = 0;
+                    for (const auto& item : mtp.projections) {
+                        experts += item.kind == strata::artifact::exl3::ProjectionKind::expert_gate ||
+                                   item.kind == strata::artifact::exl3::ProjectionKind::expert_up ||
+                                   item.kind == strata::artifact::exl3::ProjectionKind::expert_down;
+                        fc_count += item.kind == strata::artifact::exl3::ProjectionKind::mtp_fc;
+                        qsa_count += item.kind == strata::artifact::exl3::ProjectionKind::qsa_q ||
+                               item.kind == strata::artifact::exl3::ProjectionKind::qsa_k ||
+                               item.kind == strata::artifact::exl3::ProjectionKind::qsa_v ||
+                               item.kind == strata::artifact::exl3::ProjectionKind::qsa_out ||
+                               item.kind == strata::artifact::exl3::ProjectionKind::qsa_indexer_q ||
+                               item.kind == strata::artifact::exl3::ProjectionKind::qsa_indexer_k;
+                        hc_count += item.kind == strata::artifact::exl3::ProjectionKind::hc_norm ||
+                              item.kind == strata::artifact::exl3::ProjectionKind::hc_down ||
+                              item.kind == strata::artifact::exl3::ProjectionKind::hc_up ||
+                              item.kind == strata::artifact::exl3::ProjectionKind::hc_inject;
+                        add_one += item.value_transform == strata::artifact::exl3::ValueTransform::add_one;
+                    }
+                    const auto* fc = archive.find_linear("mtp.fc_embedding");
+                    const auto* shared = archive.find_linear("mtp.layers.0.mlp.shared_expert.gate_proj");
+                    const auto* expert = archive.find_linear("mtp.layers.0.mlp.experts.0.gate_proj");
+                    const bool mixed_bits = fc != nullptr && shared != nullptr && expert != nullptr &&
+                                            fc->bits == 4 && shared->bits == 5 && expert->bits == 3;
+                    useful = mtp_built && mtp.unsupported.empty() && mtp.geometry.layers == 1 &&
+                             experts == static_cast<size_t>(3 * map.geometry.experts) && fc_count == 2 && qsa_count == 6 &&
+                             hc_count == 8 && add_one == 8 && mixed_bits;
+                    if (!useful && !mtp_err.empty()) std::cerr << mtp_err << '\n';
+                }
             }
             useful = useful && has_mapping(map, strata::artifact::exl3::ProjectionKind::embedding) &&
                      has_mapping(map, strata::artifact::exl3::ProjectionKind::lm_head);

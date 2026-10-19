@@ -139,6 +139,12 @@ struct ModelMap {
 /// for recognized but not yet engine-compatible variants.
 bool build_model_map(const Archive& archive, ModelMap& result, std::string& err, bool include_mtp = false);
 
+/// Build the single Qwen3.8 MTP decoder map from an already validated trunk
+/// map.  The MTP layer keeps its packed/raw component identities and uses a
+/// one-layer `mtp.layers` source prefix; the final combine-less mixer is
+/// consumed by the existing source-prefix-derived WeightSet path.
+bool build_qwen38_mtp_map(const Archive& archive, const ModelMap& trunk, ModelMap& result, std::string& err);
+
 /// Build the pinned Qwen V-head reorder independently of an archive. The
 /// returned element permutation is target-to-source and the block map is
 /// target-block-to-source-block. This is also useful to validate a loader's

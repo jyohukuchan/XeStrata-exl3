@@ -265,6 +265,70 @@ int main() {
         if (graph != nullptr) strata::gpu::graph_destroy(graph);
         if (stream != nullptr) strata::gpu::stream_destroy(stream);
         restore_resident_shards();
+
+        // The all-resident graph reads device IDs on every replay, without a host plan update.
+        strata::core::Exl3ExpertRuntime resident;
+        if (!resident.open(source, pool, max_tokens, k, {{0, 0}, {0, 1}, {1, 0}, {1, 1}}, err) ||
+            !resident.fully_resident() || runtime.fully_resident()) {
+            std::fprintf(stderr, "all-resident runtime open failed: %s\n", err.c_str());
+            ++failures;
+        } else {
+            std::vector<float> tight_x(static_cast<size_t>(max_tokens * hidden));
+            for (int64_t row = 0; row < max_tokens; ++row)
+                std::copy_n(x.data() + row * ldx, hidden, tight_x.data() + row * hidden);
+            float* d_tight_x = device.upload(tight_x);
+            int32_t* d_ids = device.upload(std::vector<int32_t>(ids, ids + max_tokens * k));
+            std::vector<float> direct_output(expected.size(), 24680.5f);
+            float* d_direct_output = device.upload(direct_output);
+            auto resident_stream = strata::gpu::stream_create();
+            strata::gpu::Graph* resident_graph = nullptr;
+            bool resident_ok = resident_stream != nullptr;
+            if (resident_ok) {
+                auto& resident_queue = strata::core::Runtime::get().stream(resident_stream);
+                resident_ok = strata::gpu::begin_capture(resident_stream) &&
+                    resident.record_resident_enqueue(resident_queue, 0, d_tight_x, d_ids, max_tokens,
+                                                       d_direct_output, ldy, err) &&
+                    strata::gpu::end_capture(resident_stream, &resident_graph) && resident_graph != nullptr;
+            }
+            const std::vector<std::vector<int32_t>> replay_ids{{0, 1, 1, 0}, {1, 1, 0, 0}, {0, -1, 2, 0}};
+            for (size_t replay = 0; resident_ok && replay < replay_ids.size(); ++replay) {
+                std::fill(direct_output.begin(), direct_output.end(), 24680.5f);
+                strata::parity::copy_in(d_ids, replay_ids[replay].data(), replay_ids[replay].size());
+                strata::parity::copy_in(d_direct_output, direct_output.data(), direct_output.size());
+                resident_ok = strata::gpu::graph_launch(resident_graph, resident_stream) &&
+                              strata::gpu::stream_sync(resident_stream);
+                if (!resident_ok) break;
+                strata::parity::copy_out(direct_output.data(), d_direct_output, direct_output.size());
+                for (int64_t entry = 0; entry < max_tokens * k; ++entry) {
+                    const int32_t expert = replay_ids[replay][static_cast<size_t>(entry)];
+                    const bool valid = expert >= 0 && expert < 2;
+                    if (valid && strata::kernels::cpu::exl3::expert(views[static_cast<size_t>(expert)],
+                            tight_x.data() + (entry / k) * hidden, hidden,
+                            expected.data() + entry * ldy, ldy, 1) != strata::kernels::cpu::exl3::Status::ok)
+                        resident_ok = false;
+                    for (int64_t col = 0; col < ldy; ++col) {
+                        const size_t at = static_cast<size_t>(entry * ldy + col);
+                        const bool matches = col >= hidden ? direct_output[at] == 24680.5f :
+                            valid ? std::isfinite(direct_output[at]) && close(direct_output[at], expected[at]) :
+                                    std::isnan(direct_output[at]);
+                        if (!matches) {
+                            std::fprintf(stderr, "resident replay %zu row %lld col %lld: got %.9g\n",
+                                         replay, (long long) entry, (long long) col, (double) direct_output[at]);
+                            resident_ok = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (!resident_ok) {
+                std::fprintf(stderr, "all-resident device-plan replay failed: %s\n", err.c_str());
+                ++failures;
+            } else {
+                std::printf("all-resident device-plan replay/duplicates/invalid guards: OK\n");
+            }
+            if (resident_graph != nullptr) strata::gpu::graph_destroy(resident_graph);
+            if (resident_stream != nullptr) strata::gpu::stream_destroy(resident_stream);
+        }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "exl3_expert_runtime_test: %s\n", e.what());
         ++failures;

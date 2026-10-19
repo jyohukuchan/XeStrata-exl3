@@ -625,4 +625,94 @@ bool build_model_map(const Archive& archive, ModelMap& result, std::string& err,
     }
 }
 
+
+bool build_qwen38_mtp_map(const Archive& archive, const ModelMap& trunk, ModelMap& result, std::string& err) {
+    result = ModelMap{};
+    err.clear();
+    if (trunk.family != ModelFamily::qwen38) {
+        err = "EXL3 MTP map: trunk map is not Qwen3.8";
+        return false;
+    }
+    if (trunk.geometry.layers <= 0 || trunk.geometry.hidden_size <= 0 || trunk.geometry.experts <= 0 ||
+        trunk.geometry.experts_per_token <= 0 || trunk.geometry.hc_count <= 0 || trunk.geometry.hc_rank <= 0) {
+        err = "EXL3 MTP map: trunk geometry is incomplete";
+        return false;
+    }
+    const auto g = trunk.geometry;
+    if (g.mtp_layers != 1 || trunk.geometry.dedicated_embedding) {
+        err = "EXL3 MTP map: exactly one shared-embedding MTP layer is required";
+        return false;
+    }
+    result.family = ModelFamily::qwen38;
+    result.geometry = g;
+    result.geometry.layers = 1;
+    result.geometry.mtp_layers = 0;
+    result.source_prefix = "mtp.layers";
+    const int64_t N = g.hidden_size, HC = g.hc_count, LR = g.hc_rank;
+    const int64_t Q = g.q_heads * g.head_dim, KV = g.kv_heads * g.head_dim;
+    const int64_t IDXQ = g.indexer_heads * g.indexer_head_dim;
+    const int64_t IDXK = g.indexer_kv_heads * g.indexer_head_dim;
+    const std::string p = "mtp.layers.0.";
+    const std::string cp = "blk.0.";
+    add_linear(result, archive, ProjectionKind::mtp_fc, -1, -1, "mtp.fc_embedding", "mtp.fc_embedding.weight", N, N);
+    add_linear(result, archive, ProjectionKind::mtp_fc, -1, -1, "mtp.fc_hidden", "mtp.fc_hidden.weight", N, N);
+    add_aux(result, archive, -1, "mtp.pre_fc_norm_embedding", "mtp.pre_fc_norm_embedding.weight", N,
+            ValueTransform::add_one);
+    add_aux(result, archive, -1, "mtp.pre_fc_norm_hidden", "mtp.pre_fc_norm_hidden.weight", N * HC,
+            ValueTransform::add_one);
+
+    auto add_hc = [&](const char* source_prefix, const char* canonical_prefix) {
+        add_aux(result, archive, 0, p + source_prefix + std::string(".hc_norm"),
+                cp + canonical_prefix + std::string("_norm.weight"), N * HC, ValueTransform::add_one,
+                {}, ProjectionKind::hc_norm);
+        add_raw(result, archive, ProjectionKind::hc_down, 0, -1,
+                p + source_prefix + std::string(".input_mix_weight_down"),
+                cp + canonical_prefix + std::string("_down.weight"), N * HC, LR);
+        add_raw(result, archive, ProjectionKind::hc_up, 0, -1,
+                p + source_prefix + std::string(".input_mix_weight_up"),
+                cp + canonical_prefix + std::string("_up.weight"), LR, N * HC);
+        add_raw(result, archive, ProjectionKind::hc_inject, 0, -1,
+                p + source_prefix + std::string(".block_inject_weight"),
+                cp + canonical_prefix + std::string("_inject.weight"), N * HC, HC);
+    };
+    add_hc("attn_hyper_connection", "hc_attn");
+    add_hc("mlp_hyper_connection", "hc_ffn");
+
+    const std::string attn = p + "self_attn.";
+    add_linear(result, archive, ProjectionKind::qsa_q, 0, -1, attn + "q_proj", cp + "attn_q.weight", N, 2 * Q);
+    add_linear(result, archive, ProjectionKind::qsa_k, 0, -1, attn + "k_proj", cp + "attn_k.weight", N, KV);
+    add_linear(result, archive, ProjectionKind::qsa_v, 0, -1, attn + "v_proj", cp + "attn_v.weight", N, KV);
+    add_linear(result, archive, ProjectionKind::qsa_out, 0, -1, attn + "o_proj", cp + "attn_output.weight", Q, N);
+    add_aux(result, archive, 0, attn + "q_norm", cp + "attn_q_norm.weight", g.head_dim, ValueTransform::add_one);
+    add_aux(result, archive, 0, attn + "k_norm", cp + "attn_k_norm.weight", g.head_dim, ValueTransform::add_one);
+    const std::string indexer = attn + "indexer.index_qk_proj";
+    add_linear(result, archive, ProjectionKind::qsa_indexer_q, 0, -1, indexer, cp + "indexer.q_proj.weight", N,
+               IDXQ, MappingTransform::output_slice, {{0, 0, IDXQ}});
+    add_linear(result, archive, ProjectionKind::qsa_indexer_k, 0, -1, indexer, cp + "indexer.k_proj.weight", N,
+               IDXK, MappingTransform::output_slice, {{IDXQ, 0, IDXK}});
+    add_aux(result, archive, 0, attn + "indexer.q_layernorm", cp + "indexer.q_norm.weight",
+            g.indexer_head_dim, ValueTransform::add_one);
+    add_aux(result, archive, 0, attn + "indexer.k_layernorm", cp + "indexer.k_norm.weight",
+            g.indexer_head_dim, ValueTransform::add_one);
+
+    const std::string mlp = p + "mlp.";
+    add_raw(result, archive, ProjectionKind::router, 0, -1, mlp + "gate", cp + "ffn_gate_inp.weight", N, g.experts);
+    add_raw(result, archive, ProjectionKind::shared_scalar, 0, -1, mlp + "shared_expert_gate",
+            cp + "ffn_gate_inp_shexp.weight", N, 1);
+    add_linear(result, archive, ProjectionKind::shared_gate, 0, -1, mlp + "shared_expert.gate_proj",
+               cp + "ffn_gate_shexp.weight", N, g.shared_intermediate);
+    add_linear(result, archive, ProjectionKind::shared_up, 0, -1, mlp + "shared_expert.up_proj",
+               cp + "ffn_up_shexp.weight", N, g.shared_intermediate);
+    add_linear(result, archive, ProjectionKind::shared_down, 0, -1, mlp + "shared_expert.down_proj",
+               cp + "ffn_down_shexp.weight", g.shared_intermediate, N);
+    for (int64_t expert = 0; expert < g.experts; ++expert) {
+        const std::string ep = mlp + "experts." + std::to_string(expert) + ".";
+        const std::string ec = cp + "experts." + std::to_string(expert) + ".";
+        add_linear(result, archive, ProjectionKind::expert_gate, 0, expert, ep + "gate_proj", ec + "gate_proj", N, g.moe_intermediate);
+        add_linear(result, archive, ProjectionKind::expert_up, 0, expert, ep + "up_proj", ec + "up_proj", N, g.moe_intermediate);
+        add_linear(result, archive, ProjectionKind::expert_down, 0, expert, ep + "down_proj", ec + "down_proj", g.moe_intermediate, N);
+    }
+    return true;
+}
+
 }  // namespace strata::artifact::exl3

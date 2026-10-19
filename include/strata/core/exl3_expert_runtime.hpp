@@ -55,6 +55,12 @@ public:
     /// the caller updates before launching the graph.
     bool record_enqueue(sycl::queue& queue, const float* device_fp32_x, int64_t ldx, float* gpu_output, int64_t ldy,
                         std::string& err);
+    /// Record an all-resident device route-plan builder followed by the grouped kernel.  The route IDs are device
+    /// data written by MoeWindow::publish; no host plan copy, allocation, callback, or CPU miss path is involved.
+    /// The in-order queue serializes reuse of the persistent plan and scratch. The owner must outlive replay.
+    bool record_resident_enqueue(sycl::queue& queue, int64_t layer, const float* device_fp32_x,
+                                 const int32_t* device_ids, int64_t n_tokens, float* gpu_output, int64_t ldy,
+                                 std::string& err);
     /// Publish only the hit entry list through the legacy window sink so its CPU-row merge can reuse the existing
     /// mapped plan and flag protocol.  EXL3's own grouped plan remains in the persistent runtime images.
     bool publish_window_plan(GpuPlanSink& sink, std::string& err) const;
@@ -77,6 +83,8 @@ public:
     size_t grouped_scratch_elements() const { return scratch_elements_; }
     const ExpertCache& cache() const { return cache_; }
     const Exl3ExpertSource* source() const { return source_; }
+    /// True only when every (layer, expert) pair was admitted to the persistent device cache at open().
+    bool fully_resident() const { return all_resident_; }
 
     /// Device plan fields exposed for the future MoeWindow merge seam.
     const uint64_t* gpu_blob_base() const { return d_blob_base_; }
@@ -111,6 +119,7 @@ private:
     bool prepared_ = false;
     bool cpu_ready_ = false;
     bool pending_gpu_ = false;
+    bool all_resident_ = false;
     int64_t prepared_layer_ = -1;
     int64_t miss_entries_ = 0;
     int64_t hit_entries_ = 0;
@@ -139,6 +148,9 @@ private:
     int32_t* d_dst_ = nullptr;
     int32_t* d_ngroups_ = nullptr;
     int32_t* d_nentries_ = nullptr;
+    uint64_t* d_pair_blob_base_ = nullptr;   ///< [n_layers*n_expert], uploaded once for the all-resident route builder
+    int32_t* d_pair_format_index_ = nullptr; ///< [n_layers*n_expert], uploaded once for the all-resident route builder
+    int64_t pair_count_ = 0;
     float* d_scratch_ = nullptr;
     size_t scratch_elements_ = 0;
     strata::kernels::exl3::GroupedPlan device_plan_{};

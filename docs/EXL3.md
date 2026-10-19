@@ -125,7 +125,11 @@ strata --exl3 /path/to/exl3-model --metadata-gguf /path/to/metadata-only.gguf \
 Packed projections reorder H128 blocks, moving GDN V-heads to canonical order. Raw projections use explicit
 axis maps and retain their original F16/BF16/F32 dtype. Norm `+1`, GDN `A_log` `-exp`, and widening auxiliary
 weights required by F32 kernels are separate operations. Expert residency derives from actual blob bytes
-and device capacity and connects to the existing segmented graphs.
+and device capacity. Partial residency uses the existing segmented graphs. When all `(layer, expert)` pairs
+are GPU resident, the graph builds its route plan from device IDs without CPU ring service. The same owner's
+plan/scratch is reused sequentially on an in-order queue. `STRATA_EXL3_RESIDENT_GRAPH=0` or
+`STRATA_VERIFY_SEGMENTED=1` selects the earlier path for comparison. On devices supporting SG32, grouped
+expert H128 transforms use a register FWHT; other devices retain the existing transform.
 
 AR uses `--prompt-chunk 0 --spec 0`; `--spec 1` also disables MTP. A positive `--prompt-chunk` runs prefill
 in decode windows bounded by `max-t`, returning the last row. Compressed weights remain compressed; this is
@@ -199,7 +203,8 @@ stream before capture; teardown waits for the device and restores only its own r
 experts, PLE and MTP connect through separate owners.
 `read_exl3_model_spec()` reads Qwen3.5/Qwen3.8 geometry directly from the archive's HF config without GGUF
 weights or a synthetic pack. It separates trunk and MTP; requesting Qwen3.8 MTP is rejected until
-its dedicated loader is connected.
+its dedicated loader is connected. `build_qwen38_mtp_map()` validates FC, QSA/indexer, HC and shared/routed
+experts as a separate one-layer map, never implicitly adding them to the trunk map.
 `Exl3Ple` owns PLE key/value projections in packed/raw storage, applies `+1` to its three norms for FP32 kernels,
 and retains the original F16 convolution. Layer/verify paths pass preprojected FP32 keys and values to the existing
 PLE post-ops. Loading validates norm, convolution and projection shapes and the PLE config.

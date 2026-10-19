@@ -155,6 +155,49 @@ inline int hadamard_sign(int row, int col) {
     return parity == 0 ? 1 : -1;
 }
 
+bool grouped_cooperative_capability(const sycl::queue& queue);
+
+inline void fwht128_registers(const sycl::sub_group& sg, int lane, float& a0, float& a1, float& a2, float& a3) {
+    for (int step = 1; step < 32; step <<= 1) {
+        const float p0 = sycl::permute_group_by_xor(sg, a0, step);
+        const float p1 = sycl::permute_group_by_xor(sg, a1, step);
+        const float p2 = sycl::permute_group_by_xor(sg, a2, step);
+        const float p3 = sycl::permute_group_by_xor(sg, a3, step);
+        a0 = (lane & step) ? p0 - a0 : a0 + p0;
+        a1 = (lane & step) ? p1 - a1 : a1 + p1;
+        a2 = (lane & step) ? p2 - a2 : a2 + p2;
+        a3 = (lane & step) ? p3 - a3 : a3 + p3;
+    }
+    const float b0 = a0 + a1, b1 = a0 - a1, b2 = a2 + a3, b3 = a2 - a3;
+    a0 = b0 + b2; a1 = b1 + b3; a2 = b0 - b2; a3 = b1 - b3;
+}
+
+inline void fwht128_input(const sycl::sub_group& sg, int lane, const float* input, const uint16_t* suh,
+                          int64_t block, float& a0, float& a1, float& a2, float& a3) {
+    a0 = input[block + lane] * f32_from_f16(suh[block + lane]);
+    a1 = input[block + lane + 32] * f32_from_f16(suh[block + lane + 32]);
+    a2 = input[block + lane + 64] * f32_from_f16(suh[block + lane + 64]);
+    a3 = input[block + lane + 96] * f32_from_f16(suh[block + lane + 96]);
+    fwht128_registers(sg, lane, a0, a1, a2, a3);
+    a0 *= kHadamardScale; a1 *= kHadamardScale; a2 *= kHadamardScale; a3 *= kHadamardScale;
+}
+
+inline void fwht128_output(const sycl::sub_group& sg, int lane, const float* dot, const uint16_t* svh,
+                           const uint16_t* bias, int64_t block, bool add_bias, float& a0, float& a1, float& a2,
+                           float& a3) {
+    a0 = dot[block + lane]; a1 = dot[block + lane + 32];
+    a2 = dot[block + lane + 64]; a3 = dot[block + lane + 96];
+    fwht128_registers(sg, lane, a0, a1, a2, a3);
+    a0 *= kHadamardScale * f32_from_f16(svh[block + lane]);
+    a1 *= kHadamardScale * f32_from_f16(svh[block + lane + 32]);
+    a2 *= kHadamardScale * f32_from_f16(svh[block + lane + 64]);
+    a3 *= kHadamardScale * f32_from_f16(svh[block + lane + 96]);
+    if (add_bias && bias != nullptr) {
+        a0 += f32_from_f16(bias[block + lane]); a1 += f32_from_f16(bias[block + lane + 32]);
+        a2 += f32_from_f16(bias[block + lane + 64]); a3 += f32_from_f16(bias[block + lane + 96]);
+    }
+}
+
 inline bool span_ok(const ExpertComponentLayout& component, uint64_t total, uint64_t expected, bool required) {
     if (component.bytes == 0) return !required;
     return component.bytes == expected && component.offset % alignof(uint16_t) == 0 &&
@@ -302,9 +345,110 @@ inline float dot_value(const ProjectionView& view, const float* input_basis, int
     return dot;
 }
 
+sycl::event submit_gate_up_input_cooperative(sycl::queue& queue, const GroupedPlan& plan, const float* x,
+                                             int64_t ldx, float* scratch, int64_t plane, GroupedOptions options,
+                                             const std::vector<sycl::event>& deps) {
+    const size_t blocks = static_cast<size_t>(plan.hidden / 128);
+    return queue.submit([&](sycl::handler& h) {
+        if (!deps.empty()) h.depends_on(deps);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(plan.max_entries) * blocks * 32), 32),
+                       [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+            const auto sg = item.get_sub_group(); const int lane = (int) sg.get_local_id()[0];
+            const size_t g = (size_t) item.get_group_linear_id();
+            const int32_t entry = (int32_t) (g / blocks); const int64_t block = (int64_t) (g % blocks) * 128;
+            const ResolvedEntry r = resolve_entry(plan, entry, options); const bool active = r.valid;
+            const float* in = active ? x + (int64_t) r.token * ldx : nullptr;
+            float* gate = active ? scratch + (size_t) entry * (size_t) plane : nullptr;
+            float* up = active ? scratch + (size_t) plan.max_entries * (size_t) plane + (size_t) entry * (size_t) plane : nullptr;
+            float g0=0,g1=0,g2=0,g3=0,u0=0,u1=0,u2=0,u3=0;
+            if (active && options.gate.input_hadamard && r.gate.suh) fwht128_input(sg,lane,in,r.gate.suh,block,g0,g1,g2,g3);
+            else if (active) { g0=in[block+lane];g1=in[block+lane+32];g2=in[block+lane+64];g3=in[block+lane+96]; }
+            if (active && options.up.input_hadamard && r.up.suh) fwht128_input(sg,lane,in,r.up.suh,block,u0,u1,u2,u3);
+            else if (active) { u0=in[block+lane];u1=in[block+lane+32];u2=in[block+lane+64];u3=in[block+lane+96]; }
+            if (active) { gate[block+lane]=g0;gate[block+lane+32]=g1;gate[block+lane+64]=g2;gate[block+lane+96]=g3;
+                          up[block+lane]=u0;up[block+lane+32]=u1;up[block+lane+64]=u2;up[block+lane+96]=u3; }
+        });
+    });
+}
+
+sycl::event submit_gate_up_post_cooperative(sycl::queue& queue, const GroupedPlan& plan, float* scratch, int64_t plane,
+                                            GroupedOptions options, const std::vector<sycl::event>& deps) {
+    const size_t blocks = (static_cast<size_t>(plan.max_ff) + 127u) / 128u;
+    return queue.submit([&](sycl::handler& h) {
+        if (!deps.empty()) h.depends_on(deps);
+        h.parallel_for(sycl::nd_range<1>(static_cast<size_t>(plan.max_entries) * blocks * 32, 32),
+                       [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+            const auto sg=item.get_sub_group(); const int lane=(int)sg.get_local_id()[0]; const size_t g=(size_t)item.get_group_linear_id();
+            const int32_t entry = static_cast<int32_t>(g / blocks);
+            const int64_t block = static_cast<int64_t>(g % blocks) * 128;
+            const ResolvedEntry r = resolve_entry(plan, entry, options);
+            if (!r.valid || block >= r.ff) return;
+            float* gd = scratch + 2 * (size_t) plan.max_entries * (size_t) plane +
+                        (size_t) entry * (size_t) plane;
+            float* ud = scratch + 3 * (size_t) plan.max_entries * (size_t) plane +
+                        (size_t) entry * (size_t) plane;
+            float* go = scratch + 4 * (size_t) plan.max_entries * (size_t) plane +
+                        (size_t) entry * (size_t) plane;
+            float* uo = scratch + 5 * (size_t) plan.max_entries * (size_t) plane +
+                        (size_t) entry * (size_t) plane;
+            const bool gh = options.gate.output_hadamard && r.gate.svh;
+            const bool uh = options.up.output_hadamard && r.up.svh;
+            float g0 = 0, g1 = 0, g2 = 0, g3 = 0;
+            float u0 = 0, u1 = 0, u2 = 0, u3 = 0;
+            const int64_t c0 = block + lane, c1 = c0 + 32, c2 = c0 + 64, c3 = c0 + 96;
+            if (gh) {
+                fwht128_output(sg, lane, gd, r.gate.svh, r.gate.bias, block, options.gate.add_bias,
+                               g0, g1, g2, g3);
+            } else {
+                if (c0 < r.ff) g0 = gd[c0]; if (c1 < r.ff) g1 = gd[c1];
+                if (c2 < r.ff) g2 = gd[c2]; if (c3 < r.ff) g3 = gd[c3];
+            }
+            if (uh) {
+                fwht128_output(sg, lane, ud, r.up.svh, r.up.bias, block, options.up.add_bias,
+                               u0, u1, u2, u3);
+            } else {
+                if (c0 < r.ff) u0 = ud[c0]; if (c1 < r.ff) u1 = ud[c1];
+                if (c2 < r.ff) u2 = ud[c2]; if (c3 < r.ff) u3 = ud[c3];
+            }
+            if (options.gate.add_bias && !gh) {
+                if (r.gate.is_packed() && r.gate.bias) {
+                    if (c0 < r.ff) g0 += f32_from_f16(r.gate.bias[c0]);
+                    if (c1 < r.ff) g1 += f32_from_f16(r.gate.bias[c1]);
+                    if (c2 < r.ff) g2 += f32_from_f16(r.gate.bias[c2]);
+                    if (c3 < r.ff) g3 += f32_from_f16(r.gate.bias[c3]);
+                } else if (r.gate.is_raw() && r.gate.raw.bias) {
+                    if (c0 < r.ff) g0 += raw_bias_value(r.gate.raw, (size_t) c0);
+                    if (c1 < r.ff) g1 += raw_bias_value(r.gate.raw, (size_t) c1);
+                    if (c2 < r.ff) g2 += raw_bias_value(r.gate.raw, (size_t) c2);
+                    if (c3 < r.ff) g3 += raw_bias_value(r.gate.raw, (size_t) c3);
+                }
+            }
+            if (options.up.add_bias && !uh) {
+                if (r.up.is_packed() && r.up.bias) {
+                    if (c0 < r.ff) u0 += f32_from_f16(r.up.bias[c0]);
+                    if (c1 < r.ff) u1 += f32_from_f16(r.up.bias[c1]);
+                    if (c2 < r.ff) u2 += f32_from_f16(r.up.bias[c2]);
+                    if (c3 < r.ff) u3 += f32_from_f16(r.up.bias[c3]);
+                } else if (r.up.is_raw() && r.up.raw.bias) {
+                    if (c0 < r.ff) u0 += raw_bias_value(r.up.raw, (size_t) c0);
+                    if (c1 < r.ff) u1 += raw_bias_value(r.up.raw, (size_t) c1);
+                    if (c2 < r.ff) u2 += raw_bias_value(r.up.raw, (size_t) c2);
+                    if (c3 < r.ff) u3 += raw_bias_value(r.up.raw, (size_t) c3);
+                }
+            }
+            if (c0 < r.ff) { go[c0] = g0; uo[c0] = u0; }
+            if (c1 < r.ff) { go[c1] = g1; uo[c1] = u1; }
+            if (c2 < r.ff) { go[c2] = g2; uo[c2] = u2; }
+            if (c3 < r.ff) { go[c3] = g3; uo[c3] = u3; }
+        });
+    });
+}
+
 sycl::event submit_gate_up_input(sycl::queue& queue, const GroupedPlan& plan, const float* x, int64_t ldx,
                                  float* scratch, int64_t plane, GroupedOptions options,
                                  const std::vector<sycl::event>& deps) {
+    if (grouped_cooperative_capability(queue))
+        return submit_gate_up_input_cooperative(queue, plan, x, ldx, scratch, plane, options, deps);
     return queue.submit([&](sycl::handler& h) {
         if (!deps.empty()) h.depends_on(deps);
         h.parallel_for(sycl::range<1>((size_t) plan.max_entries * (size_t) plan.hidden), [=](sycl::id<1> id) {
@@ -344,9 +488,13 @@ sycl::event submit_gate_up_input(sycl::queue& queue, const GroupedPlan& plan, co
 }
 
 bool grouped_cooperative_capability(const sycl::queue& queue) {
-    const auto subgroup_sizes = queue.get_device().get_info<sycl::info::device::sub_group_sizes>();
-    if (std::find(subgroup_sizes.begin(), subgroup_sizes.end(), size_t(32)) == subgroup_sizes.end()) return false;
-    return queue.get_device().get_info<sycl::info::device::max_work_group_size>() >= 32;
+    try {
+        const auto subgroup_sizes = queue.get_device().get_info<sycl::info::device::sub_group_sizes>();
+        if (std::find(subgroup_sizes.begin(), subgroup_sizes.end(), size_t(32)) == subgroup_sizes.end()) return false;
+        return queue.get_device().get_info<sycl::info::device::max_work_group_size>() >= 32;
+    } catch (...) {
+        return false;
+    }
 }
 
 sycl::event submit_gate_up_dot_cooperative(sycl::queue& queue, const GroupedPlan& plan, float* scratch,
@@ -430,6 +578,8 @@ sycl::event submit_gate_up_dot(sycl::queue& queue, const GroupedPlan& plan, floa
 
 sycl::event submit_gate_up_post(sycl::queue& queue, const GroupedPlan& plan, float* scratch, int64_t plane,
                                 GroupedOptions options, const std::vector<sycl::event>& deps) {
+    if (grouped_cooperative_capability(queue))
+        return submit_gate_up_post_cooperative(queue, plan, scratch, plane, options, deps);
     return queue.submit([&](sycl::handler& h) {
         if (!deps.empty()) h.depends_on(deps);
         h.parallel_for(sycl::range<1>((size_t) plan.max_entries * (size_t) plan.max_ff), [=](sycl::id<1> id) {
@@ -509,6 +659,93 @@ sycl::event submit_down_dot_cooperative(sycl::queue& queue, const GroupedPlan& p
     });
 }
 
+sycl::event submit_down_input_cooperative(sycl::queue& queue, const GroupedPlan& plan, float* scratch,
+                                          int64_t plane, GroupedOptions options, const std::vector<sycl::event>& deps) {
+    const size_t blocks = (static_cast<size_t>(plan.max_ff) + 127u) / 128u;
+    return queue.submit([&](sycl::handler& h) {
+        if (!deps.empty()) h.depends_on(deps);
+        h.parallel_for(sycl::nd_range<1>(static_cast<size_t>(plan.max_entries) * blocks * 32, 32),
+                       [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+            const auto sg = item.get_sub_group();
+            const int lane = (int) sg.get_local_id()[0];
+            const size_t group = (size_t) item.get_group_linear_id();
+            const int32_t entry = (int32_t) (group / blocks);
+            const int64_t block = (int64_t) (group % blocks) * 128;
+            const ResolvedEntry resolved = resolve_entry(plan, entry, options);
+            if (!resolved.valid || block >= resolved.ff) return;
+            const float* input = scratch + 4 * (size_t) plan.max_entries * (size_t) plane +
+                                 (size_t) entry * (size_t) plane;
+            float* output = scratch + (size_t) entry * (size_t) plane;
+            float a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+            if (options.down.input_hadamard && resolved.down.suh) {
+                fwht128_input(sg, lane, input, resolved.down.suh, block, a0, a1, a2, a3);
+            } else {
+                const int64_t c0 = block + lane, c1 = c0 + 32, c2 = c0 + 64, c3 = c0 + 96;
+                if (c0 < resolved.ff) a0 = input[c0]; if (c1 < resolved.ff) a1 = input[c1];
+                if (c2 < resolved.ff) a2 = input[c2]; if (c3 < resolved.ff) a3 = input[c3];
+            }
+            const int64_t c0 = block + lane, c1 = c0 + 32, c2 = c0 + 64, c3 = c0 + 96;
+            if (c0 < resolved.ff) output[c0] = a0; if (c1 < resolved.ff) output[c1] = a1;
+            if (c2 < resolved.ff) output[c2] = a2; if (c3 < resolved.ff) output[c3] = a3;
+        });
+    });
+}
+
+sycl::event submit_down_post_cooperative(sycl::queue& queue, const GroupedPlan& plan, float* scratch, int64_t plane,
+                                         int64_t ldy, float* y, GroupedOptions options,
+                                         const std::vector<sycl::event>& deps) {
+    const size_t blocks = static_cast<size_t>(plan.hidden / 128);
+    return queue.submit([&](sycl::handler& h) {
+        if (!deps.empty()) h.depends_on(deps);
+        h.parallel_for(sycl::nd_range<1>(static_cast<size_t>(plan.max_entries) * blocks * 32, 32),
+                       [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+            const auto sg = item.get_sub_group();
+            const int lane = (int) sg.get_local_id()[0];
+            const size_t group = (size_t) item.get_group_linear_id();
+            const int32_t entry = (int32_t) (group / blocks);
+            const int64_t block = (int64_t) (group % blocks) * 128;
+            const ResolvedEntry resolved = resolve_entry(plan, entry, options);
+            float* output = resolved.has_destination ? y + (int64_t) resolved.destination * ldy : nullptr;
+            if (!resolved.valid) {
+                if (output) {
+                    output[block + lane] = sycl::nan((uint32_t) 0);
+                    output[block + lane + 32] = sycl::nan((uint32_t) 0);
+                    output[block + lane + 64] = sycl::nan((uint32_t) 0);
+                    output[block + lane + 96] = sycl::nan((uint32_t) 0);
+                }
+                return;
+            }
+            const float* dot = scratch + 2 * (size_t) plan.max_entries * (size_t) plane +
+                               (size_t) entry * (size_t) plane;
+            float a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+            if (options.down.output_hadamard && resolved.down.svh) {
+                fwht128_output(sg, lane, dot, resolved.down.svh, resolved.down.bias, block,
+                               options.down.add_bias, a0, a1, a2, a3);
+            } else {
+                const int64_t c0 = block + lane, c1 = c0 + 32, c2 = c0 + 64, c3 = c0 + 96;
+                if (c0 < plan.hidden) a0 = dot[c0]; if (c1 < plan.hidden) a1 = dot[c1];
+                if (c2 < plan.hidden) a2 = dot[c2]; if (c3 < plan.hidden) a3 = dot[c3];
+                if (options.down.add_bias) {
+                    if (resolved.down.is_packed() && resolved.down.bias) {
+                        if (c0 < plan.hidden) a0 += f32_from_f16(resolved.down.bias[c0]);
+                        if (c1 < plan.hidden) a1 += f32_from_f16(resolved.down.bias[c1]);
+                        if (c2 < plan.hidden) a2 += f32_from_f16(resolved.down.bias[c2]);
+                        if (c3 < plan.hidden) a3 += f32_from_f16(resolved.down.bias[c3]);
+                    } else if (resolved.down.is_raw() && resolved.down.raw.bias) {
+                        if (c0 < plan.hidden) a0 += raw_bias_value(resolved.down.raw, (size_t) c0);
+                        if (c1 < plan.hidden) a1 += raw_bias_value(resolved.down.raw, (size_t) c1);
+                        if (c2 < plan.hidden) a2 += raw_bias_value(resolved.down.raw, (size_t) c2);
+                        if (c3 < plan.hidden) a3 += raw_bias_value(resolved.down.raw, (size_t) c3);
+                    }
+                }
+            }
+            const int64_t c0 = block + lane, c1 = c0 + 32, c2 = c0 + 64, c3 = c0 + 96;
+            if (c0 < plan.hidden) output[c0] = a0; if (c1 < plan.hidden) output[c1] = a1;
+            if (c2 < plan.hidden) output[c2] = a2; if (c3 < plan.hidden) output[c3] = a3;
+        });
+    });
+}
+
 }  // namespace
 
 size_t exl3_grouped_scratch_elements(const GroupedPlan& plan) {
@@ -550,7 +787,11 @@ sycl::event exl3_grouped_fp32(sycl::queue& queue, const GroupedPlan& plan, const
             gate_values[col] = (g / (1.0f + sycl::exp(-g))) * up_values[col];
         });
     });
-    const sycl::event down_input = queue.submit([&](sycl::handler& h) {
+    sycl::event down_input;
+    if (grouped_cooperative_capability(queue)) {
+        down_input = submit_down_input_cooperative(queue, plan, scratch, plane, options, {activation});
+    } else {
+        down_input = queue.submit([&](sycl::handler& h) {
         h.depends_on(activation);
         h.parallel_for(sycl::range<1>((size_t) plan.max_entries * (size_t) plan.max_ff), [=](sycl::id<1> id) {
             const size_t flat = (size_t) id[0];
@@ -573,7 +814,8 @@ sycl::event exl3_grouped_fp32(sycl::queue& queue, const GroupedPlan& plan, const
                 down_input_values[row] = activation_values[row];
             }
         });
-    });
+        });
+    }
     sycl::event down_dot;
     if (grouped_cooperative_capability(queue)) {
         down_dot = submit_down_dot_cooperative(queue, plan, scratch, plane, options, {down_input});
@@ -593,6 +835,8 @@ sycl::event exl3_grouped_fp32(sycl::queue& queue, const GroupedPlan& plan, const
             });
         });
     }
+    if (grouped_cooperative_capability(queue))
+        return submit_down_post_cooperative(queue, plan, scratch, plane, ldy, y, options, {down_dot});
     return queue.submit([&](sycl::handler& h) {
         h.depends_on(down_dot);
         h.parallel_for(sycl::range<1>((size_t) plan.max_entries * (size_t) plan.hidden), [=](sycl::id<1> id) {

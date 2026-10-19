@@ -45,6 +45,8 @@ void Exl3ExpertRuntime::close() {
     if (d_dst_ != nullptr) strata::gpu::free(d_dst_);
     if (d_ngroups_ != nullptr) strata::gpu::free(d_ngroups_);
     if (d_nentries_ != nullptr) strata::gpu::free(d_nentries_);
+    if (d_pair_blob_base_ != nullptr) strata::gpu::free(d_pair_blob_base_);
+    if (d_pair_format_index_ != nullptr) strata::gpu::free(d_pair_format_index_);
     if (h_blob_base_ != nullptr) strata::gpu::free(h_blob_base_);
     if (h_format_index_ != nullptr) strata::gpu::free(h_format_index_);
     if (h_format_table_ != nullptr) strata::gpu::free(h_format_table_);
@@ -56,17 +58,20 @@ void Exl3ExpertRuntime::close() {
     d_scratch_ = nullptr;
     d_blob_base_ = nullptr; d_format_index_ = nullptr; d_format_table_ = nullptr;
     d_start_ = nullptr; d_tok_ = nullptr; d_dst_ = nullptr; d_ngroups_ = nullptr; d_nentries_ = nullptr;
+    d_pair_blob_base_ = nullptr; d_pair_format_index_ = nullptr;
     h_blob_base_ = nullptr; h_format_index_ = nullptr; h_format_table_ = nullptr;
     h_start_ = nullptr; h_tok_ = nullptr; h_dst_ = nullptr; h_ngroups_ = nullptr; h_nentries_ = nullptr;
     source_ = nullptr;
     pool_ = nullptr;
     n_layers_ = n_expert_ = max_tokens_ = routed_k_ = max_entries_ = hidden_ = max_ff_ = 0;
+    pair_count_ = 0;
     scratch_elements_ = 0;
     pair_formats_.clear(); pair_format_index_.clear(); format_table_host_.clear();
     cpu_jobs_.clear(); miss_ids_.clear(); registry_.clear();
     device_plan_ = {};
     device_runtime_ = nullptr;
     opened_ = prepared_ = cpu_ready_ = pending_gpu_ = false;
+    all_resident_ = false;
     prepared_layer_ = -1;
     miss_entries_ = 0;
 }
@@ -109,6 +114,15 @@ bool Exl3ExpertRuntime::allocate_images(std::string& err) {
         !device(reinterpret_cast<void**>(&d_ngroups_), sizeof(int32_t), "group count") ||
         !device(reinterpret_cast<void**>(&d_nentries_), sizeof(int32_t), "entry count"))
         return false;
+    if (all_resident_) {
+        if (pair_count_ <= 0 || static_cast<uint64_t>(pair_count_) > std::numeric_limits<size_t>::max() / sizeof(uint64_t) ||
+            static_cast<uint64_t>(pair_count_) > std::numeric_limits<size_t>::max() / sizeof(int32_t) ||
+            !device(reinterpret_cast<void**>(&d_pair_blob_base_), static_cast<size_t>(pair_count_) * sizeof(uint64_t),
+                    "resident pair blob table") ||
+            !device(reinterpret_cast<void**>(&d_pair_format_index_), static_cast<size_t>(pair_count_) * sizeof(int32_t),
+                    "resident pair format table"))
+            return false;
+    }
     std::memset(h_blob_base_, 0, groups * sizeof(uint64_t));
     std::memset(h_format_index_, 0, groups * sizeof(int32_t));
     std::memset(h_format_table_, 0, formats * sizeof(Exl3ExpertFormatDesc));
@@ -154,9 +168,35 @@ bool Exl3ExpertRuntime::allocate_images(std::string& err) {
             err = "exl3 runtime: plan image belongs to another runtime";
             return false;
         }
+    if (all_resident_ && (Runtime::owner(d_pair_blob_base_) != device_runtime_ ||
+                          Runtime::owner(d_pair_format_index_) != device_runtime_)) {
+        err = "exl3 runtime: resident pair table belongs to another runtime";
+        return false;
+    }
     if (cache_.valid() && Runtime::owner(cache_.device_slot(0)) != device_runtime_) {
         err = "exl3 runtime: cache arena belongs to another runtime";
         return false;
+    }
+    if (all_resident_) {
+        std::vector<uint64_t> pair_blobs(static_cast<size_t>(pair_count_), 0);
+        for (int64_t layer = 0; layer < n_layers_; ++layer) {
+            for (int64_t expert = 0; expert < n_expert_; ++expert) {
+                const size_t at = pair_index(layer, expert);
+                const int32_t slot = cache_.slot_of(layer, expert);
+                const uint8_t* blob = slot >= 0 ? cache_.device_slot(slot) : nullptr;
+                if (slot < 0 || blob == nullptr) {
+                    err = "exl3 runtime: all-resident pair table has a missing device slot";
+                    return false;
+                }
+                pair_blobs[at] = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(blob));
+            }
+        }
+        if (!strata::gpu::copy(d_pair_blob_base_, pair_blobs.data(), pair_blobs.size() * sizeof(uint64_t)) ||
+            !strata::gpu::copy(d_pair_format_index_, pair_format_index_.data(),
+                               pair_format_index_.size() * sizeof(int32_t))) {
+            err = std::string("exl3 runtime: copying resident pair tables: ") + strata::gpu::last_error();
+            return false;
+        }
     }
     if (!strata::gpu::copy(d_format_table_, h_format_table_, formats * sizeof(Exl3ExpertFormatDesc))) {
         err = std::string("exl3 runtime: copying format table: ") + strata::gpu::last_error();
@@ -187,9 +227,12 @@ bool Exl3ExpertRuntime::open(Exl3ExpertSource& source, strata::kernels::cpu::Exp
     routed_k_ = routed_k;
     if (n_layers_ <= 0 || n_expert_ <= 0) { err = "exl3 runtime: source geometry is invalid"; close(); return false; }
     const uint64_t pairs = static_cast<uint64_t>(n_layers_) * static_cast<uint64_t>(n_expert_);
-    if (pairs > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+    if (pairs > static_cast<uint64_t>(std::numeric_limits<size_t>::max()) ||
+        pairs > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
         err = "exl3 runtime: source pair table overflows"; close(); return false;
     }
+    pair_count_ = static_cast<int64_t>(pairs);
+    all_resident_ = resident.size() == static_cast<size_t>(pairs);
     pair_formats_.resize(static_cast<size_t>(pairs));
     pair_format_index_.resize(static_cast<size_t>(pairs));
     std::unordered_map<Exl3ExpertFormatID, int32_t> format_indices;
@@ -449,6 +492,84 @@ bool Exl3ExpertRuntime::record_enqueue(sycl::queue& queue, const float* device_f
                                                         d_scratch_, scratch_elements_, {}, copies);
     } catch (const std::exception& e) {
         err = std::string("exl3 runtime: graph grouped enqueue: ") + e.what();
+        return false;
+    }
+    return true;
+}
+
+bool Exl3ExpertRuntime::record_resident_enqueue(sycl::queue& queue, int64_t layer, const float* device_fp32_x,
+                                                const int32_t* device_ids, int64_t n_tokens, float* gpu_output,
+                                                int64_t ldy, std::string& err) {
+    err.clear();
+    if (!opened_ || !all_resident_) {
+        err = "exl3 runtime: the direct resident plan requires a fully resident runtime";
+        return false;
+    }
+    if (!valid_layer(layer) || n_tokens <= 0 || n_tokens > max_tokens_ || device_fp32_x == nullptr ||
+        device_ids == nullptr || gpu_output == nullptr || !span_fits(n_tokens, hidden_, hidden_) ||
+        !span_fits(max_entries_, ldy, hidden_)) {
+        err = "exl3 runtime: invalid direct resident geometry";
+        return false;
+    }
+    if (!queue.has_property<sycl::property::queue::in_order>()) {
+        err = "exl3 runtime: direct resident replay requires an in-order queue";
+        return false;
+    }
+    Runtime* queue_runtime = Runtime::owner_of_stream(&queue);
+    if (queue_runtime == nullptr || queue_runtime != device_runtime_ || Runtime::owner(device_fp32_x) != queue_runtime ||
+        Runtime::owner(device_ids) != queue_runtime || Runtime::owner(gpu_output) != queue_runtime) {
+        err = "exl3 runtime: direct resident pointers belong to another runtime/device";
+        return false;
+    }
+    int64_t entries = 0;
+    if (!product_fits(n_tokens, routed_k_, max_entries_, entries) || entries <= 0) {
+        err = "exl3 runtime: direct resident route count is out of range";
+        return false;
+    }
+    try {
+        // Each route is one group.  This intentionally avoids a device compaction/radix pass: duplicate experts
+        // remain separate route groups, and the existing grouped kernel already guarantees unique destinations.
+        uint64_t* const plan_blob = d_blob_base_;
+        int32_t* const plan_format = d_format_index_;
+        int32_t* const plan_start = d_start_;
+        int32_t* const plan_tok = d_tok_;
+        int32_t* const plan_dst = d_dst_;
+        int32_t* const plan_groups = d_ngroups_;
+        int32_t* const plan_entries = d_nentries_;
+        const uint64_t* const pair_blob = d_pair_blob_base_;
+        const int32_t* const pair_format = d_pair_format_index_;
+        const int64_t experts = n_expert_;
+        const int64_t route_k = routed_k_;
+        const int64_t layer_id = layer;
+        const sycl::event plan = queue.submit([&](sycl::handler& h) {
+            h.parallel_for(sycl::range<1>(static_cast<size_t>(entries)), [=](sycl::id<1> id) {
+                const int32_t entry = static_cast<int32_t>(id[0]);
+                if (entry == 0) {
+                    plan_start[0] = 0;
+                    *plan_groups = static_cast<int32_t>(entries);
+                    *plan_entries = static_cast<int32_t>(entries);
+                }
+                plan_start[entry + 1] = entry + 1;
+                plan_tok[entry] = entry / static_cast<int32_t>(route_k);
+                plan_dst[entry] = entry;
+                const int32_t expert = device_ids[entry];
+                const bool valid = expert >= 0 && expert < experts;
+                if (!valid) {
+                    plan_blob[entry] = 0;
+                    plan_format[entry] = -1;
+                    // Keep the destination valid so the grouped guard poisons this row with NaNs.
+                    return;
+                }
+                const size_t pair = static_cast<size_t>(layer_id) * static_cast<size_t>(experts) +
+                                    static_cast<size_t>(expert);
+                plan_blob[entry] = pair_blob[pair];
+                plan_format[entry] = pair_format[pair];
+            });
+        });
+        (void) strata::kernels::exl3::exl3_grouped_fp32(queue, device_plan_, device_fp32_x, hidden_, gpu_output, ldy,
+                                                        d_scratch_, scratch_elements_, {}, {plan});
+    } catch (const std::exception& e) {
+        err = std::string("exl3 runtime: direct resident grouped enqueue: ") + e.what();
         return false;
     }
     return true;

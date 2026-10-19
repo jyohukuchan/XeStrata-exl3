@@ -1627,7 +1627,10 @@ bool PlainModel::launch_serve(strata::gpu::Graph* g, std::vector<strata::gpu::Gr
     (void) strata::gpu::stream_idle(cs_);
     std::vector<int> grps((size_t) rings, 0), tbs((size_t) rings, 0), ns((size_t) rings, T);
     if (seg) win_.set_segments(&segs);
-    return win_.serve(rings, layers, grps.data(), tbs.data(), ns.data(), &PlainModel::pool_fn, this, cs_, err);
+    if (!win_.serve(rings, layers, grps.data(), tbs.data(), ns.data(), &PlainModel::pool_fn, this, cs_, err)) return false;
+    if (win_.direct_resident())
+        for (int64_t ring = 0; ring < rings; ++ring) disp_.cache_hits += (int64_t) ns[(size_t) ring] * spec_.n_expert_used;
+    return true;
 }
 
 bool PlainModel::forward(const int32_t* tokens, int T, int64_t pos, int32_t* out, float* logits, std::string& err) {

@@ -118,7 +118,11 @@ strata --exl3 /path/to/exl3-model --metadata-gguf /path/to/metadata-only.gguf \
 packed projection は H128 block の並べ替えを行い、GDN の V-head の順序を canonical 配置へ移す。
 raw projection は軸ごとの明示的な変換で元の F16/BF16/F32 を保持する。norm の `+1`、GDN の
 `A_log` の `-exp` と FP32 を要求する補助 weight の widening だけを個別に適用する。
-expert の residency は実際の blob byte 数と device の容量から決め、既存の segmented graph に接続する。
+expert の residency は実際の blob byte 数と device の容量から決める。部分常駐時は既存の segmented graph に接続する。
+全 `(layer, expert)` が GPU に常駐する場合は、device 上の route ID から graph 内で経路表を作り、
+CPU の ring 応答を省く。同じ owner の plan/scratch は in-order queue 上で順番に再利用する。
+`STRATA_EXL3_RESIDENT_GRAPH=0` または `STRATA_VERIFY_SEGMENTED=1` で比較用に従来経路を選べる。
+SG32 を使える device では grouped expert の H128 変換を register FWHT で実行し、他では既存の変換を使う。
 
 AR では `--prompt-chunk 0 --spec 0` を使う。`--spec 1` も MTP 無効として扱う。正の `--prompt-chunk` は
 `max-t` 以下の decode window に分けて prefill を実行し、最後の行の出力を返す。圧縮 weight はそのまま
@@ -192,7 +196,8 @@ capture 前に済ませ、解放時は device の処理完了を待って自分�
 PLE、MTP は別の owner に接続する。
 `read_exl3_model_spec()` は archive の HF config から Qwen3.5/Qwen3.8 の geometry を読み、
 GGUF の weight や仮の pack を必要としない。trunk と MTP を区別し、Qwen3.8 の MTP は
-専用 loader へ接続するまで要求時に拒否する。
+専用 loader へ接続するまで要求時に拒否する。`build_qwen38_mtp_map()` は FC、QSA/indexer、
+HC、shared/routed expert を別の一層 map に検証し、trunk の map へ暗黙に混ぜない。
 `Exl3Ple` は PLE の key/value projection を packed/raw のまま所有し、三つの norm は `+1` を適用して
 FP32、conv は元の F16 として保持する。layer/verify は事前投影した FP32 の key/value を既存 PLE
 post-op に渡す。norm、conv、projection の shape と PLE config は読み込み時に検証する。

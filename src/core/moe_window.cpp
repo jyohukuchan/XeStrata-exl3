@@ -86,6 +86,11 @@ bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std
     sh_ = shape;
     tier_ = tier;
     exl3_runtime_ = tier.exl3_runtime;
+    const char* force_segments = std::getenv("STRATA_VERIFY_SEGMENTED");
+    const char* resident_graph = std::getenv("STRATA_EXL3_RESIDENT_GRAPH");
+    direct_resident_ = exl3 && exl3_runtime_->fully_resident() &&
+                       !(force_segments != nullptr && std::strtol(force_segments, nullptr, 10) != 0) &&
+                       !(resident_graph != nullptr && std::strtol(resident_graph, nullptr, 10) == 0);
     int64_t max_ff = 0;
     bf16_ = false;
     if (exl3) max_ff = tier.exl3_runtime->max_ff();
@@ -143,6 +148,11 @@ bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std
     set_plan_slot(0);
     copy_ = strata::gpu::stream_create();
     if (!copy_) { err = "moe window: copy stream create failed"; return false; }
+    if (direct_resident_) {
+        // The direct path never polls mapped flags or launches a host-visible segment.
+        segmented_ = false;
+        return true;
+    }
     strata::gpu::Stream probe = strata::gpu::stream_create();
     if (!probe) { err = "moe window: stream create failed"; return false; }
     const char* v = std::getenv("STRATA_VERIFY_SEGMENTED");
@@ -212,6 +222,13 @@ void MoeWindow::publish(uint32_t ring, int grp, int tb, int n, const float* x, c
     (void) grp;
     using namespace strata::kernels;
     const int64_t N = sh_.n_embd, K = sh_.k;
+    if (direct_resident_) {
+        // The router's device buffers are stable across graph replay.  Keep their addresses for the later direct
+        // plan builder; a doorbell copy into mapped staging would only add a kernel and two host-visible buffers.
+        direct_x_ = x;
+        direct_ids_ = ids;
+        return;
+    }
     doorbell_publish(x, ids, w, (int64_t) n * N, (int64_t) n * K, m_x_ + (size_t) tb * N, m_ids_ + (size_t) tb * K,
                      m_w_ + (size_t) tb * K, m_seq_, cs);
     if (exl3_runtime_ != nullptr) return;
@@ -228,6 +245,22 @@ bool MoeWindow::experts(int64_t layer, uint32_t ring, int grp, int tb, int n, st
             tb > sh_.max_t - n) {
             err = "moe window: EXL3 ring geometry is invalid";
             return false;
+        }
+        if (direct_resident_) {
+            try {
+                sycl::queue& queue = Runtime::get().stream(cs);
+                if (direct_x_ == nullptr || direct_ids_ == nullptr) {
+                    err = "moe window: direct EXL3 route buffers were not published";
+                    return false;
+                }
+                if (!exl3_runtime_->record_resident_enqueue(queue, layer, direct_x_, direct_ids_, n,
+                                                            parts_ + (size_t) tb * K * N, N, err))
+                    return false;
+            } catch (const std::exception& e) {
+                err = "moe window, direct EXL3 layer " + std::to_string(layer) + ": " + e.what();
+                return false;
+            }
+            return true;
         }
         const int64_t cap = (int64_t) n * K;
         int32_t* pl = plan_ + (size_t) grp * (size_t) (plan_i32_ + 16);
@@ -316,6 +349,19 @@ void MoeWindow::reset() {
 
 bool MoeWindow::serve(int64_t rings, const int64_t* layers, const int* grps, const int* tbs, const int* ns,
                       MoePoolFn pool, void* user, strata::gpu::Stream cs, std::string& err) {
+    if (direct_resident_) {
+        (void) rings;
+        (void) layers;
+        (void) grps;
+        (void) tbs;
+        (void) ns;
+        (void) pool;
+        (void) user;
+        // The captured graph contains the device route-plan builders and grouped kernels.  Returning here lets the
+        // caller enqueue its sampler on the same in-order stream; its normal final stream sync observes completion.
+        err.clear();
+        return true;
+    }
     volatile uint32_t* const seq = h_seq_;
     // STRATA_WINDOW_TIMES=1 (measuring): the host's time per ring, waiting for it (the GPU's work up to the layer's
     // experts) and answering it (the plan, the CPU's experts and the flags), summed over the run and printed every

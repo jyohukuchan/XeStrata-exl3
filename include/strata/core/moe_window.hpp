@@ -83,6 +83,8 @@ public:
     /// The plan the pool fills (ExpertDispatch::plan).
     GpuPlanSink* sink() { return &sink_; }
     Exl3ExpertRuntime* exl3_runtime() const { return exl3_runtime_; }
+    /// True when this window has the all-resident direct route-plan path and therefore needs no host ring service.
+    bool direct_resident() const { return direct_resident_; }
 
 private:
     static void publish_plan(void* ctx);
@@ -96,6 +98,9 @@ private:
     MoeWindowShape sh_;
     MoeWindowTier tier_;
     Exl3ExpertRuntime* exl3_runtime_ = nullptr;
+    bool direct_resident_ = false;
+    const float* direct_x_ = nullptr;
+    const int32_t* direct_ids_ = nullptr;
     bool segmented_ = false;
     const std::vector<strata::gpu::Graph*>* segs_ = nullptr;
     strata::gpu::Stream copy_ = nullptr;
