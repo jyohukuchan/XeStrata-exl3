@@ -2,7 +2,8 @@
 // SPDX-FileCopyrightText: 2026 jyohukuchan
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
-// EXL3 expert blob offsets follow exllamav3's MIT-licensed packed representation.
+// EXL3 packed offsets follow exllamav3's MIT-licensed representation; raw
+// projection spans carry their source dtype explicitly.
 #pragma once
 
 #include "strata/kernels/exl3_expert_format.hpp"
@@ -19,10 +20,11 @@ struct ExpertComponentLayout {
     uint64_t bytes = 0;
 };
 
-/// POD offsets and metadata for one packed gate/up/down expert.  The layout
+/// POD offsets and metadata for one packed/raw gate/up/down expert.  The layout
 /// contains no owning pointer, so it remains valid when a blob is copied or
 /// moved to another base address.
 struct ExpertProjectionLayout {
+    ProjectionStorage storage = ProjectionStorage::packed_trellis;
     int64_t k = 0;
     int64_t n = 0;
     int bits = 0;
@@ -31,6 +33,10 @@ struct ExpertProjectionLayout {
     ExpertComponentLayout suh;  // codespell:ignore suh
     ExpertComponentLayout svh;
     ExpertComponentLayout bias;
+    raw::DType raw_dtype = raw::DType::F32;
+    raw::DType raw_bias_dtype = raw::DType::F32;
+    ExpertComponentLayout raw_weights;
+    ExpertComponentLayout raw_bias;
 };
 
 struct ExpertBlobLayout {
@@ -59,8 +65,19 @@ inline MatrixView expert_matrix_view(const ExpertProjectionLayout& projection, c
 }
 
 inline ExpertView expert_view(const ExpertBlobLayout& layout, const uint8_t* base) {
-    return {expert_matrix_view(layout.gate, base), expert_matrix_view(layout.up, base),
-            expert_matrix_view(layout.down, base)};
+    const auto projection_view = [base](const ExpertProjectionLayout& projection) {
+        if (projection.storage == ProjectionStorage::packed_trellis)
+            return ProjectionView(expert_matrix_view(projection, base));
+        RawProjectionView raw_view;
+        raw_view.data = projection.raw_weights.bytes == 0 ? nullptr : base + projection.raw_weights.offset;
+        raw_view.bias = projection.raw_bias.bytes == 0 ? nullptr : base + projection.raw_bias.offset;
+        raw_view.k = projection.k;
+        raw_view.n = projection.n;
+        raw_view.dtype = projection.raw_dtype;
+        raw_view.bias_dtype = projection.raw_bias_dtype;
+        return ProjectionView::from_raw(raw_view);
+    };
+    return {projection_view(layout.gate), projection_view(layout.up), projection_view(layout.down)};
 }
 
 }  // namespace strata::kernels::exl3

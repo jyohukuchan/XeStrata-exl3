@@ -267,17 +267,15 @@ int64_t now_ms() {
 
 exl3::Status validate_pool_exl3_job(const ExpertJobExl3& job, int64_t max_rows, int64_t max_hidden, int64_t max_ff) {
     if (job.rows <= 0 || job.rows > max_rows || job.x == nullptr || job.y == nullptr) return exl3::Status::invalid_argument;
-    const strata::kernels::exl3::MatrixView* matrices[] = {&job.view.gate, &job.view.up, &job.view.down};
-    for (const auto* matrix : matrices) {
-        const exl3::Status status = exl3::validate(*matrix);
-        if (status != exl3::Status::ok) return status;
-        if (matrix->suh == nullptr || matrix->svh == nullptr) return exl3::Status::missing_data;
-        if (matrix->k % 128 != 0 || matrix->n % 128 != 0) return exl3::Status::unsupported_layout;
-    }
     const int64_t hidden = job.view.gate.k, ff = job.view.gate.n;
     if (job.view.up.k != hidden || job.view.up.n != ff || job.view.down.k != ff || job.view.down.n != hidden ||
         hidden > max_hidden || ff > max_ff || job.ldx < hidden || job.ldy < hidden)
         return exl3::Status::unsupported_layout;
+    // The expert validator dispatches packed/raw projections through the
+    // explicit storage discriminator and preserves precise status codes before
+    // the pool publishes this job.
+    const exl3::Status descriptor_status = exl3::validate_expert(job.view, job.rows, job.x, job.ldx, job.y, job.ldy);
+    if (descriptor_status != exl3::Status::ok) return descriptor_status;
     const uint64_t max_float_elements = static_cast<uint64_t>(std::numeric_limits<ptrdiff_t>::max()) / sizeof(float);
     if (static_cast<uint64_t>(job.ldx) > max_float_elements / static_cast<uint64_t>(job.rows) ||
         static_cast<uint64_t>(job.ldy) > max_float_elements / static_cast<uint64_t>(job.rows))

@@ -21,6 +21,7 @@ namespace {
 
 using ExpertView = strata::kernels::exl3::ExpertView;
 using MatrixView = strata::kernels::exl3::MatrixView;
+using ProjectionView = strata::kernels::exl3::ProjectionView;
 using Status = strata::kernels::cpu::exl3::Status;
 using ExpertScratch = strata::kernels::cpu::exl3::ExpertScratch;
 using strata::kernels::cpu::exl3::expert;
@@ -221,7 +222,7 @@ int main(int argc, char** argv) {
     const MatrixData gate = materialize(*gate_source, 256, 128);
     const MatrixData up = materialize(*up_source, 256, 128);
     const MatrixData down = materialize(*down_source, 128, 256);
-    const ExpertView expert_view{view(gate), view(up), view(down)};
+    const ExpertView expert_view{ProjectionView(view(gate)), ProjectionView(view(up)), ProjectionView(view(down))};
     const int64_t hidden = 256, ff = 128;
     int failures = 0;
     for (const int64_t rows : {int64_t(1), int64_t(4)}) {
@@ -277,7 +278,8 @@ int main(int argc, char** argv) {
     const MatrixData wide_gate = materialize(*gate_source, 128, 256);
     const MatrixData wide_up = materialize(*up_source, 128, 256);
     const MatrixData wide_down = materialize(*down_source, 256, 128);
-    const ExpertView wide_view{view(wide_gate), view(wide_up), view(wide_down)};
+    const ExpertView wide_view{ProjectionView(view(wide_gate)), ProjectionView(view(wide_up)),
+                               ProjectionView(view(wide_down))};
     std::vector<float> wide_x(128), wide_expected(128), wide_gate_values(256), wide_up_values(256);
     // Zero input keeps this shape-focused case finite even for the fixture's
     // deliberately wide random codebook values; biases still exercise every

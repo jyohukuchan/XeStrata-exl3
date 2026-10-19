@@ -6,6 +6,7 @@
 // A bounded, graph-capturable grouped routed expert correctness path.
 #include "strata/kernels/exl3_grouped.hpp"
 
+#include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_exl3_grouped
 #include "strata/kernels/device_arch_tag.hpp"
@@ -110,6 +111,22 @@ inline float decoded_weight(const MatrixView& view, int64_t row, int64_t col) {
     return f32_from_f16(decode_state(extract_state(tile, view.bits, state), view.codebook));
 }
 
+inline bool valid_raw_dtype(raw::DType dtype) {
+    return dtype == raw::DType::F16 || dtype == raw::DType::BF16 || dtype == raw::DType::F32;
+}
+
+inline float raw_value(const RawProjectionView& view, size_t index) {
+    if (view.dtype == raw::DType::F16) return f32_from_f16(static_cast<const uint16_t*>(view.data)[index]);
+    if (view.dtype == raw::DType::BF16) return f32_from_bf16(static_cast<const uint16_t*>(view.data)[index]);
+    return static_cast<const float*>(view.data)[index];
+}
+
+inline float raw_bias_value(const RawProjectionView& view, size_t index) {
+    if (view.bias_dtype == raw::DType::F16) return f32_from_f16(static_cast<const uint16_t*>(view.bias)[index]);
+    if (view.bias_dtype == raw::DType::BF16) return f32_from_bf16(static_cast<const uint16_t*>(view.bias)[index]);
+    return static_cast<const float*>(view.bias)[index];
+}
+
 inline int hadamard_sign(int row, int col) {
     unsigned bits = (unsigned) (row & col);
     int parity = 0;
@@ -128,8 +145,24 @@ inline bool span_ok(const ExpertComponentLayout& component, uint64_t total, uint
 
 inline bool projection_ok(const ExpertProjectionLayout& p, int64_t expected_k, int64_t expected_n,
                           bool input_hadamard, bool output_hadamard, uint64_t total) {
-    if (p.k != expected_k || p.n != expected_n || p.k <= 0 || p.n <= 0 || p.k % 16 != 0 || p.n % 16 != 0 ||
-        p.bits < 1 || p.bits > 8 || p.codebook < 0 || p.codebook > 2)
+    if (p.k != expected_k || p.n != expected_n || p.k <= 0 || p.n <= 0) return false;
+    if (p.storage == ProjectionStorage::raw) {
+        if (!valid_raw_dtype(p.raw_dtype) || !valid_raw_dtype(p.raw_bias_dtype) || p.bits != 0 || p.codebook != 0 ||
+            p.raw_weights.bytes == 0 || p.trellis.bytes != 0 || p.suh.bytes != 0 || p.svh.bytes != 0 || p.bias.bytes != 0)
+            return false;
+        const uint64_t k = (uint64_t) p.k, n = (uint64_t) p.n;
+        if (k > std::numeric_limits<uint64_t>::max() / n) return false;
+        const uint64_t elements = k * n;
+        const uint64_t weight_size = (uint64_t) raw::dtype_bytes(p.raw_dtype);
+        if (elements > std::numeric_limits<uint64_t>::max() / weight_size) return false;
+        const uint64_t weights = elements * weight_size;
+        const uint64_t bias_size = (uint64_t) raw::dtype_bytes(p.raw_bias_dtype);
+        if (n > std::numeric_limits<uint64_t>::max() / bias_size) return false;
+        const uint64_t bias = p.raw_bias.bytes == 0 ? 0 : n * bias_size;
+        return span_ok(p.raw_weights, total, weights, true) && span_ok(p.raw_bias, total, bias, false);
+    }
+    if (p.storage != ProjectionStorage::packed_trellis || p.k % 16 != 0 || p.n % 16 != 0 || p.bits < 1 || p.bits > 8 ||
+        p.codebook < 0 || p.codebook > 2 || p.raw_weights.bytes != 0 || p.raw_bias.bytes != 0)
         return false;
     const uint64_t k = (uint64_t) p.k, n = (uint64_t) p.n, bits = (uint64_t) p.bits;
     if (k > std::numeric_limits<uint64_t>::max() / n) return false;
@@ -145,7 +178,17 @@ inline bool projection_ok(const ExpertProjectionLayout& p, int64_t expected_k, i
     return true;
 }
 
-inline MatrixView matrix_from_layout(const ExpertProjectionLayout& p, const uint8_t* base) {
+inline ProjectionView matrix_from_layout(const ExpertProjectionLayout& p, const uint8_t* base) {
+    if (p.storage == ProjectionStorage::raw) {
+        RawProjectionView raw_view;
+        raw_view.data = base + p.raw_weights.offset;
+        raw_view.bias = p.raw_bias.bytes == 0 ? nullptr : base + p.raw_bias.offset;
+        raw_view.k = p.k;
+        raw_view.n = p.n;
+        raw_view.dtype = p.raw_dtype;
+        raw_view.bias_dtype = p.raw_bias_dtype;
+        return ProjectionView::from_raw(raw_view);
+    }
     MatrixView view;
     view.trellis = (const uint16_t*) (base + p.trellis.offset);
     view.suh = p.suh.bytes == 0 ? nullptr : (const uint16_t*) (base + p.suh.offset);
@@ -155,13 +198,13 @@ inline MatrixView matrix_from_layout(const ExpertProjectionLayout& p, const uint
     view.n = p.n;
     view.bits = p.bits;
     view.codebook = p.codebook;
-    return view;
+    return ProjectionView(view);
 }
 
 struct ResolvedEntry {
-    MatrixView gate;
-    MatrixView up;
-    MatrixView down;
+    ProjectionView gate{MatrixView{}};
+    ProjectionView up{MatrixView{}};
+    ProjectionView down{MatrixView{}};
     int32_t token = -1;
     int32_t destination = -1;
     int64_t ff = 0;
@@ -209,6 +252,18 @@ inline ResolvedEntry resolve_entry(const GroupedPlan& plan, int32_t entry, const
                        options.down.output_hadamard, layout.total_bytes))
         return result;
     const uint8_t* base = (const uint8_t*) plan.blob_base[group];
+    const auto aligned_raw_projection = [base](const ExpertProjectionLayout& projection) {
+        if (projection.storage != ProjectionStorage::raw) return true;
+        const uint64_t weight_alignment = (uint64_t) raw::dtype_bytes(projection.raw_dtype);
+        const uint64_t bias_alignment = (uint64_t) raw::dtype_bytes(projection.raw_bias_dtype);
+        if (weight_alignment == 0 || (projection.raw_weights.offset + (uint64_t) (uintptr_t) base) % weight_alignment != 0)
+            return false;
+        return projection.raw_bias.bytes == 0 ||
+               (bias_alignment != 0 && (projection.raw_bias.offset + (uint64_t) (uintptr_t) base) % bias_alignment == 0);
+    };
+    if (!aligned_raw_projection(layout.gate) || !aligned_raw_projection(layout.up) ||
+        !aligned_raw_projection(layout.down))
+        return result;
     result.gate = matrix_from_layout(layout.gate, base);
     result.up = matrix_from_layout(layout.up, base);
     result.down = matrix_from_layout(layout.down, base);
@@ -217,9 +272,15 @@ inline ResolvedEntry resolve_entry(const GroupedPlan& plan, int32_t entry, const
     return result;
 }
 
-inline float dot_value(const MatrixView& view, const float* input_basis, int64_t col) {
+inline float dot_value(const ProjectionView& view, const float* input_basis, int64_t col) {
     float dot = 0.0f;
-    for (int64_t row = 0; row < view.k; ++row) dot += input_basis[row] * decoded_weight(view, row, col);
+    if (view.is_packed()) {
+        const MatrixView packed = view.packed_matrix();
+        for (int64_t row = 0; row < view.k; ++row) dot += input_basis[row] * decoded_weight(packed, row, col);
+    } else {
+        const size_t base = (size_t) col * (size_t) view.k;
+        for (int64_t row = 0; row < view.k; ++row) dot += input_basis[row] * raw_value(view.raw, base + (size_t) row);
+    }
     return dot;
 }
 
@@ -305,17 +366,20 @@ sycl::event submit_gate_up_post(sycl::queue& queue, const GroupedPlan& plan, flo
                                  (size_t) entry * (size_t) plane;
             float* up_output = scratch + 5 * (size_t) plan.max_entries * (size_t) plane +
                                (size_t) entry * (size_t) plane;
-            const auto post = [&](const MatrixView& view, const GemvOptions& projection_options, const float* dot,
+            const auto post = [&](const ProjectionView& view, const GemvOptions& projection_options, const float* dot,
                                   float* output) {
                 float value = dot[col];
-                if (projection_options.output_hadamard && view.svh != nullptr) {
+                if (view.is_packed() && projection_options.output_hadamard && view.svh != nullptr) {
                     const int64_t block = col & ~int64_t(127);
                     const int local = (int) (col & 127);
                     value = 0.0f;
                     for (int j = 0; j < 128; ++j) value += (float) hadamard_sign(local, j) * dot[block + j];
                     value *= kHadamardScale * f32_from_f16(view.svh[col]);
                 }
-                if (projection_options.add_bias && view.bias != nullptr) value += f32_from_f16(view.bias[col]);
+                if (projection_options.add_bias) {
+                    if (view.is_packed() && view.bias != nullptr) value += f32_from_f16(view.bias[col]);
+                    else if (view.is_raw() && view.raw.bias != nullptr) value += raw_bias_value(view.raw, (size_t) col);
+                }
                 output[col] = value;
             };
             post(resolved.gate, options.gate, gate_dot, gate_output);
@@ -372,7 +436,7 @@ sycl::event exl3_grouped_fp32(sycl::queue& queue, const GroupedPlan& plan, const
             const float* activation_values = scratch + 4 * (size_t) plan.max_entries * (size_t) plane +
                                              (size_t) entry * (size_t) plane;
             float* down_input_values = scratch + (size_t) entry * (size_t) plane;
-            if (options.down.input_hadamard && resolved.down.suh != nullptr) {
+            if (resolved.down.is_packed() && options.down.input_hadamard && resolved.down.suh != nullptr) {
                 const int64_t block = row & ~int64_t(127);
                 const int local = (int) (row & 127);
                 float sum = 0.0f;
@@ -414,7 +478,7 @@ sycl::event exl3_grouped_fp32(sycl::queue& queue, const GroupedPlan& plan, const
             const float* dot = scratch + 2 * (size_t) plan.max_entries * (size_t) plane +
                                (size_t) entry * (size_t) plane;
             float* output = y + (int64_t) resolved.destination * ldy;
-            if (options.down.output_hadamard && resolved.down.svh != nullptr) {
+            if (resolved.down.is_packed() && options.down.output_hadamard && resolved.down.svh != nullptr) {
                 const int64_t block = col & ~int64_t(127);
                 const int local = (int) (col & 127);
                 float transformed = 0.0f;
@@ -425,8 +489,12 @@ sycl::event exl3_grouped_fp32(sycl::queue& queue, const GroupedPlan& plan, const
                 output[col] = transformed;
             } else {
                 output[col] = dot[col];
-                if (options.down.add_bias && resolved.down.bias != nullptr)
-                    output[col] += f32_from_f16(resolved.down.bias[col]);
+                if (options.down.add_bias) {
+                    if (resolved.down.is_packed() && resolved.down.bias != nullptr)
+                        output[col] += f32_from_f16(resolved.down.bias[col]);
+                    else if (resolved.down.is_raw() && resolved.down.raw.bias != nullptr)
+                        output[col] += raw_bias_value(resolved.down.raw, (size_t) col);
+                }
             }
         });
     });

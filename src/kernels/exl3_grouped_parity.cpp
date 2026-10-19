@@ -5,6 +5,7 @@
 // EXL3 fixture layout follows exllamav3's MIT-licensed packed representation.
 // Grouped routed-expert parity against an independent FP64 host oracle.
 #include "strata/kernels/exl3_grouped.hpp"
+#include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/core/gpu.hpp"
 
@@ -29,6 +30,7 @@ using strata::kernels::exl3::ExpertComponentLayout;
 using strata::kernels::exl3::ExpertProjectionLayout;
 using strata::kernels::exl3::MatrixView;
 using strata::kernels::f32_from_f16;
+using strata::kernels::f32_from_bf16;
 
 constexpr float kHadamardScale = 0.08838834764831845f;
 
@@ -46,6 +48,20 @@ struct HostExpert {
     ExpertBlobLayout layout;
     std::vector<uint8_t> blob;
     HostMatrix gate, up, down;
+};
+
+struct RawHostProjection {
+    int64_t k = 0, n = 0;
+    strata::kernels::raw::DType dtype = strata::kernels::raw::DType::F32;
+    strata::kernels::raw::DType bias_dtype = strata::kernels::raw::DType::F32;
+    std::vector<uint8_t> weights, bias;
+};
+
+struct MixedHostExpert {
+    ExpertBlobLayout layout;
+    std::vector<uint8_t> blob;
+    HostMatrix gate;
+    RawHostProjection up, down;
 };
 
 bool read_bytes(const std::vector<uint8_t>& bytes, size_t& at, void* dst, size_t count) {
@@ -174,6 +190,54 @@ ExpertProjectionLayout append_projection(std::vector<uint8_t>& blob, const HostM
     return result;
 }
 
+ExpertComponentLayout append_raw_component(std::vector<uint8_t>& blob, const std::vector<uint8_t>& bytes) {
+    while ((blob.size() & 7u) != 0) blob.push_back(0);
+    ExpertComponentLayout result{blob.size(), bytes.size()};
+    blob.insert(blob.end(), bytes.begin(), bytes.end());
+    return result;
+}
+
+RawHostProjection raw_projection(int64_t k, int64_t n, strata::kernels::raw::DType dtype,
+                                 strata::kernels::raw::DType bias_dtype) {
+    RawHostProjection result;
+    result.k = k;
+    result.n = n;
+    result.dtype = dtype;
+    result.bias_dtype = bias_dtype;
+    const size_t count = static_cast<size_t>(k) * static_cast<size_t>(n);
+    const int weight_bytes = strata::kernels::raw::dtype_bytes(dtype);
+    result.weights.resize(count * static_cast<size_t>(weight_bytes));
+    if (dtype == strata::kernels::raw::DType::F32) {
+        const float value = 0.03125f;
+        for (size_t i = 0; i < count; ++i) std::memcpy(result.weights.data() + i * 4, &value, 4);
+    } else {
+        const uint16_t value = dtype == strata::kernels::raw::DType::BF16 ? 0x3f80 : 0x3c00;
+        for (size_t i = 0; i < count; ++i) std::memcpy(result.weights.data() + i * 2, &value, 2);
+    }
+    const int bias_bytes = strata::kernels::raw::dtype_bytes(bias_dtype);
+    result.bias.resize(static_cast<size_t>(n) * static_cast<size_t>(bias_bytes));
+    if (bias_dtype == strata::kernels::raw::DType::F32) {
+        const float value = 0.125f;
+        for (int64_t i = 0; i < n; ++i) std::memcpy(result.bias.data() + (size_t) i * 4, &value, 4);
+    } else {
+        const uint16_t value = bias_dtype == strata::kernels::raw::DType::BF16 ? 0x3d00 : 0x3400;
+        for (int64_t i = 0; i < n; ++i) std::memcpy(result.bias.data() + (size_t) i * 2, &value, 2);
+    }
+    return result;
+}
+
+ExpertProjectionLayout append_raw_projection(std::vector<uint8_t>& blob, const RawHostProjection& matrix) {
+    ExpertProjectionLayout result;
+    result.storage = strata::kernels::exl3::ProjectionStorage::raw;
+    result.k = matrix.k;
+    result.n = matrix.n;
+    result.raw_dtype = matrix.dtype;
+    result.raw_bias_dtype = matrix.bias_dtype;
+    result.raw_weights = append_raw_component(blob, matrix.weights);
+    result.raw_bias = append_raw_component(blob, matrix.bias);
+    return result;
+}
+
 HostExpert make_expert(HostMatrix gate, HostMatrix up, HostMatrix down) {
     HostExpert result;
     result.gate = std::move(gate);
@@ -183,6 +247,20 @@ HostExpert make_expert(HostMatrix gate, HostMatrix up, HostMatrix down) {
     result.layout.gate = append_projection(result.blob, result.gate);
     result.layout.up = append_projection(result.blob, result.up);
     result.layout.down = append_projection(result.blob, result.down);
+    result.layout.total_bytes = result.blob.size();
+    return result;
+}
+
+MixedHostExpert make_mixed_expert(HostMatrix gate) {
+    MixedHostExpert result;
+    result.gate = std::move(gate);
+    result.up = raw_projection(128, 128, strata::kernels::raw::DType::F16, strata::kernels::raw::DType::F16);
+    result.down = raw_projection(128, 128, strata::kernels::raw::DType::BF16, strata::kernels::raw::DType::BF16);
+    result.layout.alignment = 8;
+    result.layout.gate = append_projection(result.blob, result.gate);
+    result.layout.up = append_raw_projection(result.blob, result.up);
+    result.layout.down = append_raw_projection(result.blob, result.down);
+    while ((result.blob.size() & 7u) != 0) result.blob.push_back(0);
     result.layout.total_bytes = result.blob.size();
     return result;
 }
@@ -230,6 +308,49 @@ void expert_reference(const HostExpert& expert, const float* x, int64_t ldx, flo
     for (size_t i = 0; i < activation.size(); ++i)
         activation[i] = gate[i] / (1.0f + std::exp(-gate[i])) * up[i];
     linear_reference(expert.down, activation.data(), expert.down.k, y, ldy);
+}
+
+float raw_value(const RawHostProjection& matrix, size_t index) {
+    if (matrix.dtype == strata::kernels::raw::DType::F16) {
+        uint16_t value; std::memcpy(&value, matrix.weights.data() + index * 2, 2);
+        return f32_from_f16(value);
+    }
+    if (matrix.dtype == strata::kernels::raw::DType::BF16) {
+        uint16_t value; std::memcpy(&value, matrix.weights.data() + index * 2, 2);
+        return f32_from_bf16(value);
+    }
+    float value; std::memcpy(&value, matrix.weights.data() + index * 4, 4); return value;
+}
+
+float raw_bias_value(const RawHostProjection& matrix, size_t index) {
+    if (matrix.bias_dtype == strata::kernels::raw::DType::F16) {
+        uint16_t value; std::memcpy(&value, matrix.bias.data() + index * 2, 2);
+        return f32_from_f16(value);
+    }
+    if (matrix.bias_dtype == strata::kernels::raw::DType::BF16) {
+        uint16_t value; std::memcpy(&value, matrix.bias.data() + index * 2, 2);
+        return f32_from_bf16(value);
+    }
+    float value; std::memcpy(&value, matrix.bias.data() + index * 4, 4); return value;
+}
+
+void raw_linear_reference(const RawHostProjection& matrix, const float* x, int64_t ldx, float* y, int64_t ldy) {
+    for (int64_t col = 0; col < matrix.n; ++col) {
+        double sum = 0.0;
+        for (int64_t row = 0; row < matrix.k; ++row)
+            sum += (double) x[row] * (double) raw_value(matrix, (size_t) col * (size_t) matrix.k + (size_t) row);
+        y[col] = (float) sum + raw_bias_value(matrix, (size_t) col);
+    }
+    (void) ldx; (void) ldy;
+}
+
+void mixed_expert_reference(const MixedHostExpert& expert, const float* x, int64_t ldx, float* y, int64_t ldy) {
+    std::vector<float> gate(expert.gate.n), up(expert.up.n), activation(expert.gate.n);
+    linear_reference(expert.gate, x, ldx, gate.data(), expert.gate.n);
+    raw_linear_reference(expert.up, x, ldx, up.data(), expert.up.n);
+    for (size_t i = 0; i < activation.size(); ++i)
+        activation[i] = gate[i] / (1.0f + std::exp(-gate[i])) * up[i];
+    raw_linear_reference(expert.down, activation.data(), expert.down.k, y, ldy);
 }
 
 bool close(float got, float expected) {
@@ -373,6 +494,40 @@ int main(int argc, char** argv) {
     std::printf("inactive scratch sentinel: %s (%zu bad)\n", inactive_scratch_bad == 0 ? "OK" : "FAIL",
                 inactive_scratch_bad);
     if (inactive_scratch_bad != 0) ++failures;
+
+    // A separate one-entry grouped launch covers a packed 2bpw gate with raw
+    // F16 up and raw BF16 down.  Raw dtype and bias spans stay in the format
+    // table; no packed bits sentinel is involved.
+    const MixedHostExpert mixed = make_mixed_expert(materialize(*b2_256_128, 128, 128));
+    uint8_t* d_mixed_blob = device.upload(mixed.blob);
+    const std::vector<uint64_t> mixed_blob_base{(uint64_t) (uintptr_t) d_mixed_blob};
+    const std::vector<int32_t> mixed_format_index{0}, mixed_starts{0, 1}, mixed_tok{0}, mixed_dst{0};
+    const std::vector<ExpertBlobLayout> mixed_formats{mixed.layout};
+    const int32_t mixed_ngroups_value = 1, mixed_nentries_value = 1;
+    uint64_t* d_mixed_blob_base = device.upload(mixed_blob_base);
+    int32_t* d_mixed_format_index = device.upload(mixed_format_index);
+    ExpertBlobLayout* d_mixed_formats = device.upload(mixed_formats);
+    int32_t* d_mixed_starts = device.upload(mixed_starts);
+    int32_t* d_mixed_tok = device.upload(mixed_tok);
+    int32_t* d_mixed_dst = device.upload(mixed_dst);
+    int32_t* d_mixed_ngroups = device.upload(std::vector<int32_t>{mixed_ngroups_value});
+    int32_t* d_mixed_nentries = device.upload(std::vector<int32_t>{mixed_nentries_value});
+    strata::kernels::exl3::GroupedPlan mixed_plan{d_mixed_blob_base, d_mixed_format_index, d_mixed_formats,
+                                                   d_mixed_starts, d_mixed_tok, d_mixed_dst, d_mixed_ngroups,
+                                                   d_mixed_nentries, 1, 1, 1, 1, 1, 128, 128};
+    std::vector<float> mixed_x(131, -777.0f), mixed_expected(133, sentinel), mixed_actual(133, sentinel);
+    for (int i = 0; i < 128; ++i) mixed_x[(size_t) i] = 0.017f * (float) (i - 40);
+    mixed_expert_reference(mixed, mixed_x.data(), 131, mixed_expected.data(), 133);
+    float* d_mixed_x = device.upload(mixed_x);
+    float* d_mixed_y = device.upload(mixed_actual);
+    const size_t mixed_scratch_elements = strata::kernels::exl3::exl3_grouped_scratch_elements(mixed_plan);
+    float* d_mixed_scratch = device.alloc<float>(mixed_scratch_elements);
+    strata::kernels::exl3::exl3_grouped_fp32(queue, mixed_plan, d_mixed_x, 131, d_mixed_y, 133, d_mixed_scratch,
+                                             mixed_scratch_elements).wait_and_throw();
+    strata::parity::copy_out(mixed_actual.data(), d_mixed_y, mixed_actual.size());
+    const bool mixed_ok = check_rows(mixed_actual, mixed_expected, 133, 128, sentinel, std::vector<int32_t>{0},
+                                     "grouped packed2/F16/BF16");
+    if (!mixed_ok) ++failures;
 
     // Capture the same bounded launch sequence on an engine stream.  The graph stores the static plan pointers,
     // while ngroups/nentries remain device scalars and can change between replays without recapturing.

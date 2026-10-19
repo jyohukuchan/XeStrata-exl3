@@ -20,7 +20,9 @@ cb0、mcg、mul1、F16 scale、旧形式の符号 bitfield、F16/F32 biasを扱�
 行列の圧縮成分だけを読み、展開済みの重み全体は作らない。非量子化 tensor は raw descriptor として残る。
 `find_linear()` は名前で descriptor を検索する。expert factory は gate/up/down を一つの blob にまとめ、
 各成分の offset、bit 幅、codebook を保持する。blob を別のアドレスへコピーした後も同じ layout から
-view を作れる。raw expert はこの factory の対象に含まない。
+view を作れる。各 projection は packed trellis と raw を明示的に区別し、raw weight と bias の
+F16/BF16/F32 を元の dtype と bit 列のまま保持する。raw を16bit trellis として代用しない。
+同名の packed/raw 表現が同時にある場合は曖昧な入力として拒否する。
 
 raw materializer は明示した軸ごとの並べ替え・部分選択を扱い、identity 変換では F16/BF16/F32 の
 元の bit 列を保つ。norm の `+1` と GDN `A_log` の `-exp` は明示した場合だけ F32 で適用する。
@@ -42,7 +44,7 @@ CPU と SYCL は共通の `MatrixView` を使う。SYCL の FP32 GEMV/GEMM は�
 input/output の H128、scale、bias を適用する。batched GEMM は padding を含む row stride と明示的な
 event 依存を受け取り、scratch は呼び出し側が確保する。CPU の linear も行列全体を展開せずに計算する。
 
-`ExpertView` は gate/up/down の三つの行列を独立に保持する。CPU と SYCL の expert 演算は
+`ExpertView` は gate/up/down の三つの packed/raw projection を独立に保持する。CPU と SYCL の expert 演算は
 `down(silu(gate(x)) * up(x))` を計算し、router weight は適用しない。
 
 `Exl3ExpertSource` は layer/expert ごとの明示的な名前表を受け取り、要求された expert の圧縮 blob だけを

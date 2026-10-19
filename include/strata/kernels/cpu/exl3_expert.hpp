@@ -28,6 +28,11 @@ struct ExpertScratch {
 /// descriptor or the row count is invalid/overflowing.
 size_t expert_scratch_bytes(const strata::kernels::exl3::ExpertView& view, int64_t rows);
 
+/// Validate an expert job without writing output.  The pool uses this to
+/// preserve the precise packed/raw status before publishing a batch.
+Status validate_expert(const strata::kernels::exl3::ExpertView& view, int64_t rows, const float* x, int64_t ldx,
+                       float* y, int64_t ldy);
+
 /// Routed expert composition for FP32 rows:
 /// `y = down(silu(gate(x)) * up(x))`.  Each projection keeps its own bits and
 /// codebook.  No full weight matrix is materialized.

@@ -31,6 +31,27 @@ strata::core::Exl3ExpertFormatDesc valid_format() {
     return d;
 }
 
+strata::core::Exl3ExpertFormatDesc valid_raw_format() {
+    strata::core::Exl3ExpertFormatDesc d;
+    d.alignment = 4;
+    d.gate.k = d.up.k = 128; d.gate.n = d.up.n = 256;
+    d.down.k = 256; d.down.n = 128;
+    uint64_t at = 0;
+    auto fill = [&](auto& p, strata::kernels::raw::DType dtype, strata::kernels::raw::DType bias_dtype) {
+        p.storage = strata::kernels::exl3::ProjectionStorage::raw;
+        p.bits = 0; p.codebook = 0; p.raw_dtype = dtype; p.raw_bias_dtype = bias_dtype;
+        const uint64_t weights = (uint64_t) p.k * (uint64_t) p.n * (uint64_t) strata::kernels::raw::dtype_bytes(dtype);
+        const uint64_t bias = (uint64_t) p.n * (uint64_t) strata::kernels::raw::dtype_bytes(bias_dtype);
+        p.raw_weights = {at, weights}; at += weights;
+        p.raw_bias = {at, bias}; at += bias;
+    };
+    fill(d.gate, strata::kernels::raw::DType::F16, strata::kernels::raw::DType::BF16);
+    fill(d.up, strata::kernels::raw::DType::BF16, strata::kernels::raw::DType::F16);
+    fill(d.down, strata::kernels::raw::DType::F32, strata::kernels::raw::DType::F32);
+    d.total_bytes = at;
+    return d;
+}
+
 bool check(bool condition, const char* text) {
     if (!condition) std::fprintf(stderr, "FAIL: %s\n", text);
     return condition;
@@ -76,6 +97,18 @@ int main() {
         ++failures;
     if (!check(registry.find(id_a) != nullptr && exl3_expert_format_equal(*registry.find(id_a), a), "registry lookup"))
         ++failures;
+
+    Exl3ExpertFormatDesc raw = valid_raw_format();
+    const Exl3ExpertFormatID raw_id = exl3_expert_format_id(raw);
+    if (!check(validate_exl3_expert_format(raw, error) && raw_id != 0 && raw_id != id_a,
+               "raw mixed F16/BF16/F32 format validates with a distinct id"))
+        ++failures;
+    Exl3ExpertFormatDesc raw_dtype = raw;
+    raw_dtype.gate.raw_dtype = strata::kernels::raw::DType::F32;
+    if (!check(exl3_expert_format_id(raw_dtype) != raw_id, "raw weight dtype changes format id")) ++failures;
+    Exl3ExpertFormatDesc raw_bias_dtype = raw;
+    raw_bias_dtype.gate.raw_bias_dtype = strata::kernels::raw::DType::F32;
+    if (!check(exl3_expert_format_id(raw_bias_dtype) != raw_id, "raw bias dtype changes format id")) ++failures;
 
     Exl3ExpertFormatDesc overlap = a;
     overlap.up.trellis.offset = overlap.gate.trellis.offset;

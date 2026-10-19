@@ -105,6 +105,19 @@ void add_linear(std::vector<std::pair<std::string, Tensor>>& tensors, const std:
     if (codebook == 2) tensors.emplace_back(base + ".mul1", Tensor{"I32", {1}, u32(0x83DCD12Du)});
 }
 
+void add_raw_linear(std::vector<std::pair<std::string, Tensor>>& tensors, const std::string& base, int k, int n,
+                    const std::string& dtype, bool bias, const std::string& bias_dtype) {
+    const size_t count = static_cast<size_t>(k) * static_cast<size_t>(n);
+    std::vector<uint8_t> data;
+    if (dtype == "F32") data = f32_vector(count, 0.03125f);
+    else data = words(count, dtype == "BF16" ? 0x3d00 : 0x3c00);
+    tensors.emplace_back(base + ".weight", Tensor{dtype, {(uint64_t) n, (uint64_t) k}, std::move(data)});
+    if (bias) {
+        if (bias_dtype == "F32") tensors.emplace_back(base + ".bias", Tensor{"F32", {(uint64_t) n}, f32_vector(n, 0.125f)});
+        else tensors.emplace_back(base + ".bias", Tensor{bias_dtype, {(uint64_t) n}, words(n, 0x3c00)});
+    }
+}
+
 void make_archive(const std::filesystem::path& root, int hidden, int ff, const int bits[3], const int codebooks[3],
                   const bool legacy[3], const bool biases[3], const bool f32_bias[3], bool malformed_down = false) {
     std::filesystem::create_directories(root);
@@ -114,6 +127,30 @@ void make_archive(const std::filesystem::path& root, int hidden, int ff, const i
     add_linear(tensors, names[0], hidden, ff, bits[0], codebooks[0], legacy[0], biases[0], f32_bias[0]);
     add_linear(tensors, names[1], hidden, ff, bits[1], codebooks[1], legacy[1], biases[1], f32_bias[1]);
     add_linear(tensors, names[2], malformed_down ? hidden : ff, hidden, bits[2], codebooks[2], legacy[2], biases[2], f32_bias[2]);
+    write_safetensors(root / "model.safetensors", tensors);
+}
+
+void make_mixed_raw_archive(const std::filesystem::path& root, bool f32_gate) {
+    std::filesystem::create_directories(root);
+    std::ofstream(root / "config.json") << R"({"model_type":"synthetic-exl3-mixed-raw"})";
+    std::vector<std::pair<std::string, Tensor>> tensors;
+    if (f32_gate)
+        add_raw_linear(tensors, "expert.gate", 128, 256, "F32", true, "BF16");
+    else
+        add_linear(tensors, "expert.gate", 128, 256, 2, 0, false, true, false);
+    add_raw_linear(tensors, "expert.up", 128, 256, "F16", false, "F16");
+    add_raw_linear(tensors, "expert.down", 256, 128, "BF16", true, "F16");
+    write_safetensors(root / "model.safetensors", tensors);
+}
+
+void make_ambiguous_archive(const std::filesystem::path& root) {
+    std::filesystem::create_directories(root);
+    std::ofstream(root / "config.json") << R"({"model_type":"synthetic-exl3-ambiguous"})";
+    std::vector<std::pair<std::string, Tensor>> tensors;
+    add_linear(tensors, "expert.gate", 128, 256, 2, 0, false, false, false);
+    add_raw_linear(tensors, "expert.gate", 128, 256, "F16", false, "F16");
+    add_raw_linear(tensors, "expert.up", 128, 256, "F16", false, "F16");
+    add_raw_linear(tensors, "expert.down", 256, 128, "BF16", false, "F16");
     write_safetensors(root / "model.safetensors", tensors);
 }
 
@@ -130,6 +167,13 @@ void compare_component(const artifact::ExpertBlob& blob, const format::ExpertCom
           label + " byte exact");
 }
 
+void compare_raw_component(const artifact::ExpertBlob& blob, const format::ExpertComponentLayout& layout,
+                           const std::vector<uint8_t>& expected, const std::string& label) {
+    check(layout.bytes == expected.size(), label + " byte length");
+    check(expected.empty() || std::memcmp(blob.data() + layout.offset, expected.data(), expected.size()) == 0,
+          label + " byte exact");
+}
+
 void run_case(const std::filesystem::path& root, const artifact::ExpertTensorNames& names, size_t& total_bytes) {
     artifact::Archive archive(root);
     format::ExpertBlobLayout metadata;
@@ -140,7 +184,7 @@ void run_case(const std::filesystem::path& root, const artifact::ExpertTensorNam
     check(artifact::materialize_expert(archive, names, blob, err), "materialize expert: " + err);
     if (blob.data() == nullptr) return;
     total_bytes = blob.bytes();
-    check(blob.layout.alignment == 2 && blob.bytes() == blob.layout.total_bytes, "typed storage size and alignment");
+    check(blob.layout.alignment == 8 && blob.bytes() == blob.layout.total_bytes, "typed storage size and alignment");
     check(metadata.total_bytes == blob.layout.total_bytes && metadata.gate.trellis.bytes == blob.layout.gate.trellis.bytes &&
               metadata.up.trellis.bytes == blob.layout.up.trellis.bytes && metadata.down.trellis.bytes == blob.layout.down.trellis.bytes,
           "metadata/materialized layout agreement");
@@ -168,9 +212,9 @@ void run_case(const std::filesystem::path& root, const artifact::ExpertTensorNam
           "rebased view trellis pointers");
     check(view.gate.suh != nullptr && view.up.suh != nullptr && view.down.suh != nullptr,
           "rebased view scale pointers");
-    std::vector<uint16_t> copied = blob.words;
+    std::vector<uint64_t> copied = blob.storage;
     const auto copied_view = format::expert_view(blob.layout, reinterpret_cast<const uint8_t*>(copied.data()));
-    check(copied_view.gate.trellis == reinterpret_cast<const uint16_t*>(copied.data() + blob.layout.gate.trellis.offset),
+    check(copied_view.gate.trellis == reinterpret_cast<const uint16_t*>(reinterpret_cast<const uint8_t*>(copied.data()) + blob.layout.gate.trellis.offset),
           "copy/rebase gate pointer");
     check(copied_view.down.trellis != view.down.trellis, "copy/rebase changes base pointer");
 }
@@ -198,6 +242,48 @@ int main() {
     size_t bytes_b = 0;
     run_case(base / "b", names, bytes_b);
     check(bytes_a != bytes_b, "different per-projection bit allocation changes blob bytes");
+
+    make_mixed_raw_archive(base / "mixed", false);
+    artifact::Archive mixed_archive(base / "mixed");
+    format::ExpertBlobLayout mixed_layout;
+    check(artifact::describe_expert(mixed_archive, names, mixed_layout, err), "mixed packed/raw metadata opens");
+    check(mixed_layout.gate.storage == format::ProjectionStorage::packed_trellis &&
+              mixed_layout.up.storage == format::ProjectionStorage::raw &&
+              mixed_layout.up.raw_dtype == strata::kernels::raw::DType::F16 &&
+              mixed_layout.down.storage == format::ProjectionStorage::raw &&
+              mixed_layout.down.raw_dtype == strata::kernels::raw::DType::BF16,
+          "mixed packed2/F16/BF16 discriminators and dtypes");
+    artifact::ExpertBlob mixed_blob;
+    check(artifact::materialize_expert(mixed_archive, names, mixed_blob, err), "mixed packed/raw materializes: " + err);
+    const auto* mixed_up = mixed_archive.find_tensor("expert.up.weight");
+    const auto* mixed_down = mixed_archive.find_tensor("expert.down.weight");
+    std::vector<uint8_t> mixed_up_bytes, mixed_down_bytes;
+    mixed_archive.read_tensor(*mixed_up, mixed_up_bytes);
+    mixed_archive.read_tensor(*mixed_down, mixed_down_bytes);
+    compare_raw_component(mixed_blob, mixed_blob.layout.up.raw_weights, mixed_up_bytes, "raw F16 up weights");
+    compare_raw_component(mixed_blob, mixed_blob.layout.down.raw_weights, mixed_down_bytes, "raw BF16 down weights");
+    check(mixed_blob.view().up.is_raw() && mixed_blob.view().down.is_raw() && mixed_blob.view().up.raw.data != nullptr,
+          "mixed raw view is explicit and non-null");
+
+    make_mixed_raw_archive(base / "f32", true);
+    artifact::Archive f32_archive(base / "f32");
+    format::ExpertBlobLayout f32_layout;
+    check(artifact::describe_expert(f32_archive, names, f32_layout, err), "raw F32 metadata opens");
+    check(f32_layout.gate.storage == format::ProjectionStorage::raw &&
+              f32_layout.gate.raw_dtype == strata::kernels::raw::DType::F32 &&
+              f32_layout.gate.raw_bias_dtype == strata::kernels::raw::DType::BF16,
+          "raw F32 weight and BF16 bias dtype are retained");
+    artifact::ExpertBlob f32_blob;
+    check(artifact::materialize_expert(f32_archive, names, f32_blob, err), "raw F32 expert materializes: " + err);
+    check(f32_blob.view().gate.is_raw() && f32_blob.view().gate.raw.dtype == strata::kernels::raw::DType::F32,
+          "raw F32 view is not interpreted as trellis");
+
+    make_ambiguous_archive(base / "ambiguous");
+    artifact::Archive ambiguous_archive(base / "ambiguous");
+    format::ExpertBlobLayout ambiguous_layout;
+    check(!artifact::describe_expert(ambiguous_archive, names, ambiguous_layout, err) &&
+              err.find("both packed and raw") != std::string::npos,
+          "packed/raw representation ambiguity is rejected");
 
     make_archive(base / "bad", 128, 256, bits_a, cb_a, legacy_a, bias_a, f32_a, true);
     artifact::Archive bad_archive(base / "bad");

@@ -21,7 +21,9 @@ the selected matrix's compressed components without producing an expanded weight
 tensors retain their raw descriptors.
 `find_linear()` looks up descriptors by name. The expert factory packs gate/up/down into one blob,
 preserving each component's offset, bit width and codebook. The same layout recreates views after
-copying the blob to a different address. This factory does not include raw experts.
+copying the blob to a different address. Each projection explicitly distinguishes packed trellis from raw
+storage. Raw weights and biases retain their F16/BF16/F32 dtype and bits; raw storage is never represented
+as a 16-bit trellis. Simultaneous packed and raw representations of the same name are rejected as ambiguous.
 
 The raw materializer applies explicit per-axis permutations and subsets. Identity value transforms preserve
 original F16/BF16/F32 bits. Norm `+1` and GDN `A_log` `-exp` transformations produce F32 only when explicitly
@@ -45,7 +47,7 @@ CPU and SYCL share `MatrixView`. SYCL FP32 GEMV/GEMM decode packed trellis weigh
 applying input/output H128, scales and bias. Batched GEMM accepts padded row strides and explicit event
 dependencies, with caller-owned scratch. CPU linear operations also avoid expanding the full matrix.
 
-`ExpertView` keeps gate/up/down as three independent matrices. CPU and SYCL expert operations compute
+`ExpertView` keeps gate/up/down as three independent packed or raw projections. CPU and SYCL expert operations compute
 `down(silu(gate(x)) * up(x))` without applying a router weight.
 
 `Exl3ExpertSource` accepts an explicit name table per layer/expert and loads compressed blobs only for
