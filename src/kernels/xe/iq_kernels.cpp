@@ -2008,9 +2008,12 @@ bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_
     // down rows) for both
     if (gu_type == 30 || d_type == 30)   // BF16 (native_expert_grouped_bf16): both sides, rows of whole value pairs
         return gu_type == 30 && d_type == 30 && n_embd > 0 && n_ff > 0 && n_embd % 32 == 0 && n_ff % 32 == 0;
-    const bool gu = in_iq_gemm(gu_type) ? gu_type != 20
-                                        : gu_type == 12 || gu_type == 13 || gu_type == 14 || gu_type == 8 ||
-                                          gu_type == 6 || gu_type == 2 || gu_type == 3 || gu_type == 10 || gu_type == 11;
+    // IQ4_NL is a 32-value codebook format, just like the legacy 4-bit rows below.  Its
+    // grouped dot path is implemented by Split<20>; keeping it out here made a standard
+    // IQ4_NL gate/up + IQ4_NL down model fail startup even though the prompt dequantizer
+    // and the down-row kernel already accepted type 20.
+    const bool gu = in_iq_gemm(gu_type) || gu_type == 12 || gu_type == 13 || gu_type == 14 || gu_type == 8 ||
+                    gu_type == 6 || gu_type == 2 || gu_type == 3 || gu_type == 10 || gu_type == 11;
     const bool d = d_type == 20 || d_type == 23 || d_type == 42 || d_type == 6 || d_type == 7 || d_type == 8 ||
                    d_type == 2 || d_type == 3 || d_type == 14 || d_type == 10 || d_type == 11 || d_type == 12 ||
                    d_type == 13;
@@ -2088,6 +2091,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
             case 16: launch_native_gu<16, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
             case 17: launch_native_gu<17, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
             case 18: launch_native_gu<18, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
+            case 20: launch_native_gu<20, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
             case 21: launch_native_gu<21, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
             case 22: launch_native_gu<22, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
             case 23: launch_native_gu<23, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
