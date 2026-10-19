@@ -9,6 +9,7 @@
 #include "strata/kernels/exl3.hpp"
 
 #include "strata/kernels/f16_bits.hpp"
+#include "cuda_intrinsics.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_exl3
 #include "strata/kernels/device_arch_tag.hpp"
 
@@ -21,6 +22,11 @@ namespace strata::kernels::exl3 {
 namespace {
 
 constexpr float kHadamardScale = 0.08838834764831845f;  // 1 / sqrt(128), as in exllamav3's reconstruct path
+// Codebook 2 uses the unsigned byte sum of state * 0x83DCD12D.  dp4a is signed-byte, so flip the sign bit
+// and add 512; this is exactly sum(u_i - 128) + 512 = sum(u_i), with no change to the following F16-RNE formula.
+inline int cb2_byte_sum_dp4a(uint32_t x) {
+    return strata::kernels::xe::dp4a(sycl::bit_cast<int32_t>(x ^ 0x80808080u), 0x01010101, 512);
+}
 // gitleaks:allow -- public EXL3 codebook multipliers and bit masks, never credentials.
 
 inline void check_view(const MatrixView& view, const char* who) {
@@ -109,7 +115,7 @@ inline uint16_t decode_state(uint16_t state, int codebook) {
         return f16_from_f32(f32_from_f16((uint16_t) x) + f32_from_f16((uint16_t) (x >> 16)));
     }
     x = x * 0x83DCD12Du;
-    const uint32_t byte_sum = (x & 0xFFu) + ((x >> 8) & 0xFFu) + ((x >> 16) & 0xFFu) + ((x >> 24) & 0xFFu);
+    const int byte_sum = cb2_byte_sum_dp4a(x);
     const uint16_t h = (uint16_t) (0x6400u + byte_sum);
     // The native mul1 path performs a half FMA.  The operands are half-valued and the portable path deliberately
     // rounds once at the same boundary, matching the scalar EXL3 reference used by the parity fixture.
@@ -141,7 +147,7 @@ inline uint16_t packed_decode_codebook(uint16_t state) {
         return f16_from_f32(f32_from_f16((uint16_t) x) + f32_from_f16((uint16_t) (x >> 16)));
     } else {
         x = x * 0x83DCD12Du;
-        const uint32_t byte_sum = (x & 0xFFu) + ((x >> 8) & 0xFFu) + ((x >> 16) & 0xFFu) + ((x >> 24) & 0xFFu);
+        const int byte_sum = cb2_byte_sum_dp4a(x);
         const int32_t numerator = 887 * static_cast<int32_t>(byte_sum) - 452608;
         return f16_from_f32(static_cast<float>(numerator) * 0x1.0p-17f);
     }
@@ -166,7 +172,7 @@ template <int Codebook>
 inline float scalar_decode_codebook_f32(uint16_t state) {
     if constexpr (Codebook == 2) {
         uint32_t x = state * 0x83DCD12Du;
-        const uint32_t byte_sum = (x & 0xFFu) + ((x >> 8) & 0xFFu) + ((x >> 16) & 0xFFu) + ((x >> 24) & 0xFFu);
+        const int byte_sum = cb2_byte_sum_dp4a(x);
         const int32_t numerator = 887 * static_cast<int32_t>(byte_sum) - 452608;
         const float value = static_cast<float>(numerator) * 0x1.0p-17f;
         uint32_t u = 0;
