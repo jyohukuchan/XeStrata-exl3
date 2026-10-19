@@ -31,6 +31,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="cuda", help="Torch device for the native calls")
     parser.add_argument("--out", default="exl3-native-parity.json", type=Path, help="JSON report path")
     parser.add_argument("--seed", default=20261019, type=int)
+    parser.add_argument("--include-head-bits", action="store_true",
+                        help="also check valid 1/6/7/8-bit checkpoint exceptions")
     parser.add_argument("--tolerance", default=0.0, type=float,
                         help="optional absolute error allowance; fused parity still requires zero bit mismatches")
     return parser
@@ -63,8 +65,9 @@ def main() -> int:
         raise SystemExit("native EXL3 parity requires a CUDA/HIP torch device")
     rng = np.random.default_rng(args.seed)
     cases: list[dict[str, Any]] = []
+    checked_bits = ref.SUPPORTED_BITS if args.include_head_bits else ref.PRIMARY_BITS
 
-    for bits in (2, 3, 4, 5):
+    for bits in checked_bits:
         packed = rng.integers(0, 65536, (8, 8, bits * 16), dtype=np.uint16)
         gpu_packed = torch.from_numpy(packed.view(np.int16)).to(device)
         for codebook in (0, 1, 2):
@@ -100,7 +103,7 @@ def main() -> int:
     fused_scale_out = rng.uniform(0.75, 1.25, 128).astype(np.float16)
     gpu_suh = torch.from_numpy(fused_scale_in).to(device)
     gpu_svh = torch.from_numpy(fused_scale_out).to(device)
-    for bits in (2, 3, 4, 5):
+    for bits in checked_bits:
         packed = rng.integers(0, 65536, (8, 8, bits * 16), dtype=np.uint16)
         gpu_packed = torch.from_numpy(packed.view(np.int16)).to(device)
         for codebook in (0, 1, 2):
@@ -133,6 +136,7 @@ def main() -> int:
         "torch": torch.__version__,
         "native_extension": str(getattr(ext, "__file__", "unknown")),
         "seed": args.seed,
+        "checked_bits": list(checked_bits),
         "tolerance": tolerance,
         "cases": cases,
         "passed": passed,

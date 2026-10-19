@@ -35,7 +35,8 @@ set(STRATA_LICENSE contrib CACHE STRING "build mode: free or contrib")
 set_property(CACHE STRATA_LICENSE PROPERTY STRINGS free contrib)
 if(STRATA_LICENSE STREQUAL "contrib-icpx")
   message(FATAL_ERROR "STRATA_LICENSE=contrib-icpx: the contrib-icpx mode (Intel oneAPI's icpx) was removed; use "
-                      "-DSTRATA_LICENSE=contrib (contrib-llvm: intel/llvm, -DCMAKE_CXX_COMPILER=.tools/intel-llvm-contrib/"
+                      "-DSTRATA_LICENSE=contrib (contrib-llvm: intel/llvm, "
+                      "-DCMAKE_CXX_COMPILER=.tools/intel-llvm-contrib/"
                       "install/bin/clang++ or .tools/intel-llvm/install/bin/clang++), or -DSTRATA_LICENSE=free")
 elseif(NOT STRATA_LICENSE MATCHES "^(free|contrib)$")
   message(FATAL_ERROR "STRATA_LICENSE=${STRATA_LICENSE}: free or contrib")
@@ -128,6 +129,23 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt AND EXISTS ${CMAKE_CU
   set(_strata_tests_default ON)
 endif()
 option(STRATA_BUILD_TESTS "Build the test suite" ${_strata_tests_default})
+if(STRATA_BUILD_TESTS)
+  find_package(Python3 COMPONENTS Interpreter QUIET)
+  if(Python3_Interpreter_FOUND)
+    execute_process(COMMAND ${Python3_EXECUTABLE} -c "import numpy"
+                    RESULT_VARIABLE _strata_exl3_numpy OUTPUT_QUIET ERROR_QUIET)
+    if(_strata_exl3_numpy EQUAL 0)
+      set(_strata_exl3_fixture ${CMAKE_CURRENT_BINARY_DIR}/exl3-fixtures.bin)
+      add_custom_command(OUTPUT ${_strata_exl3_fixture}
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/exl3_fixture.py
+                ${_strata_exl3_fixture} --include-head-bits
+        DEPENDS tools/exl3_fixture.py tools/exl3_reference.py
+        COMMENT "Generating EXL3 reconstruction and linear reference fixtures")
+      add_custom_target(strata_exl3_fixture DEPENDS ${_strata_exl3_fixture}
+                        COMMENT "Preparing EXL3 numerical fixtures")
+    endif()
+  endif()
+endif()
 option(STRATA_WERROR "Treat compiler warnings as errors" OFF)
 # The deb and rpm packages (cmake/packaging.cmake; tools/package/build.sh builds them in a clean container)
 option(STRATA_PACKAGE "install rules and CPack for the deb and rpm packages" OFF)
@@ -359,6 +377,7 @@ if(STRATA_ENABLE_XE)
   target_link_libraries(strata-load PRIVATE strata_core)
 
   add_library(strata_kernels STATIC src/kernels/xe/elementwise.cpp src/kernels/xe/iq_kernels.cpp
+                                    src/kernels/xe/exl3.cpp
                                     src/kernels/xe/native_mmvq.cpp src/kernels/xe/rope.cpp
                                     src/kernels/xe/router.cpp src/kernels/xe/bf16_gemv.cpp
                                     src/kernels/xe/quantize_act.cpp src/kernels/xe/qsa.cpp
@@ -624,6 +643,14 @@ if(STRATA_ENABLE_XE)
   target_link_libraries(strata-image PRIVATE strata_image)
 
   if(STRATA_BUILD_TESTS)
+    add_executable(exl3_parity src/kernels/exl3_parity.cpp)
+    target_link_libraries(exl3_parity PRIVATE strata_kernels)
+    target_compile_options(exl3_parity PRIVATE -fno-fast-math -ffp-contract=off)
+    if(TARGET strata_exl3_fixture)
+      add_dependencies(exl3_parity strata_exl3_fixture)
+      add_test(NAME exl3_parity COMMAND exl3_parity ${_strata_exl3_fixture})
+      set_tests_properties(exl3_parity PROPERTIES TIMEOUT 120)
+    endif()
     add_executable(elementwise_parity src/kernels/elementwise_parity.cpp)
     target_link_libraries(elementwise_parity PRIVATE strata_kernels)
     target_compile_options(elementwise_parity PRIVATE -fno-fast-math -ffp-contract=off)
@@ -795,8 +822,20 @@ if(STRATA_BUILD_TESTS)
 endif()
 
 add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
-            src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp)
+            src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp src/kernels/cpu/exl3.cpp)
 target_include_directories(strata_kernels_cpu PUBLIC include)
+set_source_files_properties(src/kernels/xe/exl3.cpp src/kernels/cpu/exl3.cpp
+                           PROPERTIES COMPILE_OPTIONS "-fno-fast-math;-ffp-contract=off;-Wall;-Wextra")
+if(STRATA_BUILD_TESTS)
+  add_executable(exl3_cpu_parity src/kernels/cpu/exl3_parity.cpp)
+  target_link_libraries(exl3_cpu_parity PRIVATE strata_kernels_cpu strata_warnings)
+  target_compile_options(exl3_cpu_parity PRIVATE -fno-fast-math -ffp-contract=off)
+  if(TARGET strata_exl3_fixture)
+    add_dependencies(exl3_cpu_parity strata_exl3_fixture)
+    add_test(NAME exl3_cpu_parity COMMAND exl3_cpu_parity ${_strata_exl3_fixture})
+    set_tests_properties(exl3_cpu_parity PROPERTIES TIMEOUT 120)
+  endif()
+endif()
 # Plan v0.3 P6: only the kernel files get the AVX-512 / AVX2 flags; the pool and the probe run on any x86-64,
 # and the engine picks the kernels at run time (cpu_avx512_ok).
 # `-mavx512vnni` alone is not enough: VBMI is a separate feature bit.

@@ -36,7 +36,8 @@ from typing import Any, cast
 import numpy as np
 
 
-SUPPORTED_BITS = (2, 3, 4, 5)
+PRIMARY_BITS = (2, 3, 4, 5)
+SUPPORTED_BITS = tuple(range(1, 9))
 TILE_VALUES = 256
 TILE_SIDE = 16
 HADAMARD_SIDE = 128
