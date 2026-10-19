@@ -32,8 +32,10 @@ inline void check_view(const MatrixView& view, const char* who) {
         throw std::invalid_argument(std::string(who) + ": bits must be in 1..8");
     if (view.codebook < 0 || view.codebook > 2)
         throw std::invalid_argument(std::string(who) + ": codebook must be 0, 1 or 2");
-    const uint64_t elements = (uint64_t) view.k * (uint64_t) view.n;
-    if (elements > (uint64_t) std::numeric_limits<size_t>::max())
+    // Check before multiplying: a wrapped element count would pass a later
+    // comparison on a 64-bit host and then reach device pointer arithmetic.
+    const uint64_t max_elements = (uint64_t) std::numeric_limits<ptrdiff_t>::max() / sizeof(uint16_t);
+    if ((uint64_t) view.k > max_elements / (uint64_t) view.n)
         throw std::invalid_argument(std::string(who) + ": matrix is too large");
 }
 
@@ -57,6 +59,10 @@ inline void check_gemm(const MatrixView& view, const float* x, float* y, int64_t
     if (rows <= 0) throw std::invalid_argument("exl3_gemm_fp32: rows must be positive");
     if (ldx < view.k || ldy < view.n)
         throw std::invalid_argument("exl3_gemm_fp32: leading dimensions must cover the logical vectors");
+    const uint64_t max_elements = (uint64_t) std::numeric_limits<ptrdiff_t>::max() / sizeof(float);
+    if ((uint64_t) rows > max_elements / (uint64_t) ldx ||
+        (uint64_t) rows > max_elements / (uint64_t) ldy)
+        throw std::invalid_argument("exl3_gemm_fp32: input or output span is too large");
     if (options.input_hadamard && view.suh != nullptr && view.k % 128 != 0)
         throw std::invalid_argument("exl3_gemm_fp32: k must be divisible by 128 for input H128");
     if (options.output_hadamard && view.svh != nullptr && view.n % 128 != 0)
@@ -242,16 +248,25 @@ sycl::event submit_output_hadamard_rows(sycl::queue& queue, const MatrixView& vi
 }  // namespace
 
 size_t exl3_gemv_scratch_elements(const MatrixView& view, GemvOptions options) {
+    check_view(view, "exl3_gemv_scratch_elements");
     size_t result = 0;
     if (options.input_hadamard && view.suh != nullptr) result += (size_t) view.k;
-    if (options.output_hadamard && view.svh != nullptr) result += (size_t) view.n;
+    if (options.output_hadamard && view.svh != nullptr) {
+        const size_t max_elements = (size_t) std::numeric_limits<ptrdiff_t>::max() / sizeof(float);
+        if ((uint64_t) view.n > max_elements || result > max_elements - (size_t) view.n)
+            throw std::invalid_argument("exl3_gemv_fp32: scratch size overflows host address range");
+        result += (size_t) view.n;
+    }
+    if (result > (size_t) std::numeric_limits<ptrdiff_t>::max() / sizeof(float))
+        throw std::invalid_argument("exl3_gemv_fp32: scratch size overflows host address range");
     return result;
 }
 
 size_t exl3_gemm_scratch_elements(const MatrixView& view, int64_t rows, GemvOptions options) {
-    if (rows <= 0) return 0;
+    if (rows <= 0) throw std::invalid_argument("exl3_gemm_fp32: rows must be positive");
     const size_t per_row = exl3_gemv_scratch_elements(view, options);
-    if (per_row > std::numeric_limits<size_t>::max() / (size_t) rows)
+    const size_t max_elements = (size_t) std::numeric_limits<ptrdiff_t>::max() / sizeof(float);
+    if (per_row > max_elements / (size_t) rows)
         throw std::invalid_argument("exl3_gemm_fp32: scratch size overflows size_t");
     return per_row * (size_t) rows;
 }

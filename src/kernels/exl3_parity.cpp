@@ -17,6 +17,7 @@
 #include <fstream>
 #include <iterator>
 #include <limits>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -202,6 +203,29 @@ int main(int argc, char** argv) {
 
     auto& queue = strata::core::Runtime::get().compute();
     int failures = 0;
+    {
+        uint16_t word = 0;
+        float value = 0;
+        MatrixView view{&word, &word, &word, nullptr, 128, 128, 3, 2};
+        auto rejects = [&](auto operation, const char* label) {
+            try {
+                operation();
+                std::printf("size guard %s: FAIL\n", label);
+                ++failures;
+            } catch (const std::invalid_argument&) {
+                std::printf("size guard %s: OK\n", label);
+            }
+        };
+        MatrixView huge = view;
+        huge.k = int64_t(1) << 62;
+        huge.n = 256;
+        rejects([&] { strata::kernels::exl3::exl3_gemv_scratch_elements(huge); }, "matrix overflow");
+        rejects([&] { strata::kernels::exl3::exl3_gemm_scratch_elements(view, int64_t(1) << 62); }, "scratch overflow");
+        rejects([&] {
+            strata::kernels::exl3::exl3_gemm_fp32(queue, view, &value, int64_t(1) << 62,
+                                                &value, 128, 2, nullptr, 0);
+        }, "row stride overflow");
+    }
     for (size_t ci = 0; ci < cases.size(); ++ci) {
         const FixtureCase& c = cases[ci];
         strata::parity::Device device;
