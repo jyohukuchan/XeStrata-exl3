@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // Bounded EXL3 source/cache/CPU/GPU plan integration.
 #include "strata/core/exl3_expert_runtime.hpp"
+#include "strata/core/exl3_prepare_profile.hpp"
 
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
@@ -393,6 +394,7 @@ bool Exl3ExpertRuntime::prepare_window(int64_t layer, const float* host_fp32_x, 
                                        const int32_t* routed_ids, int64_t n_tokens, float* cpu_output, int64_t ldy,
                                        std::string& err) {
     const HostTimelineScope timeline("prepare", layer);
+    detail::Exl3PrepareSample detail_sample;
     err.clear();
     if (!opened_ || source_ == nullptr || pool_ == nullptr) { err = "exl3 runtime: open is required"; return false; }
     if (pending_gpu_) { err = "exl3 runtime: wait_gpu must consume the previous plan first"; return false; }
@@ -429,10 +431,12 @@ bool Exl3ExpertRuntime::prepare_window(int64_t layer, const float* host_fp32_x, 
         (void) token;
         (void) at;
     }
+    detail_sample.mark(0);   // route partition, including temporary workspace
     if (!miss_ids_.empty()) {
         source_->begin_layer(layer, miss_ids_.data(), static_cast<int64_t>(miss_ids_.size()));
         if (!source_->last_error().empty()) { err = source_->last_error(); return false; }
     }
+    detail_sample.mark(1);   // source begin (guard time is a nested component)
     for (int64_t entry = 0; entry < n_tokens * routed_k_; ++entry) {
         const int32_t expert = routed_ids[entry];
         const size_t at = pair_index(layer, expert);
@@ -450,6 +454,7 @@ bool Exl3ExpertRuntime::prepare_window(int64_t layer, const float* host_fp32_x, 
         job.slot = static_cast<int>(entry);
         (void) at;
     }
+    detail_sample.mark(2);   // borrowed source pointers and CPU job views
     int64_t cursor = 0;
     for (size_t group = 0; group < group_slots.size(); ++group) {
         const int32_t slot = group_slots[group];
@@ -472,6 +477,8 @@ bool Exl3ExpertRuntime::prepare_window(int64_t layer, const float* host_fp32_x, 
     prepared_layer_ = layer;
     prepared_ = true;
     cpu_ready_ = false;
+    detail_sample.mark(3);   // host grouped hit plan
+    detail_sample.success();
     return true;
 }
 

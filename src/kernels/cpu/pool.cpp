@@ -5,6 +5,7 @@
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/platform/aux_cpus.hpp"
 #include "strata/core/progress.hpp"
+#include "strata/core/exl3_prepare_profile.hpp"
 #include "strata/kernels/cpu/canon_expert.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 
@@ -630,15 +631,32 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
 }
 
 void ExpertPool::run_phase(int mode, int n_tasks) {
+    auto* profile = mode >= 11 && mode <= 14 ? strata::core::detail::exl3_prepare_detail() : nullptr;
+    using Clock = strata::core::detail::Exl3DetailClock;
+    const auto t0 = profile != nullptr ? Clock::now() : Clock::time_point{};
     wait_parked("before a phase");
+    const auto t1 = profile != nullptr ? Clock::now() : Clock::time_point{};
     mode_ = mode;
     njobs_ = n_tasks;
     const uint32_t e = begin_batch(n_tasks);
     if (host_works_) drain(-1, host_scratch_, e);
     wait_done(n_tasks);
+    const auto t2 = profile != nullptr ? Clock::now() : Clock::time_point{};
     wait_parked("after a phase");
+    const auto t3 = profile != nullptr ? Clock::now() : Clock::time_point{};
     hstate_.store(kIdle, std::memory_order_relaxed);
     hstate_ms_.store(now_ms(), std::memory_order_relaxed);
+    if (profile != nullptr) {
+        auto& p = profile->phase[mode - 11];
+        const auto tasks = static_cast<uint64_t>(n_tasks);
+        p.tasks_min = p.calls == 0 ? tasks : std::min(p.tasks_min, tasks);
+        p.tasks_max = std::max(p.tasks_max, tasks); p.tasks_sum += tasks; ++p.calls;
+        if (n_tasks < n_) ++p.under_workers;
+        p.wall_ns += strata::core::detail::exl3_detail_ns(t0, t3);
+        p.before_park_ns += strata::core::detail::exl3_detail_ns(t0, t1);
+        p.publish_done_ns += strata::core::detail::exl3_detail_ns(t1, t2);
+        p.after_park_ns += strata::core::detail::exl3_detail_ns(t2, t3);
+    }
 }
 
 void ExpertPool::run_split(ExpertJob* jobs, int n) {
@@ -870,6 +888,9 @@ exl3::Status ExpertPool::prepare_exl3_rowparallel(int64_t max_rows, int64_t max_
 exl3::Status ExpertPool::run_exl3_rowparallel(ExpertJobExl3* jobs, int n) {
     if (n <= 0) return exl3::Status::ok;
     if (jobs == nullptr || n > exl3_row_max_jobs_) return exl3::Status::invalid_argument;
+    auto* profile = strata::core::detail::exl3_prepare_detail();
+    using Clock = strata::core::detail::Exl3DetailClock;
+    const auto validation_begin = profile != nullptr ? Clock::now() : Clock::time_point{};
     const auto add_u64 = [](uint64_t a, uint64_t b, uint64_t& out) {
         if (a > std::numeric_limits<uint64_t>::max() - b) return false;
         out = a + b;
@@ -901,10 +922,19 @@ exl3::Status ExpertPool::run_exl3_rowparallel(ExpertJobExl3* jobs, int n) {
     if (phase_max == 0 || phase_max > kMaxTasks || phase_max > exl3_rows_.tasks.capacity())
         return exl3::Status::unsupported_layout;
 
+    if (profile != nullptr) {
+        profile->validation_ns += strata::core::detail::exl3_detail_ns(validation_begin, Clock::now());
+        profile->row_batch(n, n_, host_works_);
+    }
+
+    const auto park_begin = profile != nullptr ? Clock::now() : Clock::time_point{};
     wait_parked("before an EXL3 row batch");
+    if (profile != nullptr)
+        profile->initial_park_ns += strata::core::detail::exl3_detail_ns(park_begin, Clock::now());
     exl3_row_jobs_ = jobs;
     exl3_error_.store(static_cast<int>(exl3::Status::ok), std::memory_order_release);
     auto run_tasks = [&](Exl3RowTask::Kind kind, int mode) {
+        const auto build_begin = profile != nullptr ? Clock::now() : Clock::time_point{};
         exl3_rows_.tasks.clear();
         for (int job_index = 0; job_index < n; ++job_index) {
             const ExpertJobExl3& job = jobs[job_index];
@@ -927,6 +957,8 @@ exl3::Status ExpertPool::run_exl3_rowparallel(ExpertJobExl3* jobs, int n) {
                 }
             }
         }
+        if (profile != nullptr)
+            profile->phase[mode - 11].build_ns += strata::core::detail::exl3_detail_ns(build_begin, Clock::now());
         run_phase(mode, static_cast<int>(exl3_rows_.tasks.size()));
     };
     run_tasks(Exl3RowTask::Kind::input_gate_up, 11);
@@ -937,6 +969,8 @@ exl3::Status ExpertPool::run_exl3_rowparallel(ExpertJobExl3* jobs, int n) {
     exl3_row_jobs_ = nullptr;
     hstate_.store(kIdle, std::memory_order_relaxed);
     hstate_ms_.store(now_ms(), std::memory_order_relaxed);
+    if (profile != nullptr)
+        profile->row_wall_ns += strata::core::detail::exl3_detail_ns(validation_begin, Clock::now());
     return static_cast<exl3::Status>(exl3_error_.load(std::memory_order_acquire));
 }
 

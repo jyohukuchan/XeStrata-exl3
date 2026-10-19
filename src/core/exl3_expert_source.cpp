@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
 #include "strata/core/exl3_expert_source.hpp"
+#include "strata/core/exl3_prepare_profile.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -215,7 +216,16 @@ bool Exl3ExpertSource::evict_one_locked() {
 void Exl3ExpertSource::refresh_capacity_locked(bool evict) {
     detail::HostMemory memory;
     uint64_t room = 0;
-    if (startup_capacity_bytes_ != 0 && detail::host_available_memory(memory)) {
+    auto* profile = detail::active_exl3_prepare_detail();
+    const auto guard_begin = profile != nullptr ? detail::Exl3DetailClock::now()
+                                                : detail::Exl3DetailClock::time_point{};
+    const bool available = startup_capacity_bytes_ != 0 && detail::host_available_memory(memory);
+    if (profile != nullptr && startup_capacity_bytes_ != 0) {
+        profile->guard_ns += detail::exl3_detail_ns(guard_begin, detail::Exl3DetailClock::now());
+        ++profile->guard_calls;
+        if (!available) ++profile->guard_failures;
+    }
+    if (available) {
         room = add_saturated(std::min(memory.available, memory.cgroup_limit), stats_.resident_bytes);
         room = subtract_floor(room, policy_.headroom_bytes);
         room = subtract_floor(room, policy_.reserved_bytes);

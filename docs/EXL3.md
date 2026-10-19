@@ -91,6 +91,10 @@ hits before source I/O, and places CPU-miss and GPU-hit outputs in router order.
 recorded in a graph. `STRATA_EXL3_TIMELINE=1` emits JSON lines on standard error for the start and end of host
 prepare, GPU submit and CPU pool intervals in steady-clock nanoseconds. GPU submit measures host submission time,
 not GPU kernel execution. Correlate it with a GPU profiler timeline to verify execution overlap.
+`STRATA_EXL3_PREPARE_DETAIL=1` aggregates prepare partition, source begin, borrowed views, host plan, and
+task counts and waiting times for the four CPU phases on each calling host thread. At thread exit it emits an
+`exl3_prepare_summary` JSON record on standard error. RAM guard time is nested within source begin and excludes
+startup prewarm. CPU phases cover accepted row-parallel batches only; fallback counts are not measured.
 `ExpertDispatch::exl3_runtime` and `MoeWindowTier::exl3_runtime` connect it to the existing
 CPU-row/GPU-hit merge. The current path uses one group and rejects two groups. Segmented graphs are the default.
 In the segmented path, a `publish_window_plan` callback enqueues the hit-only grouped kernel on the
