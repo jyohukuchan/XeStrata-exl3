@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
-// Scalar SYCL correctness fallback for raw F16/BF16/F32 linear weights.
+// K-cooperative SYCL linear weights with a scalar fallback for raw F16/BF16/F32.
 #include "strata/kernels/raw_linear.hpp"
 
 #include "strata/kernels/bf16_bits.hpp"
@@ -11,6 +11,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <algorithm>
 #include <limits>
 #include <stdexcept>
 
@@ -40,11 +41,14 @@ void validate(const LinearView& view, const float* x, float* y, int64_t ldx, int
         throw std::invalid_argument("raw::linear_fp32: caller span exceeds host address range");
 }
 
-}  // namespace
+bool cooperative_capable(const sycl::queue& queue) {
+    const auto sizes = queue.get_device().get_info<sycl::info::device::sub_group_sizes>();
+    return std::find(sizes.begin(), sizes.end(), size_t(32)) != sizes.end() &&
+           queue.get_device().get_info<sycl::info::device::max_work_group_size>() >= 32;
+}
 
-sycl::event linear_fp32(sycl::queue& queue, const LinearView& view, const float* x, int64_t ldx, float* y,
-                        int64_t ldy, int64_t rows, const std::vector<sycl::event>& deps) {
-    validate(view, x, y, ldx, ldy, rows);
+sycl::event linear_fp32_scalar(sycl::queue& queue, const LinearView& view, const float* x, int64_t ldx, float* y,
+                               int64_t ldy, int64_t rows, const std::vector<sycl::event>& deps) {
     return queue.submit([&](sycl::handler& h) {
         if (!deps.empty()) h.depends_on(deps);
         h.parallel_for(sycl::range<1>((size_t) rows * (size_t) view.n), [=](sycl::id<1> id) {
@@ -68,6 +72,49 @@ sycl::event linear_fp32(sycl::queue& queue, const LinearView& view, const float*
             y[row * ldy + out] = value;
         });
     });
+}
+
+sycl::event linear_fp32_cooperative(sycl::queue& queue, const LinearView& view, const float* x, int64_t ldx,
+                                    float* y, int64_t ldy, int64_t rows, const std::vector<sycl::event>& deps) {
+    constexpr size_t kSubgroup = 32;
+    const size_t groups = static_cast<size_t>(rows) * static_cast<size_t>(view.n);
+    return queue.submit([&](sycl::handler& h) {
+        if (!deps.empty()) h.depends_on(deps);
+        h.parallel_for(sycl::nd_range<1>(groups * kSubgroup, kSubgroup), [=](sycl::nd_item<1> item)
+                       [[sycl::reqd_sub_group_size(32)]] {
+            const sycl::sub_group subgroup = item.get_sub_group();
+            const size_t group = static_cast<size_t>(item.get_group_linear_id());
+            const int64_t row = static_cast<int64_t>(group / static_cast<size_t>(view.n));
+            const int64_t out = static_cast<int64_t>(group % static_cast<size_t>(view.n));
+            const int lane = static_cast<int>(subgroup.get_local_linear_id());
+            const size_t base = static_cast<size_t>(out) * static_cast<size_t>(view.k);
+            const float* xr = x + row * ldx;
+            float value = 0.0f;
+            for (int64_t in = lane; in < view.k; in += static_cast<int64_t>(kSubgroup)) {
+                float weight;
+                if (view.dtype == DType::F16)
+                    weight = f32_from_f16(static_cast<const uint16_t*>(view.data)[base + static_cast<size_t>(in)]);
+                else if (view.dtype == DType::BF16)
+                    weight = f32_from_bf16(static_cast<const uint16_t*>(view.data)[base + static_cast<size_t>(in)]);
+                else
+                    weight = static_cast<const float*>(view.data)[base + static_cast<size_t>(in)];
+                value += xr[in] * weight;
+            }
+            value = sycl::reduce_over_group(subgroup, value, sycl::plus<float>());
+            if (lane == 0) y[row * ldy + out] = value + (view.bias == nullptr ? 0.0f : view.bias[out]);
+        });
+    });
+}
+
+}  // namespace
+
+sycl::event linear_fp32(sycl::queue& queue, const LinearView& view, const float* x, int64_t ldx, float* y,
+                        int64_t ldy, int64_t rows, const std::vector<sycl::event>& deps) {
+    validate(view, x, y, ldx, ldy, rows);
+    const uint64_t groups = static_cast<uint64_t>(rows) * static_cast<uint64_t>(view.n);
+    if (groups > std::numeric_limits<size_t>::max() / 32 || !cooperative_capable(queue))
+        return linear_fp32_scalar(queue, view, x, ldx, y, ldy, rows, deps);
+    return linear_fp32_cooperative(queue, view, x, ldx, y, ldy, rows, deps);
 }
 
 void validate_embedding(const void* table, DType dtype, size_t row_bytes, const int32_t* tokens, int64_t n_tok,

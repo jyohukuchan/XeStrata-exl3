@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -64,7 +65,8 @@ void check_plan(const GroupedPlan& plan, const float* x, int64_t ldx, const floa
 }
 
 inline uint32_t load_word32(const uint16_t* packed, int word, int word_count) {
-    const int w = word % word_count;
+    // extract_state visits [word_count - 1, 2 * word_count - 1], so one ring wrap suffices.
+    const int w = word >= word_count ? word - word_count : word;
     return (uint32_t) packed[2 * w] | ((uint32_t) packed[2 * w + 1] << 16);
 }
 
@@ -102,13 +104,29 @@ inline uint16_t decode_state(uint16_t state, int codebook) {
     return f16_from_f32(f32_from_f16(h) * f32_from_f16(0x1EEEu) + f32_from_f16(0xC931u));
 }
 
+inline float decode_state_f32(uint16_t state, int codebook) {
+    if (codebook != 2) return f32_from_f16(decode_state(state, codebook));
+    const uint32_t x = state * 0x83DCD12Du;
+    const uint32_t byte_sum = (x & 0xFFu) + ((x >> 8) & 0xFFu) + ((x >> 16) & 0xFFu) + ((x >> 24) & 0xFFu);
+    const int32_t numerator = 887 * static_cast<int32_t>(byte_sum) - 452608;
+    const float value = static_cast<float>(numerator) * 0x1.0p-17f;
+    uint32_t u = 0;
+    std::memcpy(&u, &value, sizeof(u));
+    // All byte sums give abs(value) >= 238 * 2^-17, within the finite F16 normal range.
+    // Preserve the F16 RNE boundary before widening back to F32.
+    u = (u + 0xfffu + ((u >> 13) & 1u)) & 0xffffe000u;
+    float rounded = 0.0f;
+    std::memcpy(&rounded, &u, sizeof(rounded));
+    return rounded;
+}
+
 inline float decoded_weight(const MatrixView& view, int64_t row, int64_t col) {
     const int tile_row = (int) (row >> 4);
     const int tile_col = (int) (col >> 4);
     const size_t tile_index = (size_t) tile_row * (size_t) (view.n >> 4) + (size_t) tile_col;
     const uint16_t* tile = view.trellis + tile_index * (size_t) (16 * view.bits);
     const int state = tile_state_for_element((int) ((row & 15) * 16 + (col & 15)));
-    return f32_from_f16(decode_state(extract_state(tile, view.bits, state), view.codebook));
+    return decode_state_f32(extract_state(tile, view.bits, state), view.codebook);
 }
 
 inline bool valid_raw_dtype(raw::DType dtype) {
@@ -325,6 +343,68 @@ sycl::event submit_gate_up_input(sycl::queue& queue, const GroupedPlan& plan, co
     });
 }
 
+bool grouped_cooperative_capability(const sycl::queue& queue) {
+    const auto subgroup_sizes = queue.get_device().get_info<sycl::info::device::sub_group_sizes>();
+    if (std::find(subgroup_sizes.begin(), subgroup_sizes.end(), size_t(32)) == subgroup_sizes.end()) return false;
+    return queue.get_device().get_info<sycl::info::device::max_work_group_size>() >= 32;
+}
+
+sycl::event submit_gate_up_dot_cooperative(sycl::queue& queue, const GroupedPlan& plan, float* scratch,
+                                           int64_t plane, GroupedOptions options,
+                                           const std::vector<sycl::event>& deps) {
+    const size_t tiles = (static_cast<size_t>(plan.max_ff) + 7u) / 8u;
+    const size_t groups = static_cast<size_t>(plan.max_entries) * tiles;
+    return queue.submit([&](sycl::handler& h) {
+        if (!deps.empty()) h.depends_on(deps);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>(groups * 32u), sycl::range<1>(32)),
+                       [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+            const sycl::sub_group subgroup = item.get_sub_group();
+            const int lane = static_cast<int>(subgroup.get_local_id()[0]);
+            const int column_lane = lane >> 2;
+            const int k_lane = lane & 3;
+            const size_t group = static_cast<size_t>(item.get_group_linear_id());
+            const int32_t entry = static_cast<int32_t>(group / tiles);
+            const int64_t tile = static_cast<int64_t>(group % tiles);
+            const int64_t col = tile * 8 + column_lane;
+            const ResolvedEntry resolved = resolve_entry(plan, entry, options);
+            const bool active = resolved.valid && col < resolved.ff;
+            const float* gate_input = active ? scratch + static_cast<size_t>(entry) * static_cast<size_t>(plane) : nullptr;
+            const float* up_input = active ? scratch + static_cast<size_t>(plan.max_entries) * static_cast<size_t>(plane) +
+                                                   static_cast<size_t>(entry) * static_cast<size_t>(plane) : nullptr;
+            float gate_partial = 0.0f;
+            float up_partial = 0.0f;
+            if (active) {
+                if (resolved.gate.is_packed()) {
+                    const MatrixView gate = resolved.gate.packed_matrix();
+                    for (int64_t row = k_lane; row < gate.k; row += 4)
+                        gate_partial += gate_input[row] * decoded_weight(gate, row, col);
+                } else if (k_lane == 0) {
+                    gate_partial = dot_value(resolved.gate, gate_input, col);
+                }
+                if (resolved.up.is_packed()) {
+                    const MatrixView up = resolved.up.packed_matrix();
+                    for (int64_t row = k_lane; row < up.k; row += 4)
+                        up_partial += up_input[row] * decoded_weight(up, row, col);
+                } else if (k_lane == 0) {
+                    up_partial = dot_value(resolved.up, up_input, col);
+                }
+            }
+            float gate_reduced = gate_partial + sycl::permute_group_by_xor(subgroup, gate_partial, 1);
+            gate_reduced += sycl::permute_group_by_xor(subgroup, gate_reduced, 2);
+            float up_reduced = up_partial + sycl::permute_group_by_xor(subgroup, up_partial, 1);
+            up_reduced += sycl::permute_group_by_xor(subgroup, up_reduced, 2);
+            if (active && k_lane == 0) {
+                float* gate_dot = scratch + 2 * static_cast<size_t>(plan.max_entries) * static_cast<size_t>(plane) +
+                                  static_cast<size_t>(entry) * static_cast<size_t>(plane);
+                float* up_dot = scratch + 3 * static_cast<size_t>(plan.max_entries) * static_cast<size_t>(plane) +
+                                static_cast<size_t>(entry) * static_cast<size_t>(plane);
+                gate_dot[col] = gate_reduced;
+                up_dot[col] = up_reduced;
+            }
+        });
+    });
+}
+
 sycl::event submit_gate_up_dot(sycl::queue& queue, const GroupedPlan& plan, float* scratch, int64_t plane,
                                GroupedOptions options, const std::vector<sycl::event>& deps) {
     return queue.submit([&](sycl::handler& h) {
@@ -407,7 +487,11 @@ sycl::event exl3_grouped_fp32(sycl::queue& queue, const GroupedPlan& plan, const
     check_plan(plan, x, ldx, y, ldy, scratch, scratch_elements);
     const int64_t plane = std::max(plan.max_ff, plan.hidden);
     const sycl::event gate_up_input = submit_gate_up_input(queue, plan, x, ldx, scratch, plane, options, deps);
-    const sycl::event gate_up_dot = submit_gate_up_dot(queue, plan, scratch, plane, options, {gate_up_input});
+    sycl::event gate_up_dot;
+    if (grouped_cooperative_capability(queue))
+        gate_up_dot = submit_gate_up_dot_cooperative(queue, plan, scratch, plane, options, {gate_up_input});
+    else
+        gate_up_dot = submit_gate_up_dot(queue, plan, scratch, plane, options, {gate_up_input});
     const sycl::event gate_up_post = submit_gate_up_post(queue, plan, scratch, plane, options, {gate_up_dot});
     const sycl::event activation = queue.submit([&](sycl::handler& h) {
         h.depends_on(gate_up_post);
