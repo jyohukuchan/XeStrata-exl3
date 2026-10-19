@@ -187,7 +187,7 @@ target_link_libraries(strata_artifact INTERFACE strata_warnings)
 
 # Native EXL3 headers carry JSON metadata; keep the parser private to this
 # host-only archive instead of adding a dependency to every GGUF consumer.
-add_library(strata_exl3_artifact STATIC src/artifact/exl3.cpp)
+add_library(strata_exl3_artifact STATIC src/artifact/exl3.cpp src/artifact/exl3_remap.cpp)
 target_link_libraries(strata_exl3_artifact PUBLIC strata_artifact)
 target_include_directories(strata_exl3_artifact SYSTEM PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/main/nlohmann-json)
@@ -210,6 +210,9 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(exl3_artifact_test SYSTEM PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/main/nlohmann-json)
   add_test(NAME exl3_artifact_test COMMAND exl3_artifact_test)
+  add_executable(exl3_remap_test src/artifact/exl3_remap_test.cpp)
+  target_link_libraries(exl3_remap_test PRIVATE strata_exl3_artifact strata_kernels_cpu)
+  add_test(NAME exl3_remap_test COMMAND exl3_remap_test)
   add_executable(exl3_expert_artifact_test src/artifact/exl3_expert_test.cpp)
   target_link_libraries(exl3_expert_artifact_test PRIVATE strata_exl3_expert_artifact)
   target_include_directories(exl3_expert_artifact_test SYSTEM PRIVATE
@@ -421,6 +424,7 @@ if(STRATA_ENABLE_XE)
 
   add_library(strata_kernels STATIC src/kernels/xe/elementwise.cpp src/kernels/xe/iq_kernels.cpp
                                     src/kernels/xe/exl3.cpp src/kernels/xe/exl3_expert.cpp src/kernels/xe/exl3_ngram.cpp
+                                    src/kernels/xe/exl3_grouped.cpp
                                     src/kernels/xe/raw_linear.cpp
                                     src/kernels/xe/native_mmvq.cpp src/kernels/xe/rope.cpp
                                     src/kernels/xe/router.cpp src/kernels/xe/bf16_gemv.cpp
@@ -690,6 +694,14 @@ if(STRATA_ENABLE_XE)
   target_link_libraries(strata-image PRIVATE strata_image)
 
   if(STRATA_BUILD_TESTS)
+    add_executable(exl3_grouped_parity src/kernels/exl3_grouped_parity.cpp)
+    target_link_libraries(exl3_grouped_parity PRIVATE strata_engine)
+    target_compile_options(exl3_grouped_parity PRIVATE -fno-fast-math -ffp-contract=off)
+    if(TARGET strata_exl3_fixture)
+      add_dependencies(exl3_grouped_parity strata_exl3_fixture)
+      add_test(NAME exl3_grouped_parity COMMAND exl3_grouped_parity --fixture ${_strata_exl3_fixture})
+      set_tests_properties(exl3_grouped_parity PROPERTIES TIMEOUT 120)
+    endif()
     add_executable(exl3_expert_formats_test src/core/exl3_expert_formats_test.cpp)
     target_link_libraries(exl3_expert_formats_test PRIVATE strata_engine)
     add_test(NAME exl3_expert_formats_test COMMAND exl3_expert_formats_test)
