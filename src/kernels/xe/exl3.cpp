@@ -75,7 +75,8 @@ inline void check_gemm(const MatrixView& view, const float* x, float* y, int64_t
 // The device code loads uint16 words explicitly rather than casting the packed pointer to uint32_t.  This keeps the
 // contract valid for a 2-byte-aligned allocation and documents EXL3's little-endian packed-word order.
 inline uint32_t load_word32(const uint16_t* packed, int word, int word_count) {
-    const int w = word % word_count;
+    // extract_state visits [word_count - 1, 2 * word_count - 1], so one ring wrap suffices.
+    const int w = word >= word_count ? word - word_count : word;
     return (uint32_t) packed[2 * w] | ((uint32_t) packed[2 * w + 1] << 16);
 }
 
@@ -157,6 +158,113 @@ inline uint16_t packed_decode_state(const uint16_t* tile, int state) {
     const uint64_t merged = ((uint64_t) load_word32(tile, i0, word_count) << 32) |
                             (uint64_t) load_word32(tile, i1, word_count);
     return packed_decode_codebook<Codebook>((uint16_t) ((merged >> shift) & 0xFFFFu));
+}
+
+// Scalar fallback specialization: it keeps one output column per work item and avoids the subgroup requirement.
+// Codebook 2 has a proven normal-range closed form, so it never enters the software half conversion path.
+template <int Codebook>
+inline float scalar_decode_codebook_f32(uint16_t state) {
+    if constexpr (Codebook == 2) {
+        uint32_t x = state * 0x83DCD12Du;
+        const uint32_t byte_sum = (x & 0xFFu) + ((x >> 8) & 0xFFu) + ((x >> 16) & 0xFFu) + ((x >> 24) & 0xFFu);
+        const int32_t numerator = 887 * static_cast<int32_t>(byte_sum) - 452608;
+        const float value = static_cast<float>(numerator) * 0x1.0p-17f;
+        uint32_t u = 0;
+        std::memcpy(&u, &value, sizeof(u));
+        // All byte sums 0..1020 have abs(value) >= 238 * 2^-17, inside the finite F16 normal range.
+        // The closed form is pre-rounded: preserve the exact F16 RNE boundary before widening to F32.
+        u = (u + 0xfffu + ((u >> 13) & 1u)) & 0xffffe000u;
+        float rounded = 0.0f;
+        std::memcpy(&rounded, &u, sizeof(rounded));
+        return rounded;
+    } else {
+        return f32_from_f16(packed_decode_codebook<Codebook>(state));
+    }
+}
+
+template <int Bits, int Codebook>
+inline float scalar_decoded_weight(const MatrixView& view, int64_t row, int64_t col) {
+    const int64_t n_tiles = view.n / 16;
+    const size_t tile_index = static_cast<size_t>(row / 16) * static_cast<size_t>(n_tiles) +
+                              static_cast<size_t>(col / 16);
+    const uint16_t* tile = view.trellis + tile_index * static_cast<size_t>(16 * Bits);
+    const int state = tile_state_for_element(static_cast<int>((row & 15) * 16 + (col & 15)));
+    constexpr int word_count = Bits * 8;
+    const int b0 = state * Bits + Bits - 16 + 256 * Bits;
+    const int b1 = b0 + 16;
+    const int i0 = b0 / 32;
+    const int i1 = (b1 - 1) / 32;
+    const int shift = (i1 + 1) * 32 - b1;
+    const uint64_t merged = (static_cast<uint64_t>(load_word32(tile, i0, word_count)) << 32) |
+                            load_word32(tile, i1, word_count);
+    const uint16_t packed_state = static_cast<uint16_t>((merged >> shift) & 0xffffu);
+    return scalar_decode_codebook_f32<Codebook>(packed_state);
+}
+
+template <int Bits, int Codebook>
+sycl::event submit_scalar_dot_template(sycl::queue& queue, const MatrixView& view, const float* x, int64_t ldx,
+                                       float* y, int64_t ldy, int64_t rows,
+                                       const std::vector<sycl::event>& deps, bool add_bias) {
+    return queue.submit([&](sycl::handler& h) {
+        if (!deps.empty()) h.depends_on(deps);
+        h.parallel_for(sycl::range<1>(static_cast<size_t>(rows) * static_cast<size_t>(view.n)), [=](sycl::id<1> id) {
+            const size_t flat = static_cast<size_t>(id[0]);
+            const int64_t row_out = static_cast<int64_t>(flat / static_cast<size_t>(view.n));
+            const int64_t col = static_cast<int64_t>(flat % static_cast<size_t>(view.n));
+            const float* input = x + row_out * ldx;
+            float* output = y + row_out * ldy;
+            float sum = 0.0f;
+            for (int64_t row = 0; row < view.k; ++row)
+                sum += input[row] * scalar_decoded_weight<Bits, Codebook>(view, row, col);
+            if (add_bias && view.bias != nullptr) sum += f32_from_f16(view.bias[col]);
+            output[col] = sum;
+        });
+    });
+}
+
+bool submit_scalar_dot_dispatch(sycl::queue& queue, const MatrixView& view, const float* x, int64_t ldx, float* y,
+                                int64_t ldy, int64_t rows, const std::vector<sycl::event>& deps, bool add_bias,
+                                sycl::event& result) {
+    #define EXL3_SCALAR_DOT(B, C) \
+        do { \
+            result = submit_scalar_dot_template<B, C>(queue, view, x, ldx, y, ldy, rows, deps, add_bias); \
+            return true; \
+        } while (false)
+    switch (view.bits) {
+        case 1:
+            if (view.codebook == 0) EXL3_SCALAR_DOT(1, 0);
+            if (view.codebook == 1) EXL3_SCALAR_DOT(1, 1);
+            EXL3_SCALAR_DOT(1, 2);
+        case 2:
+            if (view.codebook == 0) EXL3_SCALAR_DOT(2, 0);
+            if (view.codebook == 1) EXL3_SCALAR_DOT(2, 1);
+            EXL3_SCALAR_DOT(2, 2);
+        case 3:
+            if (view.codebook == 0) EXL3_SCALAR_DOT(3, 0);
+            if (view.codebook == 1) EXL3_SCALAR_DOT(3, 1);
+            EXL3_SCALAR_DOT(3, 2);
+        case 4:
+            if (view.codebook == 0) EXL3_SCALAR_DOT(4, 0);
+            if (view.codebook == 1) EXL3_SCALAR_DOT(4, 1);
+            EXL3_SCALAR_DOT(4, 2);
+        case 5:
+            if (view.codebook == 0) EXL3_SCALAR_DOT(5, 0);
+            if (view.codebook == 1) EXL3_SCALAR_DOT(5, 1);
+            EXL3_SCALAR_DOT(5, 2);
+        case 6:
+            if (view.codebook == 0) EXL3_SCALAR_DOT(6, 0);
+            if (view.codebook == 1) EXL3_SCALAR_DOT(6, 1);
+            EXL3_SCALAR_DOT(6, 2);
+        case 7:
+            if (view.codebook == 0) EXL3_SCALAR_DOT(7, 0);
+            if (view.codebook == 1) EXL3_SCALAR_DOT(7, 1);
+            EXL3_SCALAR_DOT(7, 2);
+        default:
+            if (view.codebook == 0) EXL3_SCALAR_DOT(8, 0);
+            if (view.codebook == 1) EXL3_SCALAR_DOT(8, 1);
+            EXL3_SCALAR_DOT(8, 2);
+    }
+    #undef EXL3_SCALAR_DOT
 }
 
 template <int Bits, int Codebook>
@@ -480,7 +588,9 @@ sycl::event exl3_gemv_fp32(sycl::queue& queue, const MatrixView& view, const flo
     sycl::event dot_event;
     if (!submit_packed_dot_dispatch(queue, view, dot_input, view.k, dot_output, view.n, 1, dot_deps, dot_add_bias,
                                     dot_event))
-        dot_event = submit_dot(queue, view, dot_input, dot_output, dot_deps, dot_add_bias);
+        if (!submit_scalar_dot_dispatch(queue, view, dot_input, view.k, dot_output, view.n, 1, dot_deps,
+                                        dot_add_bias, dot_event))
+            dot_event = submit_dot(queue, view, dot_input, dot_output, dot_deps, dot_add_bias);
     if (profile != nullptr) profile->dot = dot_event;
     if (use_output) {
         const sycl::event output_event = submit_output_hadamard(queue, view, dot_output, y, {dot_event}, options.add_bias);
@@ -513,7 +623,9 @@ sycl::event exl3_gemm_fp32(sycl::queue& queue, const MatrixView& view, const flo
     sycl::event dot_event;
     if (!submit_packed_dot_dispatch(queue, view, dot_input, dot_ldx, dot_output, dot_ldy, rows, dot_deps, dot_add_bias,
                                     dot_event))
-        dot_event = submit_dot_rows(queue, view, dot_input, dot_ldx, dot_output, dot_ldy, rows, dot_deps, dot_add_bias);
+        if (!submit_scalar_dot_dispatch(queue, view, dot_input, dot_ldx, dot_output, dot_ldy, rows, dot_deps,
+                                        dot_add_bias, dot_event))
+            dot_event = submit_dot_rows(queue, view, dot_input, dot_ldx, dot_output, dot_ldy, rows, dot_deps, dot_add_bias);
     if (profile != nullptr) profile->dot = dot_event;
     if (use_output) {
         const sycl::event output_event =
