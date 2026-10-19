@@ -58,7 +58,10 @@ CPU は要求した row ID を選べ、SYCL は取得済みの packed rowを処�
 sidecar の multiplier、signed-int64 overflow、EOS 境界を使う row ID 計算も提供する。
 `row_spans()` は検証済みの論理行とファイル内 offset の対応を公開する。既存の
 `PleReader::open_spans()` へ渡すと、物理的な並び順や隙間がある分割 tensor を一つの非同期 I/O worker と
-row cache で扱える。モデル起動時の sidecar 選択と decoder の接続は別に行う。
+row cache で扱える。モデル起動時の sidecar 選択と binding は別に行う。
+`PleTable::open_exl3()` はこの reader と decoder を既存の issue/collect、batch、prefetch に接続し、
+head ごとの bias と最後の F16 丸めを適用する。現在は direct I/O を扱い、mmap と lock は明示的に拒否する。
+モデルへの binding 用に sidecar の hash 定数も公開する。
 
 NumPy のある環境で tests を有効にしてビルドすると、独立した fixture を使った CTest を実行できる。
 

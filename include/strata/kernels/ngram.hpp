@@ -27,6 +27,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace strata::kernels {
 
@@ -201,12 +202,20 @@ public:
     /// project's validated reader) and checks that the tensor exactly fills the rest of the file.
     bool open(const std::string& gguf_path, std::string& err);
     void close();
+    /// Open a validated EXL3 n-gram sidecar.  This path is direct-I/O only;
+    /// memory mapping is rejected until its physical row spans are supported.
+    bool open_exl3(const std::string& sidecar_path, std::string& err, const PleIoOptions& io = PleIoOptions{});
     bool is_open() const;
     /// True when `PleIoOptions::lock` was asked for and the OS lock succeeded (false: pages only pre-touched).
     bool locked() const;
     uint64_t rows() const;
-    /// "IQ4_NL" or "F8_E4M3" (a GGUF from tools/ple_fp8_pack.py: type I8, strata.ple.format = f8_e4m3).
+    /// "IQ4_NL" or "F8_E4M3" for GGUF, or "EXL3_NGRAM_Kx" for an EXL3 sidecar.
     const char* format() const;
+    bool is_exl3() const;
+    int exl3_bits() const;
+    const std::vector<int64_t>& exl3_layer_multipliers() const;
+    const std::vector<int64_t>& exl3_head_offsets() const;
+    const std::vector<int64_t>& exl3_head_vocab_sizes() const;
 
     /// 16 row indices -> 2560 floats.  The gathered rows are flattened HEAD-SLOWEST: row h's 160 values
     /// occupy `out[h*160, (h+1)*160)`, which is what `ggml_get_rows` does and what makes the result a plain

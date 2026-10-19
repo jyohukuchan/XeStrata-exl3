@@ -57,6 +57,13 @@ public:
         const int64_t* row_ids, const int32_t* explicit_head_ids, size_t count, float* output,
         size_t output_stride) const;
 
+    /// Decode already-fetched packed rows without performing any I/O.  The
+    /// packed pointer must be uint16-aligned and contain count*words_per_row()
+    /// words.  Explicit heads are required for a multi-head table.
+    strata::kernels::cpu::exl3::Status decode_packed_rows(
+        const uint16_t* packed_rows, size_t count, const int32_t* explicit_head_ids, float* output,
+        size_t output_stride) const;
+
     /// Reuse the sidecar's signed-int64 wrap, EOS and modulo rules to produce
     /// global row IDs in [output_rows, num_heads] row-major storage.
     void lookup_ids(const int64_t* tokens, size_t token_count, int ngram_size, int heads_per_ngram,

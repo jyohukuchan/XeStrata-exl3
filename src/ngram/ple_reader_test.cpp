@@ -13,6 +13,7 @@
 #include "strata/ngram/ple_reader.hpp"
 #include "strata/platform/direct_file.hpp"
 
+#include <array>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -24,6 +25,11 @@
 #include <string>
 #include <thread>
 #include <vector>
+#if defined(_WIN32)
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace ng = strata::ngram;
 namespace k = strata::kernels;
@@ -347,6 +353,54 @@ void all_formats_round_trip(const std::string& dir) {
     }
 }
 
+std::string unique_selftest_dir(const std::string& parent) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::create_directories(parent, ec);
+    if (ec) return {};
+#if defined(_WIN32)
+    const unsigned long long pid = static_cast<unsigned long long>(_getpid());
+#else
+    const unsigned long long pid = static_cast<unsigned long long>(getpid());
+#endif
+    for (unsigned attempt = 0; attempt < 1000; ++attempt) {
+        const fs::path candidate = fs::path(parent) /
+                                   ("ple_reader_selftest." + std::to_string(pid) + "." + std::to_string(attempt));
+        ec.clear();
+        if (fs::create_directory(candidate, ec)) return candidate.string();
+        if (ec && ec != std::errc::file_exists) return {};
+    }
+    return {};
+}
+
+void truncated_file_reports_error(const std::string& dir) {
+#if defined(_WIN32)
+    (void) dir;
+    std::printf("ple_reader truncated-file error regression: skipped on Windows\n");
+#else
+    const uint32_t rows = 8;
+    const std::string path = dir + "/ple_reader_truncated.bin";
+    CHECK(make_table(path, rows, ng::ROW_BYTES), "truncated-file fixture was written");
+    ng::PleReader rd;
+    std::string err;
+    CHECK(rd.open(path, HEADER, rows, 1, 0, err, true, ng::ROW_BYTES), "truncated-file reader open: %s", err.c_str());
+    std::error_code ec;
+    std::filesystem::resize_file(path, 0, ec);
+    CHECK(!ec, "truncated-file fixture resize: %s", ec.message().c_str());
+    const uint32_t row = 0;
+    std::array<uint8_t, ng::ROW_BYTES> raw{};
+    const auto ticket = rd.issue(&row, 1, raw.data());
+    const double started = now_us();
+    const bool ok = rd.collect(ticket, err);
+    const double elapsed = now_us() - started;
+    CHECK(!ok, "truncated-file collect reports the I/O error");
+    CHECK(!err.empty(), "truncated-file collect provides an error message");
+    CHECK(elapsed < 10e6, "truncated-file collect returns within 10 seconds (%.0f us)", elapsed);
+    rd.close();
+    std::filesystem::remove(path);
+#endif
+}
+
 // row_bytes: ng::ROW_BYTES (90, IQ4_NL) is the production default; 110 (#296, OrcaRouter's Q5_0 PLE rows) is
 // run too, through the exact same generic row_bytes path -- nothing here is IQ4_NL-specific, so a second row
 // size run here is the correctness evidence for lifting ngram.cpp's "Q5_0 PLE requires --ple-io mmap" refusal.
@@ -598,14 +652,30 @@ int main(int argc, char** argv) {
         else { std::fprintf(stderr, "usage: ple_reader_test --selftest [--dir D] | --gguf SHARD2 [--rows N] [--tokens F]\n"); return 2; }
     }
     if (self) {
-        span_selftest(dir);
-        if (g_fail != 0) return 1;
+        const std::string run_dir = unique_selftest_dir(dir);
+        if (run_dir.empty()) {
+            std::fprintf(stderr, "cannot create a unique selftest directory under %s\n", dir.c_str());
+            return 2;
+        }
+        span_selftest(run_dir);
+        truncated_file_reports_error(run_dir);
+        if (g_fail != 0) {
+            std::error_code ec;
+            std::filesystem::remove_all(run_dir, ec);
+            return 1;
+        }
         // ng::ROW_BYTES (90, IQ4_NL, production default) and 110 (#296, OrcaRouter's Q5_0 PLE rows) through the
         // same generic row_bytes path -- see the comment on selftest().
-        all_formats_round_trip(dir);               // every format of k::ple_formats(), both readers, vs its dequantizer
-        if (g_fail != 0) return 1;
-        const int r90 = selftest(dir, ng::ROW_BYTES);
-        const int r110 = selftest(dir, 110);
+        all_formats_round_trip(run_dir);               // every format of k::ple_formats(), both readers, vs its dequantizer
+        if (g_fail != 0) {
+            std::error_code ec;
+            std::filesystem::remove_all(run_dir, ec);
+            return 1;
+        }
+        const int r90 = selftest(run_dir, ng::ROW_BYTES);
+        const int r110 = selftest(run_dir, 110);
+        std::error_code ec;
+        std::filesystem::remove_all(run_dir, ec);
         return r90 != 0 ? r90 : r110;
     }
     if (!make_path.empty()) {                      // a big synthetic table, for timing --ple-io ram's fault-in

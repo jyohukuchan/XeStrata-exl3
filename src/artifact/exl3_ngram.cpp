@@ -15,6 +15,7 @@
 #include <map>
 #include <stdexcept>
 #include <unordered_map>
+#include <cstdint>
 
 namespace strata::artifact::exl3_ngram {
 namespace {
@@ -310,10 +311,20 @@ Status Reader::decode_rows(const int64_t* row_ids, const int32_t* explicit_head_
     }
     std::vector<uint16_t> packed;
     read_rows(row_ids, count, packed);
-    strata::kernels::exl3_ngram::View view{packed.data(), static_cast<int64_t>(count),
-                                           static_cast<int64_t>(impl_->words), impl_->bits, impl_->head_bias.data(),
-                                           static_cast<int64_t>(impl_->head_offsets.size())};
-    return strata::kernels::cpu::exl3_ngram::decode_rows(view, nullptr, heads.data(), count, output, output_stride);
+    return decode_packed_rows(packed.data(), count, heads.data(), output, output_stride);
+}
+
+Status Reader::decode_packed_rows(const uint16_t* packed_rows, size_t count, const int32_t* explicit_head_ids,
+                                  float* output, size_t output_stride) const {
+    if (packed_rows != nullptr && (reinterpret_cast<uintptr_t>(packed_rows) % alignof(uint16_t)) != 0)
+        return Status::unsupported_layout;
+    if (count > static_cast<size_t>(std::numeric_limits<int64_t>::max())) return Status::size_overflow;
+    if (impl_->words > std::numeric_limits<size_t>::max() / sizeof(uint16_t)) return Status::size_overflow;
+    strata::kernels::exl3_ngram::View view{
+        packed_rows, static_cast<int64_t>(count), static_cast<int64_t>(impl_->words), impl_->bits,
+        impl_->head_bias.data(), static_cast<int64_t>(impl_->head_offsets.size())};
+    return strata::kernels::cpu::exl3_ngram::decode_rows(view, nullptr, explicit_head_ids, count, output,
+                                                          output_stride);
 }
 
 void Reader::lookup_ids(const int64_t* tokens, size_t token_count, int ngram_size, int heads_per_ngram,

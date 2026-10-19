@@ -6,16 +6,19 @@
 // See include/strata/kernels/ngram.hpp for the semantics and the rival readings.
 #include "strata/kernels/ngram.hpp"
 #include "strata/artifact/gguf_reader.hpp"
+#include "strata/artifact/exl3_ngram.hpp"
 #include "strata/artifact/dequant.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/ngram/ple_reader.hpp"
 #include "strata/platform/memory.hpp"
 
 #include <cerrno>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <memory>
 #if !defined(_WIN32)
 #include <sys/mman.h>
 #endif
@@ -202,15 +205,54 @@ struct PleTable::Impl {
     bool pending = false;
     bool locked = false;
     uint32_t rows[PLE_N_HEADS] = {};
-    uint8_t raw[PLE_N_HEADS * PLE_ROW_BYTES_MAX] = {};
+    alignas(uint16_t) uint8_t raw[PLE_N_HEADS * PLE_ROW_BYTES_MAX] = {};
     static constexpr size_t kMaxPrefetch = 16;
     size_t n_prefetch = 0;
     strata::ngram::PleReader::Ticket prefetch_tickets[kMaxPrefetch] = {};
     uint32_t prefetch_keys[kMaxPrefetch][PLE_N_HEADS] = {};
-    uint8_t prefetch_raw[kMaxPrefetch][PLE_N_HEADS * PLE_ROW_BYTES_MAX] = {};
+    alignas(uint16_t) uint8_t prefetch_raw[kMaxPrefetch][PLE_N_HEADS * PLE_ROW_BYTES_MAX] = {};
     float scale = 1.0f;               // the FP8 table's one scale
     uint32_t rb = PLE_ROW_BYTES;      // bytes per row
+    bool exl3_mode = false;
+    int exl3_k = 0;
+    std::unique_ptr<strata::artifact::exl3_ngram::Reader> exl3_reader;
+    std::array<int32_t, PLE_N_HEADS> exl3_heads = {};
+    std::string exl3_format;
     void decode(const uint8_t* row, float* out160) const { fmt->dequant(row, scale, out160); }
+    int32_t exl3_head(uint32_t row) const {
+        if (!exl3_reader) return -1;
+        const auto& offsets = exl3_reader->head_offsets();
+        const auto& sizes = exl3_reader->head_vocab_sizes();
+        for (size_t h = 0; h < offsets.size(); ++h) {
+            if (offsets[h] >= 0 && sizes[h] > 0 && static_cast<int64_t>(row) >= offsets[h] &&
+                static_cast<int64_t>(row) - offsets[h] < sizes[h])
+                return static_cast<int32_t>(h);
+        }
+        return -1;
+    }
+    bool decode_exl3(const uint8_t* rows_raw, const uint32_t* row_ids, size_t count, float* output,
+                     size_t output_stride, std::string& err) const {
+        if (!exl3_reader) {
+            err = "EXL3 reader is not open";
+            return false;
+        }
+        const auto status = exl3_reader->decode_packed_rows(
+            reinterpret_cast<const uint16_t*>(rows_raw), count, exl3_heads.data(), output, output_stride);
+        if (status != strata::kernels::cpu::exl3::Status::ok) {
+            err = std::string("EXL3 n-gram decode: ") + strata::kernels::cpu::exl3::status_string(status);
+            return false;
+        }
+        for (size_t row = 0; row < count; ++row)
+            for (int i = 0; i < PLE_HEAD_DIM; ++i) {
+                float* value = output + row * output_stride + static_cast<size_t>(i);
+                *value = f32_from_f16(f16_from_f32(*value));
+            }
+        if (row_ids != nullptr)
+            for (size_t row = 0; row < count; ++row)
+                if (static_cast<uint64_t>(row_ids[row]) >= n_rows)
+                    std::memset(output + row * output_stride, 0, PLE_HEAD_DIM * sizeof(float));
+        return true;
+    }
 };
 
 PleTable::PleTable() : impl_(new Impl) {}
@@ -378,6 +420,60 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
     return true;
 }
 
+bool PleTable::open_exl3(const std::string& sidecar_path, std::string& err, const PleIoOptions& io) {
+    close();
+    if (io.mode != PleIo::Direct) {
+        err = "EXL3 n-gram sidecars require PleIo::Direct; memory mapping is unsupported until physical row spans are adapted";
+        return false;
+    }
+    if (io.lock) {
+        err = "EXL3 n-gram sidecars do not support PleIoOptions::lock on the direct-I/O path";
+        return false;
+    }
+    std::unique_ptr<strata::artifact::exl3_ngram::Reader> exl3;
+    try {
+        exl3 = std::make_unique<strata::artifact::exl3_ngram::Reader>(sidecar_path);
+    } catch (const std::exception& e) {
+        err = e.what();
+        return false;
+    }
+    if (exl3->num_heads() != PLE_N_HEADS) {
+        err = "EXL3 n-gram sidecar must declare exactly 16 heads";
+        return false;
+    }
+    if (exl3->layer_multipliers().size() != NGRAM_SIZE) {
+        err = "EXL3 n-gram sidecar must declare exactly 3 layer multipliers";
+        return false;
+    }
+    if (exl3->row_count() <= 0 || static_cast<uint64_t>(exl3->row_count()) > UINT32_MAX) {
+        err = "EXL3 n-gram sidecar row count is outside PleTable's row-index range";
+        return false;
+    }
+    const size_t row_bytes = exl3->words_per_row() * sizeof(uint16_t);
+    if (row_bytes == 0 || row_bytes > PLE_ROW_BYTES_MAX) {
+        err = "EXL3 n-gram sidecar row size exceeds PleTable's bounded row buffer";
+        return false;
+    }
+    std::vector<strata::ngram::RowSpan> spans;
+    spans.reserve(exl3->row_spans().size());
+    for (const auto& span : exl3->row_spans())
+        spans.push_back({span.first_row, span.n_rows, span.file_offset});
+    if (!impl_->reader.open_spans(sidecar_path, spans, static_cast<uint64_t>(exl3->row_count()), io.max_inflight,
+                                  io.cache_rows, err, io.io_thread, static_cast<uint32_t>(row_bytes))) {
+        close();
+        return false;
+    }
+    impl_->exl3_reader = std::move(exl3);
+    impl_->exl3_mode = true;
+    impl_->exl3_k = impl_->exl3_reader->bits();
+    impl_->exl3_format = "EXL3_NGRAM_K" + std::to_string(impl_->exl3_k);
+    impl_->n_rows = static_cast<uint64_t>(impl_->exl3_reader->row_count());
+    impl_->rb = static_cast<uint32_t>(row_bytes);
+    for (int h = 0; h < PLE_N_HEADS; ++h) impl_->exl3_heads[static_cast<size_t>(h)] = h;
+    impl_->mode = PleIo::Direct;
+    return true;
+}
+
 void PleTable::wait_prefetches() {
     if (impl_->n_prefetch == 0) return;
     std::string dummy;
@@ -408,23 +504,55 @@ void PleTable::close() {
     impl_->rb = PLE_ROW_BYTES;
     impl_->fmt = &ple_format_info(PleFormat::IQ4_NL);
     impl_->scale = 1.0f;
+    impl_->exl3_mode = false;
+    impl_->exl3_k = 0;
+    impl_->exl3_reader.reset();
+    impl_->exl3_format.clear();
     impl_->bytes_read = 0;
 }
 
 bool PleTable::is_open() const { return impl_->data != nullptr || impl_->reader.is_open(); }
 bool PleTable::locked() const { return impl_->locked; }
-const char* PleTable::format() const { return impl_->fmt->name; }
+const char* PleTable::format() const { return impl_->exl3_mode ? impl_->exl3_format.c_str() : impl_->fmt->name; }
+bool PleTable::is_exl3() const { return impl_->exl3_mode; }
+int PleTable::exl3_bits() const { return impl_->exl3_k; }
+const std::vector<int64_t>& PleTable::exl3_layer_multipliers() const {
+    static const std::vector<int64_t> empty;
+    return impl_->exl3_reader ? impl_->exl3_reader->layer_multipliers() : empty;
+}
+const std::vector<int64_t>& PleTable::exl3_head_offsets() const {
+    static const std::vector<int64_t> empty;
+    return impl_->exl3_reader ? impl_->exl3_reader->head_offsets() : empty;
+}
+const std::vector<int64_t>& PleTable::exl3_head_vocab_sizes() const {
+    static const std::vector<int64_t> empty;
+    return impl_->exl3_reader ? impl_->exl3_reader->head_vocab_sizes() : empty;
+}
 PleIo PleTable::mode() const { return impl_->mode; }
 uint64_t PleTable::rows() const { return impl_->n_rows; }
 uint64_t PleTable::bytes_read() const { return impl_->bytes_read; }
 
 void PleTable::read_row(uint32_t row, float* out160) const {
     if (impl_->mode == PleIo::Direct && impl_->reader.is_open()) {
-        uint8_t raw[PLE_ROW_BYTES_MAX];
+        alignas(uint16_t) uint8_t raw[PLE_ROW_BYTES_MAX];
         std::string err;
         const auto t = impl_->reader.issue(&row, 1, raw);
         if (!impl_->reader.collect(t, err)) {
             std::memset(out160, 0, (size_t) PLE_HEAD_DIM * sizeof(float));
+            return;
+        }
+        if (impl_->exl3_mode) {
+            const int32_t head = impl_->exl3_head(row);
+            const auto status = head < 0
+                                    ? strata::kernels::cpu::exl3::Status::invalid_argument
+                                    : impl_->exl3_reader->decode_packed_rows(
+                                          reinterpret_cast<const uint16_t*>(raw), 1, &head, out160, PLE_HEAD_DIM);
+            if (status != strata::kernels::cpu::exl3::Status::ok) {
+                std::memset(out160, 0, (size_t) PLE_HEAD_DIM * sizeof(float));
+                return;
+            }
+            for (int i = 0; i < PLE_HEAD_DIM; ++i) out160[i] = f32_from_f16(f16_from_f32(out160[i]));
+            impl_->bytes_read += impl_->rb;
             return;
         }
         impl_->decode(raw, out160);
@@ -457,6 +585,11 @@ bool PleTable::collect(float* out2560, std::string& err) {
     impl_->pending = false;
     if (impl_->mode == PleIo::Direct) {
         if (!impl_->reader.collect(impl_->ticket, err)) return false;
+        if (impl_->exl3_mode) {
+            if (!impl_->decode_exl3(impl_->raw, impl_->rows, PLE_N_HEADS, out2560, PLE_HEAD_DIM, err)) return false;
+            impl_->bytes_read += (uint64_t) PLE_N_HEADS * impl_->rb;
+            return true;
+        }
         for (int h = 0; h < PLE_N_HEADS; ++h)
             impl_->decode(impl_->raw + (size_t) h * impl_->rb, out2560 + (size_t) h * PLE_HEAD_DIM);
         impl_->bytes_read += (uint64_t) PLE_N_HEADS * impl_->rb;
@@ -491,19 +624,44 @@ bool PleTable::gather_batch(const uint32_t* rows, size_t n_tokens, float* out, s
                 }
                 impl_->n_prefetch = 0;
                 if (!ok) return false;
-                for (size_t t = 0; t < n_tokens; ++t)
-                    for (int h = 0; h < PLE_N_HEADS; ++h)
-                        impl_->decode(impl_->prefetch_raw[matched[t]] + (size_t) h * impl_->rb,
-                                      out + (t * PLE_N_HEADS + (size_t) h) * PLE_HEAD_DIM);
+                for (size_t t = 0; t < n_tokens; ++t) {
+                    if (impl_->exl3_mode) {
+                        if (!impl_->decode_exl3(impl_->prefetch_raw[matched[t]],
+                                                impl_->prefetch_keys[matched[t]], PLE_N_HEADS,
+                                                out + t * PLE_N_HEADS * PLE_HEAD_DIM, PLE_HEAD_DIM, err))
+                            return false;
+                    } else {
+                        for (int h = 0; h < PLE_N_HEADS; ++h)
+                            impl_->decode(impl_->prefetch_raw[matched[t]] + (size_t) h * impl_->rb,
+                                          out + (t * PLE_N_HEADS + (size_t) h) * PLE_HEAD_DIM);
+                    }
+                }
                 impl_->bytes_read += (uint64_t) n * impl_->rb;
                 return true;
             }
         }
         wait_prefetches();
-        std::vector<uint8_t> raw(n * impl_->rb);
-        const auto ticket = impl_->reader.issue(rows, n, raw.data());
+        std::vector<uint16_t> exl3_raw;
+        std::vector<uint8_t> raw;
+        uint8_t* raw_ptr = nullptr;
+        if (impl_->exl3_mode) {
+            exl3_raw.resize(n * impl_->rb / sizeof(uint16_t));
+            raw_ptr = reinterpret_cast<uint8_t*>(exl3_raw.data());
+        } else {
+            raw.resize(n * impl_->rb);
+            raw_ptr = raw.data();
+        }
+        const auto ticket = impl_->reader.issue(rows, n, raw_ptr);
         if (!impl_->reader.collect(ticket, err)) return false;
-        for (size_t i = 0; i < n; ++i) impl_->decode(raw.data() + i * impl_->rb, out + i * PLE_HEAD_DIM);
+        if (impl_->exl3_mode) {
+            for (size_t t = 0; t < n_tokens; ++t)
+                if (!impl_->decode_exl3(raw_ptr + t * PLE_N_HEADS * impl_->rb,
+                                        rows + t * PLE_N_HEADS, PLE_N_HEADS,
+                                        out + t * PLE_N_HEADS * PLE_HEAD_DIM, PLE_HEAD_DIM, err))
+                    return false;
+        } else {
+            for (size_t i = 0; i < n; ++i) impl_->decode(raw_ptr + i * impl_->rb, out + i * PLE_HEAD_DIM);
+        }
         impl_->bytes_read += (uint64_t) n * impl_->rb;
         return true;
     }

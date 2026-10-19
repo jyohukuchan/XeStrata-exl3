@@ -62,7 +62,10 @@ The dedicated blocking `exl3_ngram::Reader` validates sidecar shards and head ra
 requested rows. It also computes row IDs using the sidecar's multipliers, signed-int64 overflow and EOS boundaries.
 `row_spans()` exposes validated mappings from logical rows to file offsets. Passing them to the existing
 `PleReader::open_spans()` handles tensors with reordered physical spans or gaps through one asynchronous
-I/O worker and row cache. Model-startup sidecar selection and decoder integration are separate.
+I/O worker and row cache. Model-startup sidecar selection and binding remain separate.
+`PleTable::open_exl3()` connects this reader and decoder to the existing issue/collect, batch and prefetch
+APIs, applying per-head bias and final F16 rounding. It currently handles direct I/O and explicitly rejects
+mmap and locking. Sidecar hash constants are exposed for model binding.
 
 With NumPy available and tests enabled, build and run the CTests backed by independent fixtures.
 

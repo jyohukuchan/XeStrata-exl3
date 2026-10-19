@@ -254,7 +254,7 @@ target_link_libraries(strata_platform PUBLIC strata_warnings Threads::Threads)
 
 # `ngram.cpp` is the PLE hash and table geometry the GPU PLE block will share with the reader.
 add_library(strata_ngram STATIC src/kernels/ngram.cpp src/ngram/ple_reader.cpp)
-target_link_libraries(strata_ngram PUBLIC strata_platform strata_artifact)
+target_link_libraries(strata_ngram PUBLIC strata_platform strata_artifact strata_exl3_ngram_artifact)
 
 # Plan v0.3 P0.1: working-set lock of a host region (CPU only).
 if(STRATA_BUILD_TESTS)
@@ -280,6 +280,14 @@ set_tests_properties(platform_memory_test PROPERTIES SKIP_RETURN_CODE 77)   # ul
 add_executable(ple_reader_test src/ngram/ple_reader_test.cpp)
 target_link_libraries(ple_reader_test PRIVATE strata_ngram)
 add_test(NAME ple_reader_selftest COMMAND ple_reader_test --selftest)
+set_tests_properties(ple_reader_selftest PROPERTIES TIMEOUT 60)
+if(STRATA_BUILD_TESTS)
+  add_executable(exl3_table_test src/ngram/exl3_table_test.cpp)
+  target_link_libraries(exl3_table_test PRIVATE strata_ngram)
+  target_include_directories(exl3_table_test SYSTEM PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/main/nlohmann-json)
+  add_test(NAME exl3_table_test COMMAND exl3_table_test)
+endif()
 
 # ---- Intel Xe foundation --------------------------------------------------
 if(STRATA_ENABLE_XE)
