@@ -295,6 +295,61 @@ void test_cgroup_memory_budget() {
             "missing memory.stat counters did not fail closed");
 }
 
+#if defined(__linux__)
+void test_host_memory_fields() {
+    using namespace strata::core::detail;
+    constexpr uint64_t MiB = 1ull << 20;
+    TempDirectory dir;
+    const auto put = [&](const char* file, const std::string& text) {
+        const fs::path path = dir.path / file;
+        fs::create_directories(path.parent_path());
+        std::ofstream out(path);
+        out << text;
+        require(bool(out), "could not write host-memory fixture");
+    };
+    const auto put_bytes = [&](const char* file, uint64_t bytes) { put(file, std::to_string(bytes) + "\n"); };
+    const auto sample = [&](HostMemory& memory) {
+        return host_available_memory(memory, (dir.path / "meminfo").string(),
+                                     (dir.path / "self_cgroup").string(), (dir.path / "cgroup").string());
+    };
+    const std::string stat = "anon 123\ninactive_file 4194304\nfile_dirty 0\nfile_writeback 0\n";
+    put("meminfo", "MemTotal: 999999 kB\nUnused: not a number\n  MemAvailable:\t65536 kB\n");
+    put("self_cgroup", "0::/a/b\n");
+    put_bytes("cgroup/memory.max", 64 * MiB);
+    put_bytes("cgroup/memory.current", 48 * MiB);
+    put("cgroup/memory.stat", stat);
+    put("cgroup/a/memory.max", "max\n");
+    put_bytes("cgroup/a/memory.current", 0);
+    put_bytes("cgroup/a/b/memory.max", 48 * MiB);
+    put_bytes("cgroup/a/b/memory.current", 40 * MiB);
+    put("cgroup/a/b/memory.stat", stat);
+    HostMemory memory;
+    require(sample(memory) && memory.available == 12 * MiB && memory.cgroup_limit == 48 * MiB,
+            "host-memory fields or tightest ancestor changed");
+    put_bytes("cgroup/a/b/memory.current", 47 * MiB);
+    require(sample(memory) && memory.available == 5 * MiB, "dynamic cgroup usage was not reread");
+    put_bytes("cgroup/memory.max", 2 * MiB);
+    put_bytes("cgroup/memory.current", MiB);
+    put("cgroup/memory.stat", "inactive_file 0\nfile_dirty 0\nfile_writeback 0\n");
+    require(sample(memory) && memory.available == MiB && memory.cgroup_limit == 2 * MiB,
+            "dynamic ancestor cap was not reread");
+    for (const std::string& bad : {
+             stat + "inactive_file 1\n", stat + "unknown invalid\n", stat + "unknown 1 trailing\n",
+             std::string("inactive_file 18446744073709551616\nfile_dirty 0\nfile_writeback 0\n")}) {
+        put("cgroup/a/b/memory.stat", bad);
+        require(!sample(memory), "malformed memory.stat did not fail closed");
+    }
+    put("self_cgroup", "");
+    put("meminfo", "MemAvailable: 1 MB\nMemAvailable: 18446744073709551615 kB\n");
+    require(!sample(memory), "wrong units or KiB overflow were accepted");
+    put("meminfo", "MemAvailable: +1024kB trailing\n");
+    require(sample(memory) && memory.available == MiB, "stream-compatible MemAvailable fields changed");
+    put("meminfo", "MemAvailable: +1024kB trailing\nMemAvailable: 2048 kB\n");
+    require(sample(memory) && memory.available == 2 * MiB,
+            "valid stream-compatible fields or last valid MemAvailable changed");
+}
+#endif
+
 // upstream 8c80a3ba (and ed5536ea): the file cache named in a "not enough RAM" start failure
 void test_page_cache_hint() {
     using namespace strata::core::detail;
@@ -487,6 +542,9 @@ int main(int argc, char** argv) {
         test_resident_lend_region();
         test_resident_exchange();
         test_cgroup_memory_budget();
+#if defined(__linux__)
+        test_host_memory_fields();
+#endif
         test_page_cache_hint();
         test_canonical_layout();
 #if defined(STRATA_NATIVE_EXPERTS)

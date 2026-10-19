@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -28,6 +29,7 @@
 #include <fstream>
 #include <filesystem>
 #include <sstream>
+#include <string_view>
 #include <limits>
 #include <map>
 #include <memory>
@@ -259,6 +261,36 @@ void unmap_read_only(const uint8_t* view, uint64_t bytes) { munmap((void*) view,
 void close_file(int fd) { ::close(fd); }
 #endif
 
+#if !defined(_WIN32)
+void skip_memory_space(std::string_view& text) {
+    const size_t at = text.find_first_not_of(" \t\n\v\f\r");
+    text.remove_prefix(at == std::string_view::npos ? text.size() : at);
+}
+
+std::string_view take_memory_field(std::string_view& text) {
+    skip_memory_space(text);
+    const size_t end = text.find_first_of(" \t\n\v\f\r");
+    const std::string_view field = text.substr(0, end);
+    text.remove_prefix(field.size());
+    return field;
+}
+
+bool take_memory_u64(std::string_view& text, uint64_t& value) {
+    skip_memory_space(text);
+    if (text.empty()) return false;
+    // Match unsigned stream extraction, including its optional leading sign.
+    const bool negative = text.front() == '-';
+    if (negative || text.front() == '+') text.remove_prefix(1);
+    if (text.empty()) return false;
+    uint64_t magnitude = 0;
+    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), magnitude);
+    if (parsed.ec != std::errc{}) return false;
+    text.remove_prefix(static_cast<size_t>(parsed.ptr - text.data()));
+    value = negative ? uint64_t{0} - magnitude : magnitude;
+    return true;
+}
+#endif
+
 #if defined(__linux__)
 bool read_cgroup_memory_stat(const std::filesystem::path& path, uint64_t current,
                              detail::CgroupMemoryStat& stat) {
@@ -268,12 +300,14 @@ bool read_cgroup_memory_stat(const std::filesystem::path& path, uint64_t current
     bool inactive_file = false, file_dirty = false, file_writeback = false;
     std::string line;
     while (std::getline(input, line)) {
-        std::istringstream fields(line);
-        std::string key;
+        std::string_view fields(line);
+        const std::string_view key = take_memory_field(fields);
         uint64_t value = 0;
-        if (!(fields >> key >> value)) return false;
-        fields >> std::ws;
-        if (!fields.eof()) return false;
+        // Unknown counters still need valid syntax, preserving the existing
+        // fail-closed behavior without allocating a stream for every line.
+        if (key.empty() || !take_memory_u64(fields, value)) return false;
+        skip_memory_space(fields);
+        if (!fields.empty()) return false;
 
         if (key == "inactive_file") {
             if (inactive_file) return false;
@@ -316,10 +350,10 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
     std::string line;
     uint64_t bytes = 0;
     while (std::getline(info, line)) {
-        std::istringstream fields(line);
-        std::string key, unit;
+        std::string_view fields(line);
+        if (take_memory_field(fields) != "MemAvailable:") continue;
         uint64_t value = 0;
-        if (fields >> key >> value >> unit && key == "MemAvailable:" && unit == "kB" &&
+        if (take_memory_u64(fields, value) && take_memory_field(fields) == "kB" &&
             value <= std::numeric_limits<uint64_t>::max() / 1024) bytes = value * 1024;
     }
     if (bytes == 0) return false;
