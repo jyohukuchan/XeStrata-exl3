@@ -16,6 +16,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 - bpw は重みだけでなく scale、codebook、trellis、metadata、padding、dense/head/MTP の保存量を含む実効値で揃える。
 - 既存 XeStrata の同実効 bpw 形式に対して、同じ固定評価 token 列で `KL(P_BF16 || P_candidate)` の低下を示す。
 - decode 速度は、最適化を完了した構成で同じ hardware、context、batch、KV、MTP 条件を測り、既存 XeStrata の 95% 以上を暫定合格とする。未最適化 prototype の速度だけで実現可能性を否定しない。
+- Strata の CPU/GPU 協調推論を速度判定に含める。同じ VRAM 上限と resident expert の選択方針で、GPU resident expert と CPU miss の両方を実行する。全 expert が GPU に常駐する測定は GPU 経路の切り分けとして記録する。
 - 量子化精度の主比較では `STRATA_ROUTE_TAIL_SKIP=0` とし、全 routed expert の計算を維持する。
   条件により低順位の非resident expert を省略する既定の高速設定は別に記録し、同じ省略方針同士で速度を比べる。
   cache 配置や量子化形式で省略量が変わった結果を、そのまま量子化精度の改善と扱わない。
@@ -70,6 +71,8 @@ EXL3 metadata、tensor map、codebook、scale、trellis、alignment、shard を�
 ### 4. 最適化と速度判定
 
 prototype の速度は診断値として保存する。復号、積和、Hadamard/scale、codebook 読み出し、kernel launch、graph、cache、CPU expert、PCIe/host transfer の時間を分解し、既存 XeStrata の同じ区間と比較する。速度低下がある間は、bit 幅を減らして隠すのではなく、ボトルネックを解消してから判定する。
+
+CPU/GPU 協調時は CPU miss 数、GPU hit 数、CPU expert の処理時間、GPU kernel の実行時間、転送と同期の待ち時間を記録する。時間の単純な合計だけで判断せず、同じ layer の CPU と GPU の実行区間が重なるかを timeline で確認し、直列実行、CPU 計算、GPU 計算、転送のどれが decode の待ちを作るかを特定する。CPU thread 数と worker の実際の仕事量も確認する。scalar 参照 kernel や直列 fallback を残した状態の協調速度だけで前提不成立を結論しない。
 
 各 bpw と各 GPU 構成について、最適化後の同一条件を複数回測る。中央値、ばらつき、warm-up 後の値、prefill と decode、MTP の acceptance と実効 token/s を残す。95% 未満なら未達として原因と次の最適化を記録し、未最適化の一回の測定だけで前提条件を不成立とはしない。
 

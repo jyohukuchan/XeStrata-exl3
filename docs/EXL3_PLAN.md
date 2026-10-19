@@ -16,6 +16,7 @@ This plan adds EXL3 at 2–5 bpw and mixed precision to XeStrata, with higher qu
 - Match bpw as an effective value including weights, scales, codebook, trellis, metadata, padding and dense/head/MTP storage.
 - Show an improvement over the existing XeStrata format at the same effective bpw using lower `KL(P_BF16 || P_candidate)` on identical fixed evaluation token sequences.
 - Measure decode with the optimized configuration under identical hardware, context, batch, KV and MTP settings. The provisional pass line is 95% or more of existing XeStrata. Do not reject feasibility from an unoptimized prototype alone.
+- Include Strata's CPU/GPU cooperative inference in speed acceptance. Run both GPU-resident experts and CPU misses under the same VRAM limit and resident-expert selection policy. Record fully GPU-resident measurements as isolation of the GPU path.
 - Set `STRATA_ROUTE_TAIL_SKIP=0` for the primary quantization-quality comparison so every routed expert contributes.
   Record the stock fast setting, which conditionally skips low-ranked nonresident experts, separately and compare
   speed under matching skip policies. Do not attribute changes in skipped work caused by cache placement or
@@ -75,6 +76,8 @@ Check primary 2–5 bpw, all three codebooks, valid checkpoint mixed precision a
 ### 4. Optimize before judging speed
 
 Keep prototype speed as diagnostic evidence. Break down dequantization, multiply-accumulate, Hadamard/scale work, codebook reads, kernel launch, graph, cache, CPU experts and PCIe/host transfer, comparing each interval with the existing XeStrata path. Do not hide a slowdown by dropping bit widths; remove the measured bottleneck first.
+
+For CPU/GPU cooperation, record CPU misses, GPU hits, CPU expert processing time, GPU kernel execution time, and transfer and synchronization waits. Use a timeline to verify whether CPU and GPU execution for the same layer overlap, rather than judging their summed times alone. Identify whether serialization, CPU work, GPU work or transfers make decode wait. Also check CPU thread counts and the work actually assigned to workers. Do not reject the premise from cooperative performance while scalar reference kernels or serial fallbacks remain.
 
 For each bpw and GPU configuration, run the optimized configuration repeatedly under the same conditions. Record median, spread, post-warm-up values, prefill and decode, MTP acceptance and delivered token/s. A result below 95% is a miss with a recorded cause and next optimization; one unoptimized run is not evidence that the premise is false.
 
