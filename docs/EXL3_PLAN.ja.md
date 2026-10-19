@@ -14,7 +14,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 - dense、embedding、norm、output head、MTP head、vision など、量子化しないか別の精度を使うテンソルを明示的に扱う。checkpoint に記録された head/MTP の bit 数などの有効な例外を暗黙に丸めない。
 - 同一の元モデル、revision、tokenizer、校正データ、サンプリング条件で比較する。
 - bpw は重みだけでなく scale、codebook、trellis、metadata、padding、dense/head/MTP の保存量を含む実効値で揃える。
-- 既存 XeStrata の同実効 bpw 形式に対して、BF16 基準の品質指標と固定評価文の結果で改善を示す。
+- 既存 XeStrata の同実効 bpw 形式に対して、同じ固定評価 token 列で `KL(P_BF16 || P_candidate)` の低下を示す。
 - decode 速度は、最適化を完了した構成で同じ hardware、context、batch、KV、MTP 条件を測り、既存 XeStrata の 95% 以上を暫定合格とする。未最適化 prototype の速度だけで実現可能性を否定しない。
 - 量子化精度の主比較では `STRATA_ROUTE_TAIL_SKIP=0` とし、全 routed expert の計算を維持する。
   条件により低順位の非resident expert を省略する既定の高速設定は別に記録し、同じ省略方針同士で速度を比べる。
@@ -45,7 +45,7 @@ Q4_K_M などの結果は補助比較として残し、IQuant 比較の代わり
 ### 1. 精度の成立性を先に確認
 
 同じ元モデルから主対象の 2、3、4、5 bpw の EXL3 pack を作り、`mul1`、`mcg`、`legacy/default (cb0)` と代表的な混合精度 recipe を用意する。checkpoint に実在する head の bit 幅は付随する例外として保持する。BF16 教師、既存 XeStrata 形式、EXL3 を同じ holdout token 列で比較する。精度の判定指標は
-BF16 教師に対する KL のみとし、token ごとの値から mean・median・p90 と case ごとの分布を記録する。
+`KL(P_BF16 || P_candidate)` のみとし、token ごとの値から mean・median・p90 と case ごとの分布を記録する。
 perplexity や greedy token 一致率を保存した場合も、精度の達成条件には使わない。
 日本語・コードなどの短い生成は動作確認として扱う。
 

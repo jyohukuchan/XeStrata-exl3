@@ -14,7 +14,7 @@ This plan adds EXL3 at 2–5 bpw and mixed precision to XeStrata, with higher qu
 - Explicitly handle tensors that stay unquantized or use another precision: dense layers, embeddings, norms, output head, MTP head and vision components. Do not silently round valid head or MTP bit settings recorded in a checkpoint.
 - Compare the same source model, revision, tokenizer, calibration data and sampling conditions.
 - Match bpw as an effective value including weights, scales, codebook, trellis, metadata, padding and dense/head/MTP storage.
-- Show an improvement over the existing XeStrata format at the same effective bpw using BF16 reference metrics and fixed evaluation prompts.
+- Show an improvement over the existing XeStrata format at the same effective bpw using lower `KL(P_BF16 || P_candidate)` on identical fixed evaluation token sequences.
 - Measure decode with the optimized configuration under identical hardware, context, batch, KV and MTP settings. The provisional pass line is 95% or more of existing XeStrata. Do not reject feasibility from an unoptimized prototype alone.
 - Set `STRATA_ROUTE_TAIL_SKIP=0` for the primary quantization-quality comparison so every routed expert contributes.
   Record the stock fast setting, which conditionally skips low-ranked nonresident experts, separately and compare
@@ -49,7 +49,7 @@ and similar results as supplementary comparisons, not substitutes for IQuant.
 ### 1. Check precision feasibility first
 
 Create primary 2, 3, 4 and 5 bpw EXL3 packs from the same source model, covering `mul1`, `mcg`, `legacy/default (cb0)` and representative mixed precision recipes. Preserve valid checkpoint head bit widths as associated exceptions. Compare the BF16 teacher, existing XeStrata formats and EXL3 on identical holdout token sequences.
-KL divergence from the BF16 teacher is the sole precision criterion; record token-level mean, median,
+`KL(P_BF16 || P_candidate)` is the sole precision criterion; record token-level mean, median,
 p90 and per-case distributions. Perplexity and greedy-token agreement, if retained, do not determine
 precision acceptance. Short Japanese, code and similar generation checks establish functionality.
 
