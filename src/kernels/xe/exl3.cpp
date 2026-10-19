@@ -50,6 +50,22 @@ inline void check_gemv(const MatrixView& view, const float* x, float* y, const f
         throw std::invalid_argument("exl3_gemv_fp32: caller scratch is too small");
 }
 
+inline void check_gemm(const MatrixView& view, const float* x, float* y, int64_t ldx, int64_t ldy, int64_t rows,
+                       const float* scratch, size_t scratch_elements, GemvOptions options) {
+    check_view(view, "exl3_gemm_fp32");
+    if (x == nullptr || y == nullptr) throw std::invalid_argument("exl3_gemm_fp32: x and y are required");
+    if (rows <= 0) throw std::invalid_argument("exl3_gemm_fp32: rows must be positive");
+    if (ldx < view.k || ldy < view.n)
+        throw std::invalid_argument("exl3_gemm_fp32: leading dimensions must cover the logical vectors");
+    if (options.input_hadamard && view.suh != nullptr && view.k % 128 != 0)
+        throw std::invalid_argument("exl3_gemm_fp32: k must be divisible by 128 for input H128");
+    if (options.output_hadamard && view.svh != nullptr && view.n % 128 != 0)
+        throw std::invalid_argument("exl3_gemm_fp32: n must be divisible by 128 for output H128");
+    const size_t needed = exl3_gemm_scratch_elements(view, rows, options);
+    if (needed != 0 && (scratch == nullptr || scratch_elements < needed))
+        throw std::invalid_argument("exl3_gemm_fp32: caller scratch is too small");
+}
+
 // The device code loads uint16 words explicitly rather than casting the packed pointer to uint32_t.  This keeps the
 // contract valid for a 2-byte-aligned allocation and documents EXL3's little-endian packed-word order.
 inline uint32_t load_word32(const uint16_t* packed, int word, int word_count) {
@@ -161,6 +177,68 @@ sycl::event submit_output_hadamard(sycl::queue& queue, const MatrixView& view, c
     });
 }
 
+sycl::event submit_input_hadamard_rows(sycl::queue& queue, const MatrixView& view, const float* x, int64_t ldx,
+                                       float* transformed, int64_t rows, const std::vector<sycl::event>& deps) {
+    return queue.submit([&](sycl::handler& h) {
+        if (!deps.empty()) h.depends_on(deps);
+        h.parallel_for(sycl::range<1>((size_t) rows * (size_t) view.k), [=](sycl::id<1> id) {
+            const size_t flat = (size_t) id[0];
+            const int64_t r = (int64_t) (flat / (size_t) view.k);
+            const int64_t i = (int64_t) (flat % (size_t) view.k);
+            const int64_t block = i & ~int64_t(127);
+            const int local = (int) (i & 127);
+            const float* xr = x + r * ldx;
+            float* dst = transformed + r * view.k;
+            float sum = 0.0f;
+            for (int j = 0; j < 128; ++j) {
+                const float scale = f32_from_f16(view.suh[block + j]);
+                sum += (float) hadamard_sign(local, j) * xr[block + j] * scale;
+            }
+            dst[i] = sum * kHadamardScale;
+        });
+    });
+}
+
+sycl::event submit_dot_rows(sycl::queue& queue, const MatrixView& view, const float* x, int64_t ldx, float* y,
+                            int64_t ldy, int64_t rows, const std::vector<sycl::event>& deps, bool add_bias) {
+    return queue.submit([&](sycl::handler& h) {
+        if (!deps.empty()) h.depends_on(deps);
+        h.parallel_for(sycl::range<1>((size_t) rows * (size_t) view.n), [=](sycl::id<1> id) {
+            const size_t flat = (size_t) id[0];
+            const int64_t r = (int64_t) (flat / (size_t) view.n);
+            const int64_t col = (int64_t) (flat % (size_t) view.n);
+            const float* xr = x + r * ldx;
+            float* yr = y + r * ldy;
+            float sum = 0.0f;
+            for (int64_t row = 0; row < view.k; ++row) sum += xr[row] * decoded_weight(view, row, col);
+            if (add_bias && view.bias != nullptr) sum += f32_from_f16(view.bias[col]);
+            yr[col] = sum;
+        });
+    });
+}
+
+sycl::event submit_output_hadamard_rows(sycl::queue& queue, const MatrixView& view, const float* dot, float* y,
+                                        int64_t ldy, int64_t rows, const std::vector<sycl::event>& deps,
+                                        bool add_bias) {
+    return queue.submit([&](sycl::handler& h) {
+        if (!deps.empty()) h.depends_on(deps);
+        h.parallel_for(sycl::range<1>((size_t) rows * (size_t) view.n), [=](sycl::id<1> id) {
+            const size_t flat = (size_t) id[0];
+            const int64_t r = (int64_t) (flat / (size_t) view.n);
+            const int64_t j = (int64_t) (flat % (size_t) view.n);
+            const int64_t block = j & ~int64_t(127);
+            const int local = (int) (j & 127);
+            const float* dr = dot + r * view.n;
+            float* yr = y + r * ldy;
+            float sum = 0.0f;
+            for (int i = 0; i < 128; ++i) sum += (float) hadamard_sign(local, i) * dr[block + i];
+            sum *= kHadamardScale * f32_from_f16(view.svh[j]);
+            if (add_bias && view.bias != nullptr) sum += f32_from_f16(view.bias[j]);
+            yr[j] = sum;
+        });
+    });
+}
+
 }  // namespace
 
 size_t exl3_gemv_scratch_elements(const MatrixView& view, GemvOptions options) {
@@ -168,6 +246,14 @@ size_t exl3_gemv_scratch_elements(const MatrixView& view, GemvOptions options) {
     if (options.input_hadamard && view.suh != nullptr) result += (size_t) view.k;
     if (options.output_hadamard && view.svh != nullptr) result += (size_t) view.n;
     return result;
+}
+
+size_t exl3_gemm_scratch_elements(const MatrixView& view, int64_t rows, GemvOptions options) {
+    if (rows <= 0) return 0;
+    const size_t per_row = exl3_gemv_scratch_elements(view, options);
+    if (per_row > std::numeric_limits<size_t>::max() / (size_t) rows)
+        throw std::invalid_argument("exl3_gemm_fp32: scratch size overflows size_t");
+    return per_row * (size_t) rows;
 }
 
 sycl::event exl3_reconstruct(sycl::queue& queue, const MatrixView& view, uint16_t* out,
@@ -209,6 +295,32 @@ sycl::event exl3_gemv_fp32(sycl::queue& queue, const MatrixView& view, const flo
     const sycl::event dot_event = submit_dot(queue, view, dot_input, dot_output, dot_deps, dot_add_bias);
     if (use_output)
         return submit_output_hadamard(queue, view, dot_output, y, {dot_event}, options.add_bias);
+    return dot_event;
+}
+
+sycl::event exl3_gemm_fp32(sycl::queue& queue, const MatrixView& view, const float* x, int64_t ldx, float* y,
+                           int64_t ldy, int64_t rows, float* scratch, size_t scratch_elements, GemvOptions options,
+                           const std::vector<sycl::event>& deps) {
+    check_gemm(view, x, y, ldx, ldy, rows, scratch, scratch_elements, options);
+    const bool use_input = options.input_hadamard && view.suh != nullptr;
+    const bool use_output = options.output_hadamard && view.svh != nullptr;
+    const size_t input_elements = use_input ? (size_t) rows * (size_t) view.k : 0;
+    const size_t output_offset = input_elements;
+    const float* dot_input = use_input ? scratch : x;
+    const int64_t dot_ldx = use_input ? view.k : ldx;
+    float* dot_output = use_output ? scratch + output_offset : y;
+    const int64_t dot_ldy = use_output ? view.n : ldy;
+
+    std::vector<sycl::event> dot_deps = deps;
+    if (use_input) {
+        const sycl::event input_event = submit_input_hadamard_rows(queue, view, x, ldx, scratch, rows, deps);
+        dot_deps = {input_event};
+    }
+    const bool dot_add_bias = options.add_bias && !use_output;
+    const sycl::event dot_event =
+        submit_dot_rows(queue, view, dot_input, dot_ldx, dot_output, dot_ldy, rows, dot_deps, dot_add_bias);
+    if (use_output)
+        return submit_output_hadamard_rows(queue, view, dot_output, y, ldy, rows, {dot_event}, options.add_bias);
     return dot_event;
 }
 

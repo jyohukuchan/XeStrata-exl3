@@ -23,6 +23,9 @@
 namespace {
 
 using strata::kernels::exl3::MatrixView;
+using strata::kernels::f32_from_f16;
+
+constexpr float kHadamardScale = 0.08838834764831845f;
 
 struct FixtureCase {
     uint32_t bits = 0;
@@ -114,6 +117,59 @@ bool close(float got, float want) {
     return std::fabs(got - want) <= tolerance;
 }
 
+int hadamard_sign(int row, int col) {
+    unsigned bits = (unsigned) (row & col);
+    int parity = 0;
+    while (bits != 0) {
+        parity ^= 1;
+        bits &= bits - 1;
+    }
+    return parity == 0 ? 1 : -1;
+}
+
+// Independent batch oracle: it starts with the fixture's reconstructed Wgold and uses double accumulation for both
+// matrix products.  The device test therefore checks the batched packed-weight path against a host calculation,
+// rather than checking two copies of the packed decode implementation against each other.
+void batch_reference(const FixtureCase& c, const std::vector<float>& x, int64_t ldx, std::vector<float>& y, int64_t ldy,
+                     int64_t rows) {
+    for (int64_t r = 0; r < rows; ++r) {
+        std::vector<float> input((size_t) c.k);
+        for (int64_t i = 0; i < c.k; ++i) {
+            double value = x[(size_t) r * (size_t) ldx + (size_t) i];
+            if (!c.suh.empty()) {
+                const int64_t block = i & ~int64_t(127);
+                const int local = (int) (i & 127);
+                double sum = 0.0;
+                for (int j = 0; j < 128; ++j)
+                    sum += (double) hadamard_sign(local, j) * x[(size_t) r * (size_t) ldx + (size_t) block + j] *
+                           (double) f32_from_f16(c.suh[(size_t) block + j]);
+                value = (double) (float) (sum * (double) kHadamardScale);
+            }
+            input[(size_t) i] = (float) value;
+        }
+        std::vector<float> dot((size_t) c.n);
+        for (uint32_t col = 0; col < c.n; ++col) {
+            double sum = 0.0;
+            for (uint32_t row = 0; row < c.k; ++row)
+                sum += (double) input[row] * (double) f32_from_f16(c.wgold[(size_t) row * c.n + col]);
+            dot[col] = (float) sum;
+        }
+        for (uint32_t j = 0; j < c.n; ++j) {
+            double value = dot[j];
+            if (!c.svh.empty()) {
+                const int local = (int) (j & 127);
+                const int64_t block = (int64_t) j & ~int64_t(127);
+                double sum = 0.0;
+                for (int i = 0; i < 128; ++i) sum += (double) hadamard_sign(local, i) * dot[(size_t) block + i];
+                value = (double) (float) (sum * (double) kHadamardScale *
+                                          (double) f32_from_f16(c.svh[j]));
+            }
+            if (!c.bias.empty()) value += (double) f32_from_f16(c.bias[j]);
+            y[(size_t) r * (size_t) ldy + j] = (float) value;
+        }
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -194,6 +250,45 @@ int main(int argc, char** argv) {
                     c.bits, c.codebook, c.k, c.n, bad_w == 0 ? "OK" : "FAIL", bad_w,
                     bad_y == 0 ? "OK" : "FAIL", bad_y);
         if (bad_w != 0 || bad_y != 0) ++failures;
+
+        for (const int64_t rows : {int64_t(2), int64_t(4)}) {
+            const int64_t ldx = (int64_t) c.k + 7;
+            const int64_t ldy = (int64_t) c.n + 11;
+            const float input_padding = -31337.25f;
+            const float output_padding = 27182.75f;
+            std::vector<float> batch_x((size_t) rows * (size_t) ldx, input_padding);
+            std::vector<float> batch_y((size_t) rows * (size_t) ldy, output_padding);
+            for (int64_t r = 0; r < rows; ++r)
+                for (uint32_t i = 0; i < c.k; ++i)
+                    batch_x[(size_t) r * (size_t) ldx + i] =
+                        c.x[i] * (0.75f + 0.125f * (float) r) + 0.0025f * (float) ((int) (i % 9) - 4) * (float) (r + 1);
+            std::vector<float> expected = batch_y;
+            batch_reference(c, batch_x, ldx, expected, ldy, rows);
+
+            float* d_batch_x = device.upload(batch_x);
+            float* d_batch_y = device.upload(batch_y);
+            const size_t batch_scratch_elements =
+                strata::kernels::exl3::exl3_gemm_scratch_elements(view, rows);
+            float* d_batch_scratch = device.alloc<float>(batch_scratch_elements);
+            const sycl::event batch_ready = queue.ext_oneapi_submit_barrier();
+            sycl::event batch_event = strata::kernels::exl3::exl3_gemm_fp32(
+                queue, view, d_batch_x, ldx, d_batch_y, ldy, rows, d_batch_scratch, batch_scratch_elements, {}, {batch_ready});
+            batch_event.wait_and_throw();
+            std::vector<float> got_batch(batch_y.size());
+            strata::parity::copy_out(got_batch.data(), d_batch_y, got_batch.size());
+            size_t bad_batch = 0, bad_padding = 0;
+            for (int64_t r = 0; r < rows; ++r) {
+                for (uint32_t j = 0; j < c.n; ++j)
+                    if (!close(got_batch[(size_t) r * (size_t) ldy + j], expected[(size_t) r * (size_t) ldy + j]))
+                        ++bad_batch;
+                for (int64_t j = c.n; j < ldy; ++j)
+                    if (got_batch[(size_t) r * (size_t) ldy + j] != output_padding) ++bad_padding;
+            }
+            std::printf("case %2zu: batched rows %lld ldx %lld ldy %lld: %s (%zu value, %zu padding bad)\n", ci,
+                        (long long) rows, (long long) ldx, (long long) ldy,
+                        bad_batch == 0 && bad_padding == 0 ? "OK" : "FAIL", bad_batch, bad_padding);
+            if (bad_batch != 0 || bad_padding != 0) ++failures;
+        }
     }
 
     std::printf("exl3_parity: %zu cases, %d failures\n", cases.size(), failures);

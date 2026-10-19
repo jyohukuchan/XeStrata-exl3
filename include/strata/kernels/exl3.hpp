@@ -50,4 +50,18 @@ sycl::event exl3_gemv_fp32(sycl::queue& queue, const MatrixView& view, const flo
                            size_t scratch_elements, GemvOptions options = {},
                            const std::vector<sycl::event>& deps = {});
 
+/// Number of float elements required by exl3_gemm_fp32 for rows input rows.
+/// Scratch is laid out as rows*k input-transform values followed by rows*n dot values.
+size_t exl3_gemm_scratch_elements(const MatrixView& view, int64_t rows, GemvOptions options = {});
+
+/// Batched FP32 linear operation for prefill and MTP.
+///
+/// Inputs are rows vectors at x[r*ldx], outputs are rows vectors at y[r*ldy].  The leading dimensions may exceed
+/// k and n, respectively, so callers can keep padded row strides.  The weight remains packed and is decoded inside
+/// each dot; no expanded matrix is allocated.  Scratch is caller-owned and has the size returned by
+/// exl3_gemm_scratch_elements when a Hadamard stage is active.
+sycl::event exl3_gemm_fp32(sycl::queue& queue, const MatrixView& view, const float* x, int64_t ldx, float* y,
+                           int64_t ldy, int64_t rows, float* scratch, size_t scratch_elements,
+                           GemvOptions options = {}, const std::vector<sycl::event>& deps = {});
+
 }  // namespace strata::kernels::exl3

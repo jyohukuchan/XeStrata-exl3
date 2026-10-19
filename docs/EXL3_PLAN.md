@@ -16,6 +16,10 @@ This plan adds EXL3 at 2–5 bpw and mixed precision to XeStrata, with higher qu
 - Match bpw as an effective value including weights, scales, codebook, trellis, metadata, padding and dense/head/MTP storage.
 - Show an improvement over the existing XeStrata format at the same effective bpw using BF16 reference metrics and fixed evaluation prompts.
 - Measure decode with the optimized configuration under identical hardware, context, batch, KV and MTP settings. The provisional pass line is 95% or more of existing XeStrata. Do not reject feasibility from an unoptimized prototype alone.
+- Set `STRATA_ROUTE_TAIL_SKIP=0` for the primary quantization-quality comparison so every routed expert contributes.
+  Record the stock fast setting, which conditionally skips low-ranked nonresident experts, separately and compare
+  speed under matching skip policies. Do not attribute changes in skipped work caused by cache placement or
+  quantization format directly to better quantization quality.
 
 Safetensors sidecars outside the indexed shards are also part of the artifact. `ngram_embedding.safetensors` with
 `exl3_ngram_trellis` is not an ordinary linear trellis: it uses a dedicated n-gram codec with row dimension 160, so it

@@ -16,6 +16,9 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 - bpw は重みだけでなく scale、codebook、trellis、metadata、padding、dense/head/MTP の保存量を含む実効値で揃える。
 - 既存 XeStrata の同実効 bpw 形式に対して、BF16 基準の品質指標と固定評価文の結果で改善を示す。
 - decode 速度は、最適化を完了した構成で同じ hardware、context、batch、KV、MTP 条件を測り、既存 XeStrata の 95% 以上を暫定合格とする。未最適化 prototype の速度だけで実現可能性を否定しない。
+- 量子化精度の主比較では `STRATA_ROUTE_TAIL_SKIP=0` とし、全 routed expert の計算を維持する。
+  条件により低順位の非resident expert を省略する既定の高速設定は別に記録し、同じ省略方針同士で速度を比べる。
+  cache 配置や量子化形式で省略量が変わった結果を、そのまま量子化精度の改善と扱わない。
 
 indexed shard の外にある safetensors sidecar も artifact の一部として扱う。`ngram_embedding.safetensors` の
 `exl3_ngram_trellis` は通常の線形層の trellis ではなく、row 次元160の専用 n-gram codec なので、線形層の
