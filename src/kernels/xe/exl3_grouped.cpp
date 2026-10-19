@@ -468,6 +468,47 @@ sycl::event submit_gate_up_post(sycl::queue& queue, const GroupedPlan& plan, flo
     });
 }
 
+sycl::event submit_down_dot_cooperative(sycl::queue& queue, const GroupedPlan& plan, float* scratch,
+                                         int64_t plane, GroupedOptions options,
+                                         const std::vector<sycl::event>& deps) {
+    const size_t tiles = (static_cast<size_t>(plan.hidden) + 7u) / 8u;
+    const size_t groups = static_cast<size_t>(plan.max_entries) * tiles;
+    return queue.submit([&](sycl::handler& h) {
+        if (!deps.empty()) h.depends_on(deps);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>(groups * 32u), sycl::range<1>(32)),
+                       [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+            const sycl::sub_group subgroup = item.get_sub_group();
+            const int lane = static_cast<int>(subgroup.get_local_id()[0]);
+            const int column_lane = lane >> 2;
+            const int k_lane = lane & 3;
+            const size_t group = static_cast<size_t>(item.get_group_linear_id());
+            const int32_t entry = static_cast<int32_t>(group / tiles);
+            const int64_t tile = static_cast<int64_t>(group % tiles);
+            const int64_t col = tile * 8 + column_lane;
+            const ResolvedEntry resolved = resolve_entry(plan, entry, options);
+            const bool active = resolved.valid && col < plan.hidden;
+            const float* input = active ? scratch + static_cast<size_t>(entry) * static_cast<size_t>(plane) : nullptr;
+            float partial = 0.0f;
+            if (active) {
+                if (resolved.down.is_packed()) {
+                    const MatrixView down = resolved.down.packed_matrix();
+                    for (int64_t row = k_lane; row < down.k; row += 4)
+                        partial += input[row] * decoded_weight(down, row, col);
+                } else if (k_lane == 0) {
+                    partial = dot_value(resolved.down, input, col);
+                }
+            }
+            float reduced = partial + sycl::permute_group_by_xor(subgroup, partial, 1);
+            reduced += sycl::permute_group_by_xor(subgroup, reduced, 2);
+            if (active && k_lane == 0) {
+                float* output = scratch + 2 * static_cast<size_t>(plan.max_entries) * static_cast<size_t>(plane) +
+                                static_cast<size_t>(entry) * static_cast<size_t>(plane);
+                output[col] = reduced;
+            }
+        });
+    });
+}
+
 }  // namespace
 
 size_t exl3_grouped_scratch_elements(const GroupedPlan& plan) {
@@ -533,20 +574,25 @@ sycl::event exl3_grouped_fp32(sycl::queue& queue, const GroupedPlan& plan, const
             }
         });
     });
-    const sycl::event down_dot = queue.submit([&](sycl::handler& h) {
-        h.depends_on(down_input);
-        h.parallel_for(sycl::range<1>((size_t) plan.max_entries * (size_t) plan.hidden), [=](sycl::id<1> id) {
-            const size_t flat = (size_t) id[0];
-            const int32_t entry = (int32_t) (flat / (size_t) plan.hidden);
-            const int64_t col = (int64_t) (flat % (size_t) plan.hidden);
-            const ResolvedEntry resolved = resolve_entry(plan, entry, options);
-            if (!resolved.valid) return;
-            const float* input = scratch + (size_t) entry * (size_t) plane;
-            float* output = scratch + 2 * (size_t) plan.max_entries * (size_t) plane +
-                            (size_t) entry * (size_t) plane;
-            output[col] = dot_value(resolved.down, input, col);
+    sycl::event down_dot;
+    if (grouped_cooperative_capability(queue)) {
+        down_dot = submit_down_dot_cooperative(queue, plan, scratch, plane, options, {down_input});
+    } else {
+        down_dot = queue.submit([&](sycl::handler& h) {
+            h.depends_on(down_input);
+            h.parallel_for(sycl::range<1>((size_t) plan.max_entries * (size_t) plan.hidden), [=](sycl::id<1> id) {
+                const size_t flat = (size_t) id[0];
+                const int32_t entry = (int32_t) (flat / (size_t) plan.hidden);
+                const int64_t col = (int64_t) (flat % (size_t) plan.hidden);
+                const ResolvedEntry resolved = resolve_entry(plan, entry, options);
+                if (!resolved.valid) return;
+                const float* input = scratch + (size_t) entry * (size_t) plane;
+                float* output = scratch + 2 * (size_t) plan.max_entries * (size_t) plane +
+                                (size_t) entry * (size_t) plane;
+                output[col] = dot_value(resolved.down, input, col);
+            });
         });
-    });
+    }
     return queue.submit([&](sycl::handler& h) {
         h.depends_on(down_dot);
         h.parallel_for(sycl::range<1>((size_t) plan.max_entries * (size_t) plan.hidden), [=](sycl::id<1> id) {
