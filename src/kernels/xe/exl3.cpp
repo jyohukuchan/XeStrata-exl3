@@ -410,8 +410,8 @@ inline int hadamard_sign(int row, int col) {
     return parity == 0 ? 1 : -1;
 }
 
-sycl::event submit_input_hadamard(sycl::queue& queue, const MatrixView& view, const float* x, float* transformed,
-                                  const std::vector<sycl::event>& deps) {
+sycl::event submit_input_hadamard_scalar(sycl::queue& queue, const MatrixView& view, const float* x,
+                                         float* transformed, const std::vector<sycl::event>& deps) {
     return queue.submit([&](sycl::handler& h) {
         if (!deps.empty()) h.depends_on(deps);
         h.parallel_for(sycl::range<1>((size_t) view.k), [=](sycl::id<1> id) {
@@ -442,8 +442,8 @@ sycl::event submit_dot(sycl::queue& queue, const MatrixView& view, const float* 
     });
 }
 
-sycl::event submit_output_hadamard(sycl::queue& queue, const MatrixView& view, const float* dot, float* y,
-                                   const std::vector<sycl::event>& deps, bool add_bias) {
+sycl::event submit_output_hadamard_scalar(sycl::queue& queue, const MatrixView& view, const float* dot, float* y,
+                                          const std::vector<sycl::event>& deps, bool add_bias) {
     return queue.submit([&](sycl::handler& h) {
         if (!deps.empty()) h.depends_on(deps);
         h.parallel_for(sycl::range<1>((size_t) view.n), [=](sycl::id<1> id) {
@@ -459,8 +459,9 @@ sycl::event submit_output_hadamard(sycl::queue& queue, const MatrixView& view, c
     });
 }
 
-sycl::event submit_input_hadamard_rows(sycl::queue& queue, const MatrixView& view, const float* x, int64_t ldx,
-                                       float* transformed, int64_t rows, const std::vector<sycl::event>& deps) {
+sycl::event submit_input_hadamard_rows_scalar(sycl::queue& queue, const MatrixView& view, const float* x, int64_t ldx,
+                                              float* transformed, int64_t rows,
+                                              const std::vector<sycl::event>& deps) {
     return queue.submit([&](sycl::handler& h) {
         if (!deps.empty()) h.depends_on(deps);
         h.parallel_for(sycl::range<1>((size_t) rows * (size_t) view.k), [=](sycl::id<1> id) {
@@ -499,9 +500,9 @@ sycl::event submit_dot_rows(sycl::queue& queue, const MatrixView& view, const fl
     });
 }
 
-sycl::event submit_output_hadamard_rows(sycl::queue& queue, const MatrixView& view, const float* dot, float* y,
-                                        int64_t ldy, int64_t rows, const std::vector<sycl::event>& deps,
-                                        bool add_bias) {
+sycl::event submit_output_hadamard_rows_scalar(sycl::queue& queue, const MatrixView& view, const float* dot,
+                                               float* y, int64_t ldy, int64_t rows,
+                                               const std::vector<sycl::event>& deps, bool add_bias) {
     return queue.submit([&](sycl::handler& h) {
         if (!deps.empty()) h.depends_on(deps);
         h.parallel_for(sycl::range<1>((size_t) rows * (size_t) view.n), [=](sycl::id<1> id) {
@@ -519,6 +520,126 @@ sycl::event submit_output_hadamard_rows(sycl::queue& queue, const MatrixView& vi
             yr[j] = sum;
         });
     });
+}
+
+inline bool hadamard_coop_capability(const sycl::queue& queue) {
+    try {
+        const auto subgroup_sizes = queue.get_device().get_info<sycl::info::device::sub_group_sizes>();
+        if (std::find(subgroup_sizes.begin(), subgroup_sizes.end(), size_t(32)) == subgroup_sizes.end()) return false;
+        return queue.get_device().get_info<sycl::info::device::max_work_group_size>() >= 32;
+    } catch (...) {
+        return false;
+    }
+}
+
+// A 128-wide H transform uses one SG32 and four registers per lane.  The first
+// five butterfly stages stay in the SG; the two remaining bits are butterflies
+// between the four registers.  This is shared by GEMV and GEMM and by input
+// and output transforms so their strides and scale/bias order cannot diverge.
+template <bool Output, bool Rows>
+sycl::event submit_hadamard_coop(sycl::queue& queue, const MatrixView& view, const float* source,
+                                 int64_t source_ld, float* destination, int64_t destination_ld, int64_t rows,
+                                 const std::vector<sycl::event>& deps, bool add_bias) {
+    const int64_t width = Output ? view.n : view.k;
+    const size_t blocks = static_cast<size_t>(width / 128);
+    const size_t groups = Rows ? static_cast<size_t>(rows) * blocks : blocks;
+    return queue.submit([&](sycl::handler& h) {
+        if (!deps.empty()) h.depends_on(deps);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>(groups * 32), sycl::range<1>(32)),
+                       [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+            const sycl::sub_group subgroup = item.get_sub_group();
+            const int lane = static_cast<int>(subgroup.get_local_id()[0]);
+            const size_t group = static_cast<size_t>(item.get_group_linear_id());
+            const int64_t row = Rows ? static_cast<int64_t>(group / blocks) : 0;
+            const int64_t block = static_cast<int64_t>(group % blocks) * 128;
+            const float* src = Rows ? source + row * source_ld + block : source + block;
+            float* dst = Rows ? destination + row * destination_ld + block : destination + block;
+
+            float a0 = src[lane + 0 * 32];
+            float a1 = src[lane + 1 * 32];
+            float a2 = src[lane + 2 * 32];
+            float a3 = src[lane + 3 * 32];
+            if constexpr (!Output) {
+                a0 *= f32_from_f16(view.suh[block + lane + 0 * 32]);
+                a1 *= f32_from_f16(view.suh[block + lane + 1 * 32]);
+                a2 *= f32_from_f16(view.suh[block + lane + 2 * 32]);
+                a3 *= f32_from_f16(view.suh[block + lane + 3 * 32]);
+            }
+            for (int step = 1; step < 32; step <<= 1) {
+                const float p0 = sycl::permute_group_by_xor(subgroup, a0, step);
+                const float p1 = sycl::permute_group_by_xor(subgroup, a1, step);
+                const float p2 = sycl::permute_group_by_xor(subgroup, a2, step);
+                const float p3 = sycl::permute_group_by_xor(subgroup, a3, step);
+                a0 = (lane & step) != 0 ? p0 - a0 : a0 + p0;
+                a1 = (lane & step) != 0 ? p1 - a1 : a1 + p1;
+                a2 = (lane & step) != 0 ? p2 - a2 : a2 + p2;
+                a3 = (lane & step) != 0 ? p3 - a3 : a3 + p3;
+            }
+            const float b0 = a0 + a1;
+            const float b1 = a0 - a1;
+            const float b2 = a2 + a3;
+            const float b3 = a2 - a3;
+            a0 = b0 + b2;
+            a1 = b1 + b3;
+            a2 = b0 - b2;
+            a3 = b1 - b3;
+            if constexpr (Output) {
+                const float scale = kHadamardScale;
+                const int64_t i0 = block + lane + 0 * 32;
+                const int64_t i1 = block + lane + 1 * 32;
+                const int64_t i2 = block + lane + 2 * 32;
+                const int64_t i3 = block + lane + 3 * 32;
+                a0 *= scale * f32_from_f16(view.svh[i0]);
+                a1 *= scale * f32_from_f16(view.svh[i1]);
+                a2 *= scale * f32_from_f16(view.svh[i2]);
+                a3 *= scale * f32_from_f16(view.svh[i3]);
+                if (add_bias && view.bias != nullptr) {
+                    a0 += f32_from_f16(view.bias[i0]);
+                    a1 += f32_from_f16(view.bias[i1]);
+                    a2 += f32_from_f16(view.bias[i2]);
+                    a3 += f32_from_f16(view.bias[i3]);
+                }
+            } else {
+                a0 *= kHadamardScale;
+                a1 *= kHadamardScale;
+                a2 *= kHadamardScale;
+                a3 *= kHadamardScale;
+            }
+            dst[lane + 0 * 32] = a0;
+            dst[lane + 1 * 32] = a1;
+            dst[lane + 2 * 32] = a2;
+            dst[lane + 3 * 32] = a3;
+        });
+    });
+}
+
+sycl::event submit_input_hadamard(sycl::queue& queue, const MatrixView& view, const float* x, float* transformed,
+                                  const std::vector<sycl::event>& deps) {
+    if (hadamard_coop_capability(queue))
+        return submit_hadamard_coop<false, false>(queue, view, x, 0, transformed, 0, 1, deps, false);
+    return submit_input_hadamard_scalar(queue, view, x, transformed, deps);
+}
+
+sycl::event submit_output_hadamard(sycl::queue& queue, const MatrixView& view, const float* dot, float* y,
+                                   const std::vector<sycl::event>& deps, bool add_bias) {
+    if (hadamard_coop_capability(queue))
+        return submit_hadamard_coop<true, false>(queue, view, dot, 0, y, 0, 1, deps, add_bias);
+    return submit_output_hadamard_scalar(queue, view, dot, y, deps, add_bias);
+}
+
+sycl::event submit_input_hadamard_rows(sycl::queue& queue, const MatrixView& view, const float* x, int64_t ldx,
+                                       float* transformed, int64_t rows, const std::vector<sycl::event>& deps) {
+    if (hadamard_coop_capability(queue))
+        return submit_hadamard_coop<false, true>(queue, view, x, ldx, transformed, view.k, rows, deps, false);
+    return submit_input_hadamard_rows_scalar(queue, view, x, ldx, transformed, rows, deps);
+}
+
+sycl::event submit_output_hadamard_rows(sycl::queue& queue, const MatrixView& view, const float* dot, float* y,
+                                        int64_t ldy, int64_t rows, const std::vector<sycl::event>& deps,
+                                        bool add_bias) {
+    if (hadamard_coop_capability(queue))
+        return submit_hadamard_coop<true, true>(queue, view, dot, view.n, y, ldy, rows, deps, add_bias);
+    return submit_output_hadamard_rows_scalar(queue, view, dot, y, ldy, rows, deps, add_bias);
 }
 
 }  // namespace
