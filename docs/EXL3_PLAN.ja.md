@@ -17,6 +17,13 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 - 既存 XeStrata の同実効 bpw 形式に対して、BF16 基準の品質指標と固定評価文の結果で改善を示す。
 - decode 速度は、最適化を完了した構成で同じ hardware、context、batch、KV、MTP 条件を測り、既存 XeStrata の 95% 以上を暫定合格とする。未最適化 prototype の速度だけで実現可能性を否定しない。
 
+indexed shard の外にある safetensors sidecar も artifact の一部として扱う。`ngram_embedding.safetensors` の
+`exl3_ngram_trellis` は通常の線形層の trellis ではなく、row 次元160の専用 n-gram codec なので、線形層の
+descriptorへ混ぜず、専用decoderの対象として明示する。`mtp_hyper_connection_mixer_patch.safetensors` のような
+override は本体の値へ黙って混ぜず、patch が base より優先される順序と実際に読んだファイルを記録する。同じ
+実効 bpw の比較では、indexed linear の値と sidecar を含む artifact 全体の保存量を別々に示し、sidecarを除いた
+値だけでモデル全体のbpwや精度を主張しない。
+
 ## 段階
 
 ### 0. 基準の固定と XeStrata の動作確認

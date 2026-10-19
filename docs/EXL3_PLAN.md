@@ -17,6 +17,14 @@ This plan adds EXL3 at 2–5 bpw and mixed precision to XeStrata, with higher qu
 - Show an improvement over the existing XeStrata format at the same effective bpw using BF16 reference metrics and fixed evaluation prompts.
 - Measure decode with the optimized configuration under identical hardware, context, batch, KV and MTP settings. The provisional pass line is 95% or more of existing XeStrata. Do not reject feasibility from an unoptimized prototype alone.
 
+Safetensors sidecars outside the indexed shards are also part of the artifact. `ngram_embedding.safetensors` with
+`exl3_ngram_trellis` is not an ordinary linear trellis: it uses a dedicated n-gram codec with row dimension 160, so it
+must stay outside the linear descriptors and be handled by a dedicated decoder. An override such as
+`mtp_hyper_connection_mixer_patch.safetensors` must not be silently merged into the base; record that the patch takes
+precedence and record the files actually read. For same-effective-bpw comparisons, show indexed linear storage and
+sidecar-inclusive artifact storage separately. A value that excludes sidecars cannot support a model-wide bpw or quality
+claim.
+
 ## Stages
 
 ### 0. Pin the baseline and run XeStrata
