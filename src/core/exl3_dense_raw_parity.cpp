@@ -18,6 +18,7 @@
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -106,6 +107,166 @@ std::filesystem::path make_archive(const std::filesystem::path& root, const RawC
     index << "output.weight 0 2 0 " << canonical.size() << " 0 " << canonical.size() << ' ' << k << ' ' << n
           << " 0 0 0 0 0 0 0 0 0 0\n";
     return root;
+}
+
+std::filesystem::path make_dual_archive(const std::filesystem::path& root, int64_t k, int64_t n,
+                                         std::vector<float>& first_weights, std::vector<float>& first_bias,
+                                         std::vector<float>& second_weights, std::vector<float>& second_bias) {
+    std::filesystem::create_directories(root);
+    std::ofstream(root / "config.json") << R"({"model_type":"synthetic-dual-raw-head"})";
+    first_weights.resize((size_t) n * (size_t) k);
+    first_bias.resize((size_t) n);
+    second_weights.resize((size_t) n * (size_t) k);
+    second_bias.resize((size_t) n);
+    for (int64_t row = 0; row < n; ++row) {
+        first_bias[(size_t) row] = 0.013f * (float) (row - 9);
+        second_bias[(size_t) row] = -0.009f * (float) (row - 5);
+        for (int64_t col = 0; col < k; ++col) {
+            first_weights[(size_t) row * (size_t) k + (size_t) col] =
+                0.0017f * (float) ((row * 13 + col * 5) % 41 - 20);
+            second_weights[(size_t) row * (size_t) k + (size_t) col] =
+                0.0023f * (float) ((row * 7 + col * 11) % 37 - 18);
+        }
+    }
+    write_safetensors(root / "model.safetensors",
+                      {{"lm_head.weight", "F16", {(uint64_t) n, (uint64_t) k}, bytes_f16(first_weights)},
+                       {"lm_head.bias", "F16", {(uint64_t) n}, bytes_f16(first_bias)},
+                       {"alt_head.weight", "BF16", {(uint64_t) n, (uint64_t) k}, bytes_bf16(second_weights)},
+                       {"alt_head.bias", "BF16", {(uint64_t) n}, bytes_bf16(second_bias)}});
+    const uint64_t matrix_bytes = (uint64_t) k * (uint64_t) n * sizeof(float);
+    std::ofstream dense(root / "dense.bin", std::ios::binary);
+    const std::vector<uint8_t> canonical((size_t) matrix_bytes * 2, 0);
+    dense.write(reinterpret_cast<const char*>(canonical.data()), static_cast<std::streamsize>(canonical.size()));
+    std::ofstream index(root / "index.txt");
+    index << "# strata synthetic dual raw heads\n# align 256 pool " << canonical.size() << " tensors 2\n";
+    index << "output.weight 0 2 0 " << matrix_bytes << " 0 " << matrix_bytes << ' ' << k << ' ' << n
+          << " 0 0 0 0 0 0 0 0 0 0\n";
+    index << "other.weight 0 2 " << matrix_bytes << ' ' << matrix_bytes << ' ' << matrix_bytes << ' ' << matrix_bytes
+          << ' ' << k << ' ' << n << " 0 0 0 0 0 0 0 0 0 0\n";
+    return root;
+}
+
+float rounded_raw(const std::string& dtype, float value) {
+    if (dtype == "F16") return strata::kernels::f32_from_f16(strata::kernels::f16_from_f32(value));
+    if (dtype == "BF16") return strata::kernels::f32_from_bf16(strata::kernels::bf16_from_f32(value));
+    return value;
+}
+
+bool close(float got, float expected);
+
+int run_dual_owner_case(const std::filesystem::path& root) {
+    constexpr int64_t k = 128, n = 128, ldx = 131, ldy = 133;
+    std::vector<float> first_weights, first_bias, second_weights, second_bias;
+    make_dual_archive(root, k, n, first_weights, first_bias, second_weights, second_bias);
+    strata::core::WeightTable table;
+    std::string err;
+    uint64_t pool_bytes = 0;
+    if (!strata::core::WeightTable::pool_bytes(root.string(), pool_bytes, err)) {
+        std::cerr << "dual owner pool: " << err << '\n';
+        return 1;
+    }
+    void* arena = strata::gpu::alloc_device(pool_bytes);
+    if (arena == nullptr || !table.load(root.string(), arena, pool_bytes, err)) {
+        std::cerr << "dual owner table: " << (err.empty() ? strata::gpu::last_error() : err) << '\n';
+        if (arena != nullptr) strata::gpu::free(arena);
+        return 1;
+    }
+    const std::vector<float> input_host((size_t) k, 0.0f);
+    std::vector<float> input = input_host;
+    for (int64_t col = 0; col < k; ++col) input[(size_t) col] = 0.017f * (float) ((col * 9) % 47 - 23);
+    auto expected = [&](const std::vector<float>& weights, const std::vector<float>& bias, const std::string& dtype) {
+        std::vector<float> result((size_t) n, 0.0f);
+        for (int64_t out = 0; out < n; ++out) {
+            double sum = rounded_raw(dtype, bias[(size_t) out]);
+            for (int64_t in = 0; in < k; ++in)
+                sum += (double) input[(size_t) in] *
+                       rounded_raw(dtype, weights[(size_t) out * (size_t) k + (size_t) in]);
+            result[(size_t) out] = (float) sum;
+        }
+        return result;
+    };
+    const std::vector<float> first_expected = expected(first_weights, first_bias, "F16");
+    const std::vector<float> second_expected = expected(second_weights, second_bias, "BF16");
+
+    auto capture_owner = [&](strata::core::Exl3Dense& owner, strata::gpu::Stream stream,
+                             const std::vector<float>& expected_output, const char* label) {
+        std::vector<float> initial((size_t) ldy, 9917.0f), actual = initial;
+        float* d_input = static_cast<float*>(strata::gpu::alloc_device(input.size() * sizeof(float)));
+        float* d_output = static_cast<float*>(strata::gpu::alloc_device(actual.size() * sizeof(float)));
+        strata::gpu::Graph* graph = nullptr;
+        bool ok = d_input != nullptr && d_output != nullptr && strata::gpu::copy(d_input, input.data(),
+                                                                                   input.size() * sizeof(float)) &&
+                  strata::gpu::copy(d_output, initial.data(), actual.size() * sizeof(float)) &&
+                  strata::gpu::begin_capture(stream);
+        if (ok && !owner.run(d_input, ldx, d_output, ldy, 1, stream, err)) ok = false;
+        if (ok && !strata::gpu::end_capture(stream, &graph)) ok = false;
+        if (!ok && strata::gpu::is_capturing(stream)) strata::gpu::abandon_capture(stream);
+        if (ok && (!strata::gpu::graph_launch(graph, stream) || !strata::gpu::stream_sync(stream) ||
+                   !strata::gpu::copy(actual.data(), d_output, actual.size() * sizeof(float))))
+            ok = false;
+        if (ok) {
+            for (int64_t out = 0; out < n; ++out)
+                ok = ok && close(actual[(size_t) out], expected_output[(size_t) out]);
+            for (int64_t out = n; out < ldy; ++out) ok = ok && actual[(size_t) out] == initial[(size_t) out];
+        }
+        std::cout << label << " captured owner / independent scratch: " << (ok ? "OK" : "FAIL") << '\n';
+        if (graph != nullptr) strata::gpu::graph_destroy(graph);
+        if (d_input != nullptr) strata::gpu::free(d_input);
+        if (d_output != nullptr) strata::gpu::free(d_output);
+        return ok;
+    };
+
+    strata::gpu::Stream first_stream = strata::gpu::stream_create();
+    strata::gpu::Stream second_stream = strata::gpu::stream_create();
+    int failures = 0;
+    if (first_stream == nullptr || second_stream == nullptr) {
+        std::cerr << "dual owner: stream creation failed\n";
+        failures = 1;
+    } else {
+        {
+            strata::core::Exl3Dense rejected;
+            const bool missing_canonical = !rejected.load(root, "lm_head", "missing.weight", table, err, 1) &&
+                                           table.find("output.weight") != nullptr &&
+                                           table.find("output.weight")->exl3 == nullptr;
+            std::cout << "missing canonical row fails without attachment: " << (missing_canonical ? "OK" : "FAIL")
+                      << '\n';
+            failures += !missing_canonical;
+
+            strata::core::Exl3Dense first_owner, second_owner;
+            const bool loaded = first_owner.load(root, "lm_head", "output.weight", table, err, 1) &&
+                                second_owner.load(root, "alt_head", "other.weight", table, err, 1);
+            const auto* first_ref = table.find("output.weight");
+            const auto* second_ref = table.find("other.weight");
+            const bool attached = loaded && first_ref != nullptr && second_ref != nullptr &&
+                                  first_ref->exl3 == &first_owner && second_ref->exl3 == &second_owner &&
+                                  first_ref->exl3 != second_ref->exl3;
+            std::cout << "dual owners attach to distinct canonical rows: " << (attached ? "OK" : "FAIL") << '\n';
+            failures += !attached;
+            if (loaded) {
+                const bool streams_ready = first_owner.prepare_stream(first_stream, err) &&
+                                            second_owner.prepare_stream(second_stream, err);
+                std::cout << "dual owners prepare separate streams: " << (streams_ready ? "OK" : "FAIL") << '\n';
+                failures += !streams_ready;
+                if (streams_ready) {
+                    failures += !capture_owner(first_owner, first_stream, first_expected, "F16");
+                    failures += !capture_owner(second_owner, second_stream, second_expected, "BF16");
+                }
+            } else {
+                std::cerr << "dual owner load: " << err << '\n';
+                ++failures;
+            }
+        }
+        const auto* first_ref = table.find("output.weight");
+        const auto* second_ref = table.find("other.weight");
+        const bool detached = first_ref != nullptr && second_ref != nullptr && first_ref->exl3 == nullptr &&
+                              second_ref->exl3 == nullptr;
+        std::cout << "owner destruction detaches both canonical rows: " << (detached ? "OK" : "FAIL") << '\n';
+        failures += !detached;
+    }
+    if (first_stream != nullptr) strata::gpu::stream_destroy(first_stream);
+    if (second_stream != nullptr) strata::gpu::stream_destroy(second_stream);
+    strata::gpu::free(arena);
+    return failures;
 }
 
 bool close(float got, float expected) {
@@ -229,6 +390,7 @@ int main() {
     failures += run_case(root / "f16", {"F16", "F16"});
     failures += run_case(root / "bf16", {"BF16", "BF16"});
     failures += run_case(root / "f32", {"F32", "F32"});
+    failures += run_dual_owner_case(root / "dual");
     failures += run_malformed_bias_case(root / "malformed-bias");
     std::filesystem::remove_all(root);
     std::cout << "exl3_dense_raw_parity: " << failures << " failures\n";

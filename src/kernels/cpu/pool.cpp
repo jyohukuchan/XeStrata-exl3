@@ -20,6 +20,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <stdexcept>
 
 #if defined(_WIN32)
@@ -263,6 +264,26 @@ int64_t now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
         .count();
 }
+
+exl3::Status validate_pool_exl3_job(const ExpertJobExl3& job, int64_t max_rows, int64_t max_hidden, int64_t max_ff) {
+    if (job.rows <= 0 || job.rows > max_rows || job.x == nullptr || job.y == nullptr) return exl3::Status::invalid_argument;
+    const strata::kernels::exl3::MatrixView* matrices[] = {&job.view.gate, &job.view.up, &job.view.down};
+    for (const auto* matrix : matrices) {
+        const exl3::Status status = exl3::validate(*matrix);
+        if (status != exl3::Status::ok) return status;
+        if (matrix->suh == nullptr || matrix->svh == nullptr) return exl3::Status::missing_data;
+        if (matrix->k % 128 != 0 || matrix->n % 128 != 0) return exl3::Status::unsupported_layout;
+    }
+    const int64_t hidden = job.view.gate.k, ff = job.view.gate.n;
+    if (job.view.up.k != hidden || job.view.up.n != ff || job.view.down.k != ff || job.view.down.n != hidden ||
+        hidden > max_hidden || ff > max_ff || job.ldx < hidden || job.ldy < hidden)
+        return exl3::Status::unsupported_layout;
+    const uint64_t max_float_elements = static_cast<uint64_t>(std::numeric_limits<ptrdiff_t>::max()) / sizeof(float);
+    if (static_cast<uint64_t>(job.ldx) > max_float_elements / static_cast<uint64_t>(job.rows) ||
+        static_cast<uint64_t>(job.ldy) > max_float_elements / static_cast<uint64_t>(job.rows))
+        return exl3::Status::size_overflow;
+    return exl3::Status::ok;
+}
 }  // namespace
 
 void ExpertPool::diag(std::FILE* f) const {
@@ -473,7 +494,16 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
         const uint32_t i = (uint32_t) ci;
         if (id >= 0) wstate_[(size_t) id].store(ci, std::memory_order_relaxed);
         else { hstate_.store(ci, std::memory_order_relaxed); hstate_ms_.store(now_ms(), std::memory_order_relaxed); }
-        if (mode_ == 0) {
+        if (mode_ == 10) {
+            Exl3Scratch& exl3_scratch = id >= 0 ? exl3_scratch_[(size_t) id] : host_exl3_scratch_;
+            const ExpertJobExl3& j = exl3_jobs_[i];
+            exl3::ExpertScratch routed_scratch = exl3_scratch.expert();
+            const exl3::Status status = exl3::expert(j.view, j.x, j.ldx, j.y, j.ldy, j.rows, routed_scratch);
+            if (status != exl3::Status::ok) {
+                int expected = static_cast<int>(exl3::Status::ok);
+                exl3_error_.compare_exchange_strong(expected, static_cast<int>(status), std::memory_order_release);
+            }
+        } else if (mode_ == 0) {
             const ExpertJob& j = jobs_[i];
             s2_expert_vnni_q(j.blob, *j.act, j.out, scratch);
         } else if (mode_ == 1) {
@@ -635,6 +665,76 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
     multi_bytes += (int64_t) n * (int64_t) f.bytes;
     mode_ = 0;
     ms_drain_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+
+exl3::Status ExpertPool::prepare_exl3(int64_t max_rows, int64_t max_hidden, int64_t max_ff) {
+    if (max_rows <= 0 || max_hidden <= 0 || max_ff <= 0) return exl3::Status::invalid_argument;
+    if (max_hidden > static_cast<int64_t>(std::numeric_limits<size_t>::max() / sizeof(float)) ||
+        max_ff > static_cast<int64_t>(std::numeric_limits<size_t>::max() / sizeof(float)) ||
+        max_rows > static_cast<int64_t>(std::numeric_limits<size_t>::max() / static_cast<size_t>(max_ff)))
+        return exl3::Status::size_overflow;
+    const uint64_t max_float_elements = static_cast<uint64_t>(std::numeric_limits<ptrdiff_t>::max()) / sizeof(float);
+    if (static_cast<uint64_t>(max_rows) > max_float_elements / static_cast<uint64_t>(max_ff))
+        return exl3::Status::size_overflow;
+    wait_parked("before EXL3 preparation");
+    try {
+        std::vector<Exl3Scratch> prepared((size_t) n_);
+        for (Exl3Scratch& scratch : prepared) {
+            scratch.input.resize(static_cast<size_t>((std::max)(max_hidden, max_ff)));
+            scratch.gate.resize(static_cast<size_t>(max_rows) * static_cast<size_t>(max_ff));
+            scratch.up.resize(static_cast<size_t>(max_rows) * static_cast<size_t>(max_ff));
+        }
+        Exl3Scratch prepared_host;
+        prepared_host.input.resize(static_cast<size_t>((std::max)(max_hidden, max_ff)));
+        prepared_host.gate.resize(static_cast<size_t>(max_rows) * static_cast<size_t>(max_ff));
+        prepared_host.up.resize(static_cast<size_t>(max_rows) * static_cast<size_t>(max_ff));
+        exl3_scratch_.swap(prepared);
+        host_exl3_scratch_ = std::move(prepared_host);
+        exl3_max_rows_ = max_rows;
+        exl3_max_hidden_ = max_hidden;
+        exl3_max_ff_ = max_ff;
+        return exl3::Status::ok;
+    } catch (const std::bad_alloc&) {
+        return exl3::Status::scratch_too_small;
+    } catch (const std::length_error&) {
+        return exl3::Status::size_overflow;
+    }
+}
+
+exl3::Status ExpertPool::run_exl3(ExpertJobExl3* jobs, int n) {
+    if (n <= 0) return exl3::Status::ok;
+    if (n > kMaxTasks) return exl3::Status::invalid_argument;
+    if (jobs == nullptr || exl3_scratch_.size() != static_cast<size_t>(n_) || exl3_max_rows_ <= 0 ||
+        exl3_max_hidden_ <= 0 || exl3_max_ff_ <= 0)
+        return exl3::Status::scratch_too_small;
+    for (int i = 0; i < n; ++i) {
+        const ExpertJobExl3& job = jobs[i];
+        const exl3::Status valid = validate_pool_exl3_job(job, exl3_max_rows_, exl3_max_hidden_, exl3_max_ff_);
+        if (valid != exl3::Status::ok) return valid;
+    }
+    if (n_ == 1) {
+        for (int i = 0; i < n; ++i) {
+            exl3::ExpertScratch routed_scratch = exl3_scratch_[0].expert();
+            const exl3::Status status = exl3::expert(jobs[i].view, jobs[i].x, jobs[i].ldx, jobs[i].y, jobs[i].ldy,
+                                                      jobs[i].rows, routed_scratch);
+            if (status != exl3::Status::ok) return status;
+        }
+        return exl3::Status::ok;
+    }
+    wait_parked("before an EXL3 batch");
+    exl3_jobs_ = jobs;
+    njobs_ = n;
+    mode_ = 10;
+    exl3_error_.store(static_cast<int>(exl3::Status::ok), std::memory_order_release);
+    const uint32_t epoch = begin_batch(n);
+    if (host_works_) drain(-1, host_scratch_, epoch);
+    wait_done(n);
+    wait_parked("after an EXL3 batch");
+    mode_ = 0;
+    exl3_jobs_ = nullptr;
+    hstate_.store(kIdle, std::memory_order_relaxed);
+    hstate_ms_.store(now_ms(), std::memory_order_relaxed);
+    return static_cast<exl3::Status>(exl3_error_.load(std::memory_order_acquire));
 }
 
 void ExpertPool::run(ExpertJob* jobs, int n) {

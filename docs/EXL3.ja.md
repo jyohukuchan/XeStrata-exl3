@@ -39,8 +39,16 @@ input/output の H128、scale、bias を適用する。batched GEMM は padding 
 event 依存を受け取り、scratch は呼び出し側が確保する。CPU の linear も行列全体を展開せずに計算する。
 
 `ExpertView` は gate/up/down の三つの行列を独立に保持する。CPU と SYCL の expert 演算は
-`down(silu(gate(x)) * up(x))` を計算し、router weight は適用しない。expert cache や pool への接続は
-この演算部品とは別の処理になる。
+`down(silu(gate(x)) * up(x))` を計算し、router weight は適用しない。
+
+`Exl3ExpertSource` は layer/expert ごとの明示的な名前表を受け取り、要求された expert の圧縮 blob だけを
+読み込む。blob の pointer は layer/window 中は安定し、`copy_blob()` は別の layer の圧縮成分もコピーできる。
+`ExpertPool::prepare_exl3()` は worker の scratch を事前確保し、`run_exl3()` は FP32 入力で expert を計算する。
+CPU dispatch は router の出力行を保ち、既存形式の GPU plan・residency との併用を拒否する。
+
+format registry は実際の blob layout の全成分を比較し、process 内で使う ID を返す。`ExpertCache::open_buckets()`
+は形式ごとの容量を保ち、別形式の slot への admission と容量を超えるコピーを拒否する。既存の
+`open()` / `open_sized()` は format 0 のまま扱う。GPU plan と prefill への形式情報の接続は別に行う。
 
 専用 n-gram decoder は、先頭の F16 row scale と160値の ringを通常の linear と区別して復号する。
 CPU は要求した row ID を選べ、SYCL は取得済みの packed rowを処理する。head bias は明示した head IDで
@@ -48,12 +56,16 @@ CPU は要求した row ID を選べ、SYCL は取得済みの packed rowを処�
 これは row codec の部品であり、model runtime の sidecar I/O と cache への接続は別に行う。
 専用の blocking `exl3_ngram::Reader` は sidecar の shard と head 範囲を検証し、要求された行だけを読む。
 sidecar の multiplier、signed-int64 overflow、EOS 境界を使う row ID 計算も提供する。
+`row_spans()` は検証済みの論理行とファイル内 offset の対応を公開する。既存の
+`PleReader::open_spans()` へ渡すと、物理的な並び順や隙間がある分割 tensor を一つの非同期 I/O worker と
+row cache で扱える。モデル起動時の sidecar 選択と decoder の接続は別に行う。
 
 NumPy のある環境で tests を有効にしてビルドすると、独立した fixture を使った CTest を実行できる。
 
 ```sh
 cmake --build build/free --target exl3_artifact_test exl3_cpu_parity exl3_parity \
-    exl3_cpu_expert_parity exl3_expert_parity exl3_cpu_ngram_parity exl3_ngram_parity
+    exl3_cpu_expert_parity exl3_expert_parity exl3_cpu_ngram_parity exl3_ngram_parity \
+    exl3_pool_test exl3_expert_source_test exl3_expert_formats_test expert_cache_buckets_test
 ctest --test-dir build/free -R '^exl3_' --output-on-failure
 ```
 
@@ -77,6 +89,8 @@ F16/BF16/F32 の元 dtype を保って転送し、専用の raw linear で計算
 使用する各 stream の scratch は graph capture 前に
 準備し、owner はその graph より長く生存する。`lm_head()` は canonical の plane を解釈する前に EXL3 を
 選び、head mixer の FP32 出力をそのまま渡す。
+開発用の `Exl3Dense::load()` overload は任意の canonical 行名を明示でき、複数の owner を独立に保持する。
+CLI の `--exl3-head` が選ぶ対象は引き続き `output.weight` である。
 
 この経路の数値・機能確認と、同じ元重み・実効保存量での品質比較は別に行う。最適化前の部品や初期接続の
 速度は診断値として扱い、decode 速度を維持できるかの判定には使わない。

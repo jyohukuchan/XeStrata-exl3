@@ -36,10 +36,18 @@ public:
     /// persistent scratch contract explicit for a later batched head.
     bool load(const std::filesystem::path& directory, const std::string& hf_name, WeightTable& table,
               std::string& err, int64_t max_rows = 1);
+    /// Loads `hf_name` and attaches it to the explicitly selected canonical row.
+    /// The explicit form is used by non-head projections; callers own the name
+    /// mapping and must keep the selected WeightTable row alive until destruction.
+    bool load(const std::filesystem::path& directory, const std::string& hf_name, const std::string& canonical_name,
+              WeightTable& table, std::string& err, int64_t max_rows = 1);
     /// Reuses an already validated archive.  No archive-wide host metadata is
     /// retained after upload; only the selected matrix components are owned.
     bool load(const strata::artifact::exl3::Archive& archive, const std::string& hf_name, WeightTable& table,
               std::string& err, int64_t max_rows = 1);
+    /// Reuses an already validated archive and attaches to `canonical_name`.
+    bool load(const strata::artifact::exl3::Archive& archive, const std::string& hf_name,
+              const std::string& canonical_name, WeightTable& table, std::string& err, int64_t max_rows = 1);
 
     /// Prepare one runtime queue's persistent scratch before graph capture.
     /// The default compute queue is prepared by `load`; callers must prepare

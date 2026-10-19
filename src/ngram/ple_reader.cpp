@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/ngram/ple_reader.cpp - see include/strata/ngram/ple_reader.hpp.
 #include "strata/ngram/ple_reader.hpp"
 #include "strata/platform/aux_cpus.hpp"
@@ -100,8 +101,8 @@ struct TicketState {
 // (plus `wake`, which is thread-safe). Without `io_thread` the caller does all of it, as before.
 struct PleReader::Impl {
     DirectFile file;
-    uint64_t table_offset = 0;
     uint64_t n_rows = 0;
+    std::vector<RowSpan> spans;
     uint32_t row_bytes = ROW_BYTES;
     uint32_t max_inflight = 0;
     uint8_t* slab = nullptr;              // max_inflight slots of 2 pages
@@ -191,9 +192,14 @@ struct PleReader::Impl {
         rng ^= rng << 13;
         rng ^= rng >> 7;
         rng ^= rng << 17;
-        const uint64_t first = table_offset / PAGE, end = (table_offset + n_rows * (uint64_t) row_bytes) / PAGE;
+        const RowSpan& span = spans[(size_t) (rng % spans.size())];
+        const uint64_t span_bytes = span.n_rows * (uint64_t) row_bytes;
+        const uint64_t first = span.file_offset / PAGE;
+        const uint64_t end = (span.file_offset + span_bytes - 1) / PAGE;
         Job j;
-        j.offset = (first + (end > first ? rng % (end - first) : 0)) * PAGE;
+        j.offset = (first + (end > first ? rng % (end - first + 1) : 0)) * PAGE;
+        // DirectFile requires aligned request lengths, including a final
+        // partial file page; its completion reports the bytes actually read.
         j.length = PAGE;
         j.keepalive = true;
         queue.push_back(std::move(j));
@@ -337,18 +343,42 @@ PleReader::~PleReader() {
 
 bool PleReader::open(const std::string& path, uint64_t table_offset, uint64_t n_rows, uint32_t max_inflight,
                      uint64_t cache_rows, std::string& err, bool io_thread, uint32_t row_bytes) {
+    const RowSpan span{0, n_rows, table_offset};
+    return open_spans(path, &span, 1, n_rows, max_inflight, cache_rows, err, io_thread, row_bytes);
+}
+
+bool PleReader::open_spans(const std::string& path, const RowSpan* requested_spans, size_t n_spans,
+                            uint64_t total_rows, uint32_t max_inflight, uint64_t cache_rows, std::string& err,
+                            bool io_thread, uint32_t row_bytes) {
     close();
+    if (requested_spans == nullptr || n_spans == 0 || total_rows == 0 || total_rows > UINT32_MAX) {
+        err = "PleReader: row spans must cover 1..UINT32_MAX rows";
+        return false;
+    }
     if (max_inflight == 0 || max_inflight > 1024) { err = "PleReader: max_inflight must be 1..1024"; return false; }
     if (row_bytes == 0 || row_bytes > PAGE) { err = "PleReader: row_bytes must be 1..4096"; return false; }
     if (!impl_->file.open(path, err)) return false;
     impl_->row_bytes = row_bytes;
-    if (table_offset + n_rows * (uint64_t) row_bytes > impl_->file.size()) {
-        err = "PleReader: the table extends past the end of " + path;
+    impl_->spans.assign(requested_spans, requested_spans + n_spans);
+    std::sort(impl_->spans.begin(), impl_->spans.end(), [](const RowSpan& a, const RowSpan& b) {
+        return a.first_row < b.first_row;
+    });
+    uint64_t next_row = 0;
+    for (const RowSpan& span : impl_->spans) {
+        if (span.n_rows == 0 || span.first_row != next_row || span.n_rows > UINT64_MAX - span.first_row ||
+            span.file_offset > impl_->file.size() || span.n_rows > (impl_->file.size() - span.file_offset) / row_bytes) {
+            err = "PleReader: logical or physical row span is invalid";
+            close();
+            return false;
+        }
+        next_row += span.n_rows;
+    }
+    if (next_row != total_rows) {
+        err = "PleReader: logical row spans do not cover the table";
         close();
         return false;
     }
-    impl_->table_offset = table_offset;
-    impl_->n_rows = n_rows;
+    impl_->n_rows = total_rows;
     impl_->max_inflight = max_inflight;
     impl_->slab = (uint8_t*) DirectFile::alloc_aligned((size_t) max_inflight * 2 * PAGE);
     if (impl_->slab == nullptr) { err = "PleReader: cannot allocate read buffers"; close(); return false; }
@@ -407,6 +437,7 @@ void PleReader::close() {
     DirectFile::free_aligned(m.slab);
     m.slab = nullptr;
     m.queue.clear();
+    m.spans.clear();
     m.tickets.clear();
     m.delayed.clear();
     m.inflight.clear();
@@ -446,7 +477,18 @@ PleReader::Ticket PleReader::issue(const uint32_t* rows, size_t n, uint8_t* out_
             ++m.stats.cache_hits;
             continue;
         }
-        const uint64_t at = m.table_offset + (uint64_t) rows[i] * rb;
+        const auto span_it = std::upper_bound(m.spans.begin(), m.spans.end(), (uint64_t) rows[i],
+                                              [](uint64_t row, const RowSpan& span) { return row < span.first_row; });
+        if (span_it == m.spans.begin()) {
+            std::memset(dst, 0, rb);
+            continue;
+        }
+        const RowSpan& span = *(span_it - 1);
+        if ((uint64_t) rows[i] >= span.first_row + span.n_rows) {
+            std::memset(dst, 0, rb);
+            continue;
+        }
+        const uint64_t at = span.file_offset + ((uint64_t) rows[i] - span.first_row) * rb;
         const uint64_t first = at / PAGE * PAGE;
         const uint32_t length = (uint32_t) ((at + rb - 1) / PAGE * PAGE - first + PAGE);
         auto f = by_page.find(first);

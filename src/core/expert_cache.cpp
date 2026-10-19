@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <filesystem>
+#include <limits>
 #include <numeric>
 #include <utility>
 #include <cstring>
@@ -274,6 +275,14 @@ bool ExpertCache::grow(int64_t want_bytes, std::string& err) {
 
 namespace {
 bool g_cache_vmm = false;   // set_vmm
+
+bool valid_table_geometry(int64_t n_layers, int64_t n_expert) {
+    if (n_layers <= 0 || n_expert <= 0) return false;
+    const uint64_t layers = (uint64_t) n_layers, experts = (uint64_t) n_expert;
+    if (layers > std::numeric_limits<uint64_t>::max() / experts) return false;
+    const uint64_t entries = layers * experts;
+    return entries <= (uint64_t) std::numeric_limits<size_t>::max() / sizeof(int32_t);
+}
 }  // namespace
 
 void ExpertCache::set_vmm(bool enabled) { g_cache_vmm = enabled; }
@@ -281,17 +290,32 @@ void ExpertCache::set_vmm(bool enabled) { g_cache_vmm = enabled; }
 bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int64_t blob_bytes,
                        std::string& err) {
     close();
-    if (n_slots <= 0) {
+    if (n_slots <= 0 || n_slots > std::numeric_limits<int32_t>::max()) {
         err = "ExpertCache: n_slots must be positive";
         return false;
     }
-    if (n_layers <= 0 || n_expert <= 0 || blob_bytes <= 0) {
+    if (!valid_table_geometry(n_layers, n_expert) || blob_bytes <= 0) {
         err = "ExpertCache: n_layers, n_expert and blob_bytes must all be positive";
         return false;
     }
 
+    if ((uint64_t) n_slots > std::numeric_limits<uint64_t>::max() / (uint64_t) blob_bytes ||
+        (uint64_t) n_slots * (uint64_t) blob_bytes > std::numeric_limits<size_t>::max()) {
+        err = "ExpertCache: allocation size overflows";
+        return false;
+    }
     const uint64_t want = (uint64_t) n_slots * (uint64_t) blob_bytes;
 
+    if (!allocate_arena(want, err)) return false;
+    start_tables(n_slots, n_layers, n_expert, blob_bytes);
+    return true;
+}
+
+bool ExpertCache::allocate_arena(uint64_t want, std::string& err) {
+    if (want == 0 || want > (uint64_t) std::numeric_limits<size_t>::max()) {
+        err = "ExpertCache: allocation size is not representable";
+        return false;
+    }
     // ---- **THE ALLOCATION IS CHECKED AGAINST THE CARD, NOT AGAINST THE REQUEST.**
     //
     // `cudaMalloc` failing is the easy case. The one that matters is a machine where the weights already own
@@ -303,10 +327,10 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
         if ((uint64_t) free_b < want) {
             char buf[320];
             std::snprintf(buf, sizeof buf,
-                          "ExpertCache: %lld slots x %lld B = %.2f GiB, but only %.2f GiB of VRAM is free "
+                          "ExpertCache: %.2f GiB requested, but only %.2f GiB of VRAM is free "
                           "(%.2f GiB of %.2f GiB total). Lower --expert-cache.",
-                          (long long) n_slots, (long long) blob_bytes, (double) want / 1073741824.0,
-                          (double) free_b / 1073741824.0, (double) (total_b - free_b) / 1073741824.0,
+                          (double) want / 1073741824.0, (double) free_b / 1073741824.0,
+                          (double) (total_b - free_b) / 1073741824.0,
                           (double) total_b / 1073741824.0);
             err = buf;
             return false;
@@ -343,7 +367,6 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
         return false;
     }
 
-    start_tables(n_slots, n_layers, n_expert, blob_bytes);
     return true;
 }
 
@@ -418,34 +441,107 @@ bool ExpertCache::open_pieces(const std::vector<uint64_t>& size_off, std::string
 bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_layers, int64_t n_expert,
                              std::string& err) {
     if (slot_bytes.empty()) { err = "ExpertCache: no slots"; return false; }
+    if (!valid_table_geometry(n_layers, n_expert) || slot_bytes.size() > (size_t) std::numeric_limits<int32_t>::max()) {
+        err = "ExpertCache: invalid sized-cache geometry";
+        return false;
+    }
     int64_t mx = 0;
     std::vector<uint64_t> off(slot_bytes.size() + 1, 0);
     for (size_t i = 0; i < slot_bytes.size(); ++i) {
+        if (slot_bytes[i] <= 0 || (uint64_t) slot_bytes[i] > std::numeric_limits<uint64_t>::max() - 255) {
+            err = "ExpertCache: invalid slot byte size";
+            return false;
+        }
         // 256-byte aligned slots, so every blob starts where the kernels' vector loads expect it
-        off[i + 1] = off[i] + ((uint64_t) slot_bytes[i] + 255) / 256 * 256;
+        const uint64_t aligned = ((uint64_t) slot_bytes[i] + 255) / 256 * 256;
+        if (off[i] > std::numeric_limits<uint64_t>::max() - aligned) {
+            err = "ExpertCache: sized-cache allocation overflows";
+            return false;
+        }
+        off[i + 1] = off[i] + aligned;
         mx = slot_bytes[i] > mx ? slot_bytes[i] : mx;
+    }
+    if (off.back() > (uint64_t) std::numeric_limits<int64_t>::max() ||
+        off.back() > (uint64_t) std::numeric_limits<size_t>::max()) {
+        err = "ExpertCache: sized-cache allocation exceeds addressable size";
+        return false;
     }
     if (piece_max_ > 0 && off.back() > piece_max_ && seg_req_ == 0 && !(g_cache_vmm && vmm_available())) {
         close();
         if (!open_pieces(off, err)) return false;
         start_tables((int64_t) slot_bytes.size(), n_layers, n_expert, mx);
+        slot_payload_bytes_.clear();
+        for (int64_t bytes : slot_bytes) slot_payload_bytes_.push_back((uint64_t) bytes);
         // start_tables seeded the cursors on these slots: nothing below to redo
         return true;
     }
-    // one allocation of the summed size, through the uniform path's checks: n "slots" of 1 byte
-    if (!open((int64_t) off.back(), n_layers, n_expert, 1, err)) return false;
+    // Allocate the aligned arena directly. `off.back()` is a byte count and can exceed INT32_MAX even though
+    // the actual slot count is bounded above; routing it through open() would confuse those two quantities.
+    close();
+    if (!allocate_arena(off.back(), err)) return false;
+    start_tables((int64_t) slot_bytes.size(), n_layers, n_expert, mx);
     slots_ = (int64_t) slot_bytes.size();
     live_slots_ = slots_;
     blob_ = mx;
     off_ = std::move(off);
-    // #369: each layer's cursor at the bottom of its own range, as open() seeds it - open() above ran on byte-sized
-    // "slots", so its seeds are not slot indices
+    slot_payload_bytes_.clear();
+    for (int64_t bytes : slot_bytes) slot_payload_bytes_.push_back((uint64_t) bytes);
+    // start_tables() seeded cursors before the sized offsets were installed; rebuild them because the actual
+    // slot count is the number of payloads, not the aligned arena byte count.
     layer_next_.assign((size_t) (n_layers > 0 ? n_layers : 0), 0);
     for (int64_t l = 0; l < n_layers; ++l) {
         int64_t lo = 0, hi = 0;
         layer_slot_range(l, lo, hi);
         layer_next_[(size_t) l] = (int32_t) lo;
     }
+    return true;
+}
+
+bool ExpertCache::open_buckets(const std::vector<ExpertCacheBucket>& buckets, int64_t n_layers, int64_t n_expert,
+                               std::string& err) {
+    if (buckets.empty()) { err = "ExpertCache: no format buckets"; return false; }
+    if (n_layers <= 0 || n_expert <= 0) { err = "ExpertCache: invalid bucket-cache geometry"; return false; }
+    if ((uint64_t) n_layers > (uint64_t) std::numeric_limits<size_t>::max() ||
+        buckets.size() > std::numeric_limits<size_t>::max() / (size_t) n_layers) {
+        err = "ExpertCache: bucket residency table overflows";
+        return false;
+    }
+    std::vector<int64_t> slot_bytes;
+    std::vector<uint64_t> formats;
+    std::vector<int32_t> first, counts;
+    for (const ExpertCacheBucket& bucket : buckets) {
+        if (bucket.slots <= 0 || bucket.blob_bytes <= 0 || bucket.slots > std::numeric_limits<int32_t>::max()) {
+            err = "ExpertCache: invalid format bucket size";
+            return false;
+        }
+        for (uint64_t format : formats)
+            if (format == bucket.format_id) { err = "ExpertCache: duplicate format bucket"; return false; }
+        if ((uint64_t) slot_bytes.size() + (uint64_t) bucket.slots > (uint64_t) std::numeric_limits<int32_t>::max() ||
+            (uint64_t) slot_bytes.size() + (uint64_t) bucket.slots > std::numeric_limits<size_t>::max()) {
+            err = "ExpertCache: format bucket slot count overflows";
+            return false;
+        }
+        formats.push_back(bucket.format_id);
+        first.push_back((int32_t) slot_bytes.size());
+        counts.push_back((int32_t) bucket.slots);
+        slot_bytes.insert(slot_bytes.end(), (size_t) bucket.slots, bucket.blob_bytes);
+    }
+    if (!open_sized(slot_bytes, n_layers, n_expert, err)) return false;
+    bucket_formats_ = std::move(formats);
+    bucket_first_ = std::move(first);
+    bucket_slots_ = std::move(counts);
+    bucket_next_.resize(bucket_formats_.size());
+    bucket_layer_next_.assign(bucket_formats_.size() * (size_t) n_layers, 0);
+    for (size_t b = 0; b < bucket_formats_.size(); ++b) {
+        bucket_next_[b] = bucket_first_[b];
+        const int64_t q = bucket_slots_[b] / n_layers;
+        for (int64_t layer = 0; layer < n_layers; ++layer)
+            bucket_layer_next_[b * (size_t) n_layers + (size_t) layer] =
+                bucket_first_[b] + (int32_t) (q * layer);
+    }
+    slot_formats_.assign(slot_bytes.size(), 0);
+    for (size_t b = 0; b < bucket_formats_.size(); ++b)
+        for (int32_t s = 0; s < bucket_slots_[b]; ++s) slot_formats_[(size_t) bucket_first_[b] + (size_t) s] = bucket_formats_[b];
     return true;
 }
 
@@ -474,6 +570,13 @@ void ExpertCache::close() {
     fills_ = 0;
     admitted_ = 0;
     layer_next_.clear();
+    slot_formats_.clear();
+    bucket_formats_.clear();
+    bucket_first_.clear();
+    bucket_slots_.clear();
+    bucket_next_.clear();
+    bucket_layer_next_.clear();
+    slot_payload_bytes_.clear();
 }
 
 /// R4.2g.  Layer `l` owns `[l*q, (l+1)*q)` with `q = slots_ / n_layers_`; the LAST layer takes whatever is
@@ -493,6 +596,7 @@ int32_t ExpertCache::slot_of(int64_t layer, int64_t expert) const {
 }
 
 int32_t ExpertCache::admit(int64_t layer, int64_t expert) {
+    if (!bucket_formats_.empty()) return admit(layer, expert, 0);
     if (layer < 0 || layer >= n_layers_ || expert < 0 || expert >= n_expert_) return kNotResident;
     const size_t at = (size_t) (layer * n_expert_ + expert);
     if (residency_[at] != kNotResident) return residency_[at];
@@ -512,6 +616,55 @@ int32_t ExpertCache::admit(int64_t layer, int64_t expert) {
     return (int32_t) next_free_++;
 }
 
+int ExpertCache::bucket_of(uint64_t format_id) const {
+    for (size_t i = 0; i < bucket_formats_.size(); ++i)
+        if (bucket_formats_[i] == format_id) return (int) i;
+    return -1;
+}
+
+int32_t ExpertCache::admit(int64_t layer, int64_t expert, uint64_t format_id) {
+    if (bucket_formats_.empty()) return format_id == 0 ? admit(layer, expert) : kNotResident;
+    if (layer < 0 || layer >= n_layers_ || expert < 0 || expert >= n_expert_) return kNotResident;
+    const size_t at = (size_t) (layer * n_expert_ + expert);
+    if (residency_[at] != kNotResident)
+        return slot_format(residency_[at]) == format_id ? residency_[at] : kNotResident;
+    const int bucket = bucket_of(format_id);
+    if (bucket < 0) return kNotResident;
+    int32_t slot = kNotResident;
+    if (per_layer_) {
+        const int64_t q = bucket_slots_[(size_t) bucket] / n_layers_;
+        const int64_t bucket_hi = layer == n_layers_ - 1
+                               ? (int64_t) bucket_first_[(size_t) bucket] + bucket_slots_[(size_t) bucket]
+                               : (int64_t) bucket_first_[(size_t) bucket] + q * (layer + 1);
+        const int64_t hi = std::min<int64_t>(bucket_hi, live_slots_);
+        int32_t& next = bucket_layer_next_[(size_t) bucket * (size_t) n_layers_ + (size_t) layer];
+        if ((int64_t) next >= hi) return kNotResident;
+        slot = next++;
+    } else {
+        int32_t& next = bucket_next_[(size_t) bucket];
+        const int32_t end = (int32_t) std::min<int64_t>(
+            (int64_t) bucket_first_[(size_t) bucket] + bucket_slots_[(size_t) bucket], live_slots_);
+        if (next >= end) return kNotResident;
+        slot = next++;
+    }
+    residency_[at] = slot;
+    ++admitted_;
+    return slot;
+}
+
+uint64_t ExpertCache::slot_format(int32_t slot) const {
+    if (slot < 0 || (size_t) slot >= slot_formats_.size()) return 0;
+    return slot_formats_[(size_t) slot];
+}
+
+uint64_t ExpertCache::slot_capacity(int32_t slot) const {
+    if (slot < 0 || slot >= slots_) return 0;
+    if ((size_t) slot < slot_payload_bytes_.size()) return slot_payload_bytes_[(size_t) slot];
+    if (!size_off_.empty()) return size_off_[(size_t) slot + 1] - size_off_[(size_t) slot];
+    if (!off_.empty()) return off_[(size_t) slot + 1] - off_[(size_t) slot];
+    return (uint64_t) blob_;
+}
+
 uint8_t* ExpertCache::device_slot(int32_t slot) {
     if (slot < 0 || slot >= slots_) return nullptr;
     if (!off_.empty()) return base_ + off_[(size_t) slot];
@@ -525,7 +678,12 @@ const uint8_t* ExpertCache::device_slot(int32_t slot) const {
 }
 
 bool ExpertCache::fill_slot(int32_t slot, const uint8_t* host_blob, void* stream, std::string& err, int64_t bytes) {
-    const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
+    const uint64_t capacity = slot_capacity(slot);
+    if (capacity == 0 || (bytes > 0 && (uint64_t) bytes > capacity)) {
+        err = "ExpertCache::fill_slot: bytes exceed slot capacity";
+        return false;
+    }
+    const size_t n = (size_t) (bytes > 0 ? bytes : capacity);
     uint8_t* dst = device_slot(slot);
     if (dst == nullptr) {
         err = "ExpertCache::fill_slot: slot " + std::to_string(slot) + " is outside 0.." +
@@ -546,7 +704,12 @@ bool ExpertCache::fill_slot(int32_t slot, const uint8_t* host_blob, void* stream
 }
 
 bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes) {
-    const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
+    const uint64_t capacity = slot_capacity(slot);
+    if (capacity == 0 || (bytes > 0 && (uint64_t) bytes > capacity)) {
+        err = "ExpertCache::fill_slot_blocking: bytes exceed slot capacity";
+        return false;
+    }
+    const size_t n = (size_t) (bytes > 0 ? bytes : capacity);
     uint8_t* dst = device_slot(slot);
     if (dst == nullptr) {
         err = "ExpertCache::fill_slot_blocking: slot outside the arena";
@@ -566,7 +729,12 @@ bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std
 }
 
 bool ExpertCache::fill_slot_queued(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes) {
-    const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
+    const uint64_t capacity = slot_capacity(slot);
+    if (capacity == 0 || (bytes > 0 && (uint64_t) bytes > capacity)) {
+        err = "ExpertCache::fill_slot_queued: bytes exceed slot capacity";
+        return false;
+    }
+    const size_t n = (size_t) (bytes > 0 ? bytes : capacity);
     uint8_t* dst = device_slot(slot);
     if (dst == nullptr || host_blob == nullptr) {
         err = dst == nullptr ? "ExpertCache::fill_slot_queued: slot outside the arena"
@@ -592,7 +760,12 @@ bool ExpertCache::sync_queued(std::string& err) {
 }
 
 bool ExpertCache::verify_slot(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes) {
-    const int64_t nb = bytes > 0 && bytes <= blob_ ? bytes : blob_;
+    const uint64_t capacity = slot_capacity(slot);
+    if (capacity == 0 || (bytes > 0 && (uint64_t) bytes > capacity)) {
+        err = "ExpertCache::verify_slot: bytes exceed slot capacity";
+        return false;
+    }
+    const int64_t nb = (int64_t) (bytes > 0 ? bytes : capacity);
     const uint8_t* src = device_slot(slot);
     if (src == nullptr) {
         err = "ExpertCache::verify_slot: slot outside the arena";

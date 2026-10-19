@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // include/strata/ngram/ple_reader.hpp - plan v0.3 P2: the n-gram table read straight from the SSD.
 //
 // The table is 320,001,536 rows of 90 bytes (IQ4_NL, 26.8 GiB) or 160 (FP8 E4M3, 51.2 GB) and is never held in RAM: every row comes from an
@@ -28,6 +29,15 @@ namespace strata::ngram {
 
 inline constexpr uint32_t ROW_BYTES = 90;          ///< an IQ4_NL row; `open` takes the table's own size
 inline constexpr uint32_t PAGE = 4096;
+
+/// A logical row interval backed by an arbitrary physical byte interval in
+/// one file.  Spans are sorted by `first_row` and must cover the logical table
+/// contiguously; their physical order may be arbitrary.
+struct RowSpan {
+    uint64_t first_row = 0;
+    uint64_t n_rows = 0;
+    uint64_t file_offset = 0;
+};
 
 struct ReaderStats {
     uint64_t requests = 0;        ///< rows asked for
@@ -63,6 +73,17 @@ public:
     /// `row_bytes`: one row's size in the file (90 IQ4_NL, 160 FP8), at most one page.
     bool open(const std::string& path, uint64_t table_offset, uint64_t n_rows, uint32_t max_inflight,
               uint64_t cache_rows, std::string& err, bool io_thread = true, uint32_t row_bytes = ROW_BYTES);
+    /// Open one file with multiple logically contiguous row spans.  Physical
+    /// spans may be reordered and may have gaps.  The reader retains a sorted
+    /// logical map for row-to-file-offset lookup.
+    bool open_spans(const std::string& path, const RowSpan* spans, size_t n_spans, uint64_t total_rows,
+                    uint32_t max_inflight, uint64_t cache_rows, std::string& err, bool io_thread = true,
+                    uint32_t row_bytes = ROW_BYTES);
+    bool open_spans(const std::string& path, const std::vector<RowSpan>& spans, uint64_t total_rows,
+                    uint32_t max_inflight, uint64_t cache_rows, std::string& err, bool io_thread = true,
+                    uint32_t row_bytes = ROW_BYTES) {
+        return open_spans(path, spans.data(), spans.size(), total_rows, max_inflight, cache_rows, err, io_thread, row_bytes);
+    }
     uint32_t row_bytes() const;
     void close();
     bool is_open() const;

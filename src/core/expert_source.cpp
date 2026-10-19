@@ -6,6 +6,7 @@
 #include "strata/core/remote_experts.hpp"
 
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/exl3_expert_blob.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 
 #include "strata/core/pinned.hpp"
@@ -1823,6 +1824,17 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
     (void) weights;   // clause 2: `moe_combine` applies it on the device.  Not an oversight.
     ExpertDispatch& d = *(ExpertDispatch*) user;
     if (d.failed) return;   // a previous layer already failed; do not make it worse
+    if (d.src != nullptr && d.src->exl3_layout(0, 0) != nullptr) {
+        const auto* layout = d.src->exl3_layout(d.layers, 0);
+        if (layout == nullptr || n_embd != layout->gate.k) {
+            d.failed = true;
+            d.fail = "EXL3 single-token activation width does not match the source";
+            d.fail_layer = d.layers;
+            return;
+        }
+        expert_pool_dispatch_multi(d, x_f, ids, 1, k, out);
+        return;
+    }
 
     using namespace strata::kernels::cpu;
     // Clause 3: the blob's internal offsets are compile-time constants, so a mismatched geometry does not
@@ -2108,6 +2120,89 @@ int tail_skip_rank() {
 }
 void set_tail_skip_rank(int r) { g_tail_skip_rank.store(r > 0 && r < 10 ? r : 0, std::memory_order_relaxed); }
 
+namespace {
+// CPU integration boundary: exact packed blobs and the original FP32 input.
+// Legacy GPU plans carry no EXL3 descriptor, so they cannot be consumed here.
+void dispatch_exl3_cpu(ExpertDispatch& d, const float* x, const int32_t* ids, int64_t n_tok, int64_t k,
+                       float* out) {
+    using namespace strata::kernels::cpu;
+    auto fail = [&](const char* why, int64_t expert = -1) {
+        d.failed = true;
+        d.fail = why;
+        d.fail_layer = d.layers;
+        d.fail_expert = expert;
+    };
+    if (d.pool == nullptr || x == nullptr || ids == nullptr || out == nullptr) {
+        fail("EXL3 CPU dispatch requires a pool, activation, route ids and output");
+        return;
+    }
+    if (d.cache != nullptr || d.plan != nullptr || d.remote_count != 0 || d.host_res != nullptr) {
+        fail("EXL3 CPU dispatch cannot consume a legacy GPU residency plan");
+        return;
+    }
+    const auto* first = d.src->exl3_layout(d.layers, 0);
+    if (first == nullptr || first->gate.k <= 0) {
+        fail("EXL3 source has no layout for the requested layer");
+        return;
+    }
+    const int64_t width = first->gate.k, entries = n_tok * k;
+    const uint64_t max_floats = (uint64_t) std::numeric_limits<ptrdiff_t>::max() / sizeof(float);
+    if ((uint64_t) width > max_floats / (uint64_t) entries) {
+        fail("EXL3 routed output span exceeds the host address range");
+        return;
+    }
+    for (int64_t i = 0; i < entries; ++i) {
+        const int64_t expert = ids[i];
+        const auto* layout = expert >= 0 && expert < d.n_expert ? d.src->exl3_layout(d.layers, expert) : nullptr;
+        if (layout == nullptr || layout->gate.k != width) {
+            fail("EXL3 routed expert id or hidden width is invalid", expert);
+            return;
+        }
+    }
+    if (d.jobs_exl3.size() < (size_t) entries) d.jobs_exl3.resize((size_t) entries);
+    const auto start = std::chrono::steady_clock::now();
+    d.src->begin_layer(d.layers, ids, entries);
+    int64_t distinct = 0;
+    for (int64_t i = 0; i < entries; ++i) {
+        const int64_t expert = ids[i];
+        const uint8_t* blob = d.src->blob(d.layers, expert);
+        if (blob == nullptr) {
+            ++d.missing;
+            fail("EXL3 source could not materialize a routed expert", expert);
+            return;
+        }
+        bool seen = false;
+        for (int64_t previous = 0; previous < i; ++previous) seen |= ids[previous] == expert;
+        distinct += !seen;
+        ExpertJobExl3& job = d.jobs_exl3[(size_t) i];
+        job.view = strata::kernels::exl3::expert_view(*d.src->exl3_layout(d.layers, expert), blob);
+        job.rows = 1;
+        job.x = x + (size_t) (i / k) * (size_t) width;
+        job.ldx = width;
+        job.y = out + (size_t) i * (size_t) width;
+        job.ldy = width;
+        job.slot = (int) i;
+    }
+    const auto prepared = std::chrono::steady_clock::now();
+    const auto status = d.pool->run_exl3(d.jobs_exl3.data(), (int) entries);
+    if (status != exl3::Status::ok) {
+        fail(exl3::status_string(status));
+        return;
+    }
+    const auto done = std::chrono::steady_clock::now();
+    d.ms_jobs += std::chrono::duration<double, std::milli>(prepared - start).count();
+    d.ms_run += std::chrono::duration<double, std::milli>(done - prepared).count();
+    d.multi_entries += entries;
+    d.multi_misses += distinct;
+    d.cache_refused += entries;
+    if (!d.usage.empty() && !d.usage_by_window)
+        for (int64_t i = 0; i < entries; ++i)
+            d.usage[(size_t) d.layers * (size_t) d.n_expert + (size_t) ids[i]] += 1.0f;
+    ++d.layers;
+    d.experts += entries;
+}
+}  // namespace
+
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out) {
     using namespace strata::kernels::cpu;
@@ -2122,6 +2217,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         d.failed = true;
         d.fail = "a verify window routes more entries than the expert pool's window tables hold";
         d.fail_layer = d.layers;
+        return;
+    }
+    if (d.src != nullptr && d.src->exl3_layout(0, 0) != nullptr) {
+        dispatch_exl3_cpu(d, x_f, ids, n_tok, k, out);
         return;
     }
     if ((int64_t) d.act_multi.size() < n_tok) d.act_multi.resize((size_t) MAXT);

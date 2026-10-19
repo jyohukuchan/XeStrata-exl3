@@ -32,8 +32,10 @@
 
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
+#include "strata/kernels/cpu/exl3_expert.hpp"
 
 #include <atomic>
+#include <array>
 #include <cstdio>
 #include <memory>
 #include <chrono>
@@ -64,6 +66,21 @@ struct ExpertJobMulti {
     float* out[MAXT] = {};
     /// Plan v0.3 P6: a native pack's activations (native_quant_act's, in a NativeAct), one per token.
     const void* nact[MAXT] = {};
+};
+
+using ExpertView = strata::kernels::exl3::ExpertView;
+
+/// One batch-1-or-small-batch EXL3 dense expert evaluation.  `x` and `y` are
+/// row-major FP32 matrices with caller-owned strides.  The packed view is
+/// shared read-only by workers; no worker expands its weights.
+struct ExpertJobExl3 {
+    ExpertView view{};
+    int64_t rows = 0;
+    const float* x = nullptr;
+    int64_t ldx = 0;
+    float* y = nullptr;
+    int64_t ldy = 0;
+    int slot = -1;
 };
 
 /// One logical processor per PHYSICAL core, so a worker is never scheduled onto an SMT sibling of another
@@ -149,6 +166,14 @@ public:
     /// Plan v0.3 P6: the same for a native pack's layer (ggml-cpu arithmetic, `nact` activations).
     void run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n);
     static constexpr int kMaxSplitMulti = 96;
+
+    /// Allocate bounded EXL3 scratch for every worker before publishing any
+    /// EXL3 batch.  Repeated calls replace the prepared workspace only after
+    /// all workers have parked.  No allocation occurs in `run_exl3`.
+    exl3::Status prepare_exl3(int64_t max_rows, int64_t max_hidden, int64_t max_ff);
+    /// Validate all jobs, then run each matrix row through the persistent pool.
+    /// A failed validation returns before the epoch is published.
+    exl3::Status run_exl3(ExpertJobExl3* jobs, int n);
     /// run_split_multi's phases, accumulated ms: gate/up rows, the intermediate quantization, down rows.
     double ms_multi_gu = 0, ms_multi_q = 0, ms_multi_down = 0;
     int64_t multi_bytes = 0;
@@ -243,6 +268,22 @@ private:
     std::vector<std::thread> threads_;
     std::vector<int> worker_cpus_;
     std::vector<ExpertScratch> scratch_;   // one per worker: no allocation, no false sharing of the hot data
+    struct Exl3Scratch {
+        std::vector<float> input;
+        std::vector<float> gate;
+        std::vector<float> up;
+        std::array<uint16_t, 256> tile{};
+        exl3::ExpertScratch expert() {
+            return {{input.data(), input.size(), tile.data(), tile.size()}, gate.data(), gate.size(), up.data(), up.size()};
+        }
+    };
+    std::vector<Exl3Scratch> exl3_scratch_;
+    Exl3Scratch host_exl3_scratch_;
+    ExpertJobExl3* exl3_jobs_ = nullptr;
+    int64_t exl3_max_rows_ = 0;
+    int64_t exl3_max_hidden_ = 0;
+    int64_t exl3_max_ff_ = 0;
+    std::atomic<int> exl3_error_{static_cast<int>(exl3::Status::ok)};
     // run_split state: mode 0 = whole experts, 1 = gate/up row parts, 2 = down row parts
     int mode_ = 0;
     int parts_a_ = 1, parts_b_ = 1;

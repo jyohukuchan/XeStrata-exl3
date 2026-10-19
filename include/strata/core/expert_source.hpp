@@ -42,6 +42,10 @@
 #include <algorithm>
 #include <vector>
 
+namespace strata::kernels::exl3 {
+struct ExpertBlobLayout;
+}
+
 namespace strata::kernels::cpu {
 struct ExpertLayout;
 }
@@ -202,6 +206,11 @@ public:
     /// The blob's bytes into `dst` (blob_bytes(layer) of them).  Safe from several threads for a source whose
     /// `transient` can be true.
     virtual bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst);
+    /// EXL3 sources expose an immutable per-expert layout for dispatchers that
+    /// cannot use the legacy process-wide blob stride.  Other sources return null.
+    virtual const strata::kernels::exl3::ExpertBlobLayout* exl3_layout(int64_t layer, int64_t expert) const {
+        (void) layer; (void) expert; return nullptr;
+    }
     /// Asks the OS for these pairs' bytes ahead of the `blob` calls that read them.  False (nothing asked) by default.
     virtual bool advise_pairs(const std::pair<int32_t, int32_t>* pairs, int64_t n) const {
         (void) pairs; (void) n; return false;
@@ -359,6 +368,8 @@ struct ExpertDispatch {
     /// Plan v0.3 P6: a native pack's per-token activations (MAXT).
     std::vector<strata::kernels::cpu::NativeAct> nact_multi;
     std::vector<strata::kernels::cpu::ExpertJobMulti> jobs_multi;
+    /// EXL3 routed jobs: one descriptor triple per selected expert, resized by the CPU dispatch adapter.
+    std::vector<strata::kernels::cpu::ExpertJobExl3> jobs_exl3;
     std::vector<int16_t> job_of;
     /// Plan v0.3 P6: the verify window's GPU plan (VRAM hits + the PCIe share of the misses); `pcie_num`/256 of
     /// each layer's distinct missed experts (the last ones in routing order) are read by the GPU over PCIe.

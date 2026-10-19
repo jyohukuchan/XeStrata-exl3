@@ -467,6 +467,43 @@ int selftest(const std::string& dir, uint32_t rb) {
     return g_fail ? 1 : 0;
 }
 
+void span_selftest(const std::string& dir) {
+    constexpr uint32_t rb = 3000;   // rows cross 4 KiB pages at both physical placements
+    constexpr uint64_t physical_a = 192, physical_b = 8192;
+    constexpr uint32_t rows = 4;
+    const std::string path = dir + "/ple_reader_spans_selftest.bin";
+    std::vector<uint8_t> bytes((size_t) physical_b + 2 * rb, 0xA5);
+    std::vector<uint8_t> row_bytes(rb);
+    for (uint32_t row = 0; row < rows; ++row) {
+        expected_row(row, rb, row_bytes.data());
+        const uint64_t offset = row < 2 ? physical_b + (uint64_t) row * rb : physical_a + (uint64_t) (row - 2) * rb;
+        std::memcpy(bytes.data() + offset, row_bytes.data(), rb);
+    }
+    std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(bytes.data()), (std::streamsize) bytes.size());
+    const std::vector<ng::RowSpan> spans = {{0, 2, physical_b}, {2, 2, physical_a}};  // physical order reversed
+    for (bool io_thread : {false, true}) {
+        ng::PleReader reader;
+        std::string err;
+        CHECK(reader.open_spans(path, spans, rows, 8, 16, err, io_thread, rb), "span open (worker %d): %s", (int) io_thread, err.c_str());
+        if (!reader.is_open()) continue;
+        std::vector<uint32_t> requested = {0, 1, 2, 3};
+        check_rows(reader, requested, rows, rb, io_thread ? "logical spans worker" : "logical spans caller");
+        const uint64_t hits_before = reader.snapshot().cache_hits;
+        std::vector<uint32_t> repeated = {0, 0, 3, 3};
+        check_rows(reader, repeated, rows, rb, "logical spans duplicate/cache");
+        CHECK(reader.snapshot().cache_hits >= hits_before + 2, "span duplicate rows were not cache hits");
+    }
+    {
+        ng::PleReader invalid;
+        std::string err;
+        CHECK(!invalid.open_spans(path, std::vector<ng::RowSpan>{{1, 2, physical_a}, {3, 1, physical_b}}, rows, 2, 0, err, false, rb),
+              "span logical gap is rejected");
+        CHECK(!invalid.open_spans(path, std::vector<ng::RowSpan>{{0, 4, bytes.size() - 1}}, rows, 2, 0, err, false, rb),
+              "span physical bounds are rejected");
+    }
+    std::filesystem::remove(path);
+}
+
 int real(const std::string& gguf, int n_random, const std::string& tokens_path, uint32_t inflight, bool direct_first,
          bool direct_only, bool sync_submit) {
     k::PleTable mm, direct;
@@ -561,6 +598,8 @@ int main(int argc, char** argv) {
         else { std::fprintf(stderr, "usage: ple_reader_test --selftest [--dir D] | --gguf SHARD2 [--rows N] [--tokens F]\n"); return 2; }
     }
     if (self) {
+        span_selftest(dir);
+        if (g_fail != 0) return 1;
         // ng::ROW_BYTES (90, IQ4_NL, production default) and 110 (#296, OrcaRouter's Q5_0 PLE rows) through the
         // same generic row_bytes path -- see the comment on selftest().
         all_formats_round_trip(dir);               // every format of k::ple_formats(), both readers, vs its dequantizer

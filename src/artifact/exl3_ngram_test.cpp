@@ -6,6 +6,7 @@
 #include "strata/artifact/exl3_ngram.hpp"
 
 #include "strata/kernels/f16_bits.hpp"
+#include "strata/ngram/ple_reader.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -110,10 +111,28 @@ void run_reader(const std::filesystem::path& root) {
     write_sidecar(path, 2);
     artifact::Reader reader(path);
     check(reader.bits() == 2 && reader.words_per_row() == 21 && reader.row_count() == 5, "header K/words/rows");
+    check(reader.row_spans().size() == 2 && reader.row_spans()[0].first_row == 0 && reader.row_spans()[0].n_rows == 3 &&
+              reader.row_spans()[1].first_row == 3 && reader.row_spans()[1].file_offset > 0,
+          "validated logical shard spans are exposed");
     const int64_t ids[] = {2, 3, 0};
     std::vector<uint16_t> packed;
     reader.read_rows(ids, 3, packed);
     check(packed.size() == 3 * reader.words_per_row() && packed[0] == 0x3e00, "reordered blocking row read");
+    std::vector<strata::ngram::RowSpan> spans;
+    for (const auto& span : reader.row_spans())
+        spans.push_back({span.first_row, span.n_rows, span.file_offset});
+    strata::ngram::PleReader async_reader;
+    std::string io_error;
+    const bool opened = async_reader.open_spans(path.string(), spans, (uint64_t) reader.row_count(), 4, 16,
+                                                io_error, true, (uint32_t) (reader.words_per_row() * 2));
+    check(opened, "validated sidecar spans open in shared async reader");
+    if (opened) {
+        const uint32_t requested[] = {2, 3, 0};
+        std::vector<uint8_t> raw(packed.size() * 2, 0);
+        const auto ticket = async_reader.issue(requested, 3, raw.data());
+        check(async_reader.collect(ticket, io_error) && std::memcmp(raw.data(), packed.data(), raw.size()) == 0,
+              "async sidecar row bytes match blocking reader");
+    }
     const int32_t heads[] = {0, 1, 0};
     std::vector<float> output(3 * 167, -4.0f);
     const auto status = reader.decode_rows(ids, heads, 3, output.data(), 167);

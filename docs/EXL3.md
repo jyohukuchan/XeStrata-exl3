@@ -41,8 +41,18 @@ applying input/output H128, scales and bias. Batched GEMM accepts padded row str
 dependencies, with caller-owned scratch. CPU linear operations also avoid expanding the full matrix.
 
 `ExpertView` keeps gate/up/down as three independent matrices. CPU and SYCL expert operations compute
-`down(silu(gate(x)) * up(x))` without applying a router weight. Connecting the expert cache and pool is
-separate from these operations.
+`down(silu(gate(x)) * up(x))` without applying a router weight.
+
+`Exl3ExpertSource` accepts an explicit name table per layer/expert and loads compressed blobs only for
+requested experts. Blob pointers stay stable throughout a layer/window, and `copy_blob()` can also copy
+compressed components from another layer. `ExpertPool::prepare_exl3()` preallocates worker scratch, and
+`run_exl3()` computes experts from FP32 inputs. CPU dispatch preserves routed output rows and rejects
+combinations with legacy GPU plans or residency tables.
+
+The format registry compares every component of the actual blob layout and returns process-local IDs.
+`ExpertCache::open_buckets()` preserves each format's capacity, rejecting admission to a different format's
+slot and copies exceeding slot capacity. Existing `open()` / `open_sized()` keep using format 0.
+Connecting format information to GPU plans and prefill is separate.
 
 The dedicated n-gram decoder treats its leading F16 row scale and 160-value ring separately from ordinary
 linears. CPU can select requested row IDs; SYCL processes packed rows already fetched by the caller.
@@ -50,12 +60,16 @@ Head bias uses explicit head IDs. Outputs are FP32 with padded strides; callers 
 F16 rounding required by model arithmetic. This row codec is separate from model-runtime sidecar I/O and caches.
 The dedicated blocking `exl3_ngram::Reader` validates sidecar shards and head ranges and reads only
 requested rows. It also computes row IDs using the sidecar's multipliers, signed-int64 overflow and EOS boundaries.
+`row_spans()` exposes validated mappings from logical rows to file offsets. Passing them to the existing
+`PleReader::open_spans()` handles tensors with reordered physical spans or gaps through one asynchronous
+I/O worker and row cache. Model-startup sidecar selection and decoder integration are separate.
 
 With NumPy available and tests enabled, build and run the CTests backed by independent fixtures.
 
 ```sh
 cmake --build build/free --target exl3_artifact_test exl3_cpu_parity exl3_parity \
-    exl3_cpu_expert_parity exl3_expert_parity exl3_cpu_ngram_parity exl3_ngram_parity
+    exl3_cpu_expert_parity exl3_expert_parity exl3_cpu_ngram_parity exl3_ngram_parity \
+    exl3_pool_test exl3_expert_source_test exl3_expert_formats_test expert_cache_buckets_test
 ctest --test-dir build/free -R '^exl3_' --output-on-failure
 ```
 
@@ -79,6 +93,8 @@ is present, it retains the original F16/BF16/F32 dtype on upload and uses a dedi
 Bias shapes are validated before conversion to FP32. Each participating stream's scratch is
 prepared before graph capture, and the owner outlives those graphs. `lm_head()` selects EXL3 before
 interpreting canonical planes and passes the head mixer's FP32 output directly.
+The development `Exl3Dense::load()` overload accepts an explicit canonical row name, allowing multiple
+independent owners. The CLI's `--exl3-head` continues to select `output.weight`.
 
 Numerical and functional checks of this path are separate from quality comparisons at the same source
 weights and effective storage. Speeds from components and early integration before optimization are

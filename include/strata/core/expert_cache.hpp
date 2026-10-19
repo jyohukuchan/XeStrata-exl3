@@ -46,6 +46,13 @@ namespace strata::core {
 /// in the two places that use it.
 inline constexpr int32_t kNotResident = -1;
 
+/// A bucket of exact-format slots.  Slots are aligned, but never padded to another bucket's largest blob.
+struct ExpertCacheBucket {
+    uint64_t format_id = 0;   ///< zero is the legacy/canonical format
+    int64_t slots = 0;
+    int64_t blob_bytes = 0;
+};
+
 /// **THE STATIC RESIDENCY PLAN, READ BACK FROM THE FILE `tools/make_profile.py` WROTE.**
 ///
 /// `profile.bin` is `STRP`, then `version, n_layers, n_expert, slots, n_ranked`, then `n_ranked` `(layer,
@@ -96,6 +103,9 @@ public:
     /// Plan v0.3 P6: slots of the given sizes, back to back (a native pack's blobs differ per layer, and a
     /// profile-filled tier never moves an expert to another layer's slot, so each slot keeps its first size).
     bool open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_layers, int64_t n_expert, std::string& err);
+    /// Opens exact-format buckets in one arena.  Existing open/open_sized callers remain format 0.
+    bool open_buckets(const std::vector<ExpertCacheBucket>& buckets, int64_t n_layers, int64_t n_expert,
+                      std::string& err);
     /// Byte offset of each slot in the arena (null for uniform slots).  Allocated in pieces (set_max_piece), the
     /// offsets are each slot's address relative to slot 0's, so they wrap between pieces: only the slots of one piece
     /// lie back to back.
@@ -117,7 +127,7 @@ public:
     int64_t full_slots() const { return slots_; }
     /// Slots actually claimed.  Not the same as `slots()` - the cache does not evict, so a run that routes
     /// fewer distinct experts than there are slots leaves the rest empty.
-    int64_t resident() const { return per_layer_ ? admitted_ : next_free_; }
+    int64_t resident() const { return !bucket_formats_.empty() || per_layer_ ? admitted_ : next_free_; }
     /// The bytes of `slots()` (all of the arena unless shrunk); `full_bytes()`: of every slot.
     int64_t bytes() const { return slot_end(live_slots_); }
     int64_t full_bytes() const { return slot_end(slots_); }
@@ -153,6 +163,10 @@ public:
     /// full - **it never evicts**, because eviction policy is a measured question (`R4.1`'s LFU-decay vs LRU
     /// sweep) and a placeholder policy would set the hit rate that everything downstream is then sized against.
     int32_t admit(int64_t layer, int64_t expert);
+    /// Claims a slot from the exact format bucket.  Returns kNotResident for an unknown/full bucket.
+    int32_t admit(int64_t layer, int64_t expert, uint64_t format_id);
+    /// Format ID associated with a slot, or zero for legacy/open_sized caches and invalid slots.
+    uint64_t slot_format(int32_t slot) const;
 
     /// **R4.2g: GIVE EACH LAYER ITS OWN SLOTS.  ROUND 328 MEASURED WHY THE GLOBAL FORM CANNOT WORK.**
     ///
@@ -246,6 +260,17 @@ private:
     std::vector<int32_t> layer_next_;   ///< [n_layers] -> that layer's next free slot
     std::vector<uint64_t> off_;         ///< plan v0.3 P6: slot offsets (slots + 1 entries) when sized
     int64_t admitted_ = 0;
+    std::vector<uint64_t> slot_formats_;
+    std::vector<uint64_t> slot_payload_bytes_;
+    std::vector<uint64_t> bucket_formats_;
+    std::vector<int32_t> bucket_first_;
+    std::vector<int32_t> bucket_slots_;
+    std::vector<int32_t> bucket_next_;
+    std::vector<int32_t> bucket_layer_next_;
+
+    int bucket_of(uint64_t format_id) const;
+    uint64_t slot_capacity(int32_t slot) const;
+    bool allocate_arena(uint64_t bytes, std::string& err);
 };
 
 }  // namespace strata::core

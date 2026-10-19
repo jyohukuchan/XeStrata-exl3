@@ -133,7 +133,7 @@ void Exl3Dense::reset() {
 
 bool Exl3Dense::pointers_owned_by(const Runtime* runtime) const {
     if (runtime == nullptr) return false;
-    const void* pointers[] = {view_.trellis, view_.suh, view_.svh, view_.bias, raw_view_.data, raw_view_.bias};
+    const void* pointers[] = {view_.trellis, view_.suh, view_.svh, view_.bias, raw_view_.data, raw_view_.bias};  // codespell:ignore suh
     for (const void* pointer : pointers)
         if (pointer != nullptr && Runtime::owner(pointer) != runtime) return false;
     for (const StreamScratch& stream : streams_)
@@ -143,13 +143,18 @@ bool Exl3Dense::pointers_owned_by(const Runtime* runtime) const {
 
 bool Exl3Dense::load(const std::filesystem::path& directory, const std::string& hf_name, WeightTable& table,
                      std::string& err, int64_t max_rows) {
+    return load(directory, hf_name, "output.weight", table, err, max_rows);
+}
+
+bool Exl3Dense::load(const std::filesystem::path& directory, const std::string& hf_name,
+                     const std::string& canonical_name, WeightTable& table, std::string& err, int64_t max_rows) {
     if (runtime_ != nullptr || attached_ != nullptr) {
         err = "exl3 dense: the owner is already loaded";
         return false;
     }
     try {
         const strata::artifact::exl3::Archive archive(directory);
-        return load(archive, hf_name, table, err, max_rows);
+        return load(archive, hf_name, canonical_name, table, err, max_rows);
     } catch (const std::exception& error) {
         err = std::string("exl3 dense: ") + error.what();
         return false;
@@ -158,21 +163,27 @@ bool Exl3Dense::load(const std::filesystem::path& directory, const std::string& 
 
 bool Exl3Dense::load(const strata::artifact::exl3::Archive& archive, const std::string& hf_name, WeightTable& table,
                      std::string& err, int64_t max_rows) {
+    return load(archive, hf_name, "output.weight", table, err, max_rows);
+}
+
+bool Exl3Dense::load(const strata::artifact::exl3::Archive& archive, const std::string& hf_name,
+                     const std::string& canonical_name, WeightTable& table, std::string& err, int64_t max_rows) {
     err.clear();
     if (runtime_ != nullptr || attached_ != nullptr) {
         err = "exl3 dense: the owner is already loaded";
         return false;
     }
-    if (hf_name.empty() || max_rows <= 0) {
-        err = "exl3 dense: HF name and max_rows are required";
+    if (hf_name.empty() || canonical_name.empty() || max_rows <= 0) {
+        err = "exl3 dense: HF name, canonical name and max_rows are required";
         return false;
     }
     try {
-        auto canonical = table.table_.find("output.weight");
-        if (canonical == table.table_.end()) throw std::runtime_error("output.weight is missing from WeightTable");
+        auto canonical = table.table_.find(canonical_name);
+        if (canonical == table.table_.end())
+            throw std::runtime_error(canonical_name + " is missing from WeightTable");
         WeightRef& ref = canonical->second;
-        if (ref.exl3 != nullptr) throw std::runtime_error("output.weight already has an EXL3 owner");
-        if (ref.native_data != nullptr) throw std::runtime_error("output.weight already has a native projection");
+        if (ref.exl3 != nullptr) throw std::runtime_error(canonical_name + " already has an EXL3 owner");
+        if (ref.native_data != nullptr) throw std::runtime_error(canonical_name + " already has a native projection");
         const strata::artifact::exl3::LinearDescriptor* descriptor = archive.find_linear(hf_name);
         if (descriptor == nullptr) {
             const strata::artifact::exl3::TensorDescriptor* weight = archive.find_tensor(hf_name + ".weight");
@@ -182,10 +193,10 @@ bool Exl3Dense::load(const strata::artifact::exl3::Archive& archive, const std::
             if (ref.ne0 <= 0 || ref.ne1 <= 0 || weight->shape.size() != 2 ||
                 weight->shape[0] != static_cast<uint64_t>(ref.ne1) ||
                 weight->shape[1] != static_cast<uint64_t>(ref.ne0))
-                throw std::runtime_error("raw output.weight shape does not match the HF tensor");
+                throw std::runtime_error("raw " + canonical_name + " shape does not match the HF tensor");
             strata::kernels::raw::DType dtype;
             if (!raw_dtype_of(weight->dtype, dtype))
-                throw std::runtime_error("raw output.weight dtype is not F16/BF16/F32");
+                throw std::runtime_error("raw " + canonical_name + " dtype is not F16/BF16/F32");
             std::vector<uint8_t> raw;
             archive.read_tensor(*weight, raw);
             if (!copy_bytes(raw_weights_, raw, "raw weight", err)) throw std::runtime_error(err);
@@ -193,7 +204,7 @@ bool Exl3Dense::load(const strata::artifact::exl3::Archive& archive, const std::
             std::vector<float> bias_values;
             if (bias != nullptr) {
                 if (bias->shape != std::vector<uint64_t>{static_cast<uint64_t>(ref.ne1)})
-                    throw std::runtime_error("raw output.weight bias shape does not match output width");
+                    throw std::runtime_error("raw " + canonical_name + " bias shape does not match output width");
                 std::vector<uint8_t> bias_raw;
                 archive.read_tensor(*bias, bias_raw);
                 if (!materialize_raw_bias(*bias, bias_raw, bias_values, err)) throw std::runtime_error(err);
@@ -213,9 +224,9 @@ bool Exl3Dense::load(const strata::artifact::exl3::Archive& archive, const std::
             return true;
         }
         if (descriptor->k != ref.ne0 || descriptor->n != ref.ne1 || descriptor->k <= 0 || descriptor->n <= 0)
-            throw std::runtime_error("output.weight shape does not match the EXL3 descriptor");
+            throw std::runtime_error(canonical_name + " shape does not match the EXL3 descriptor");
         if (descriptor->k % 128 != 0 || descriptor->n % 128 != 0)
-            throw std::runtime_error("output.weight is not 128-aligned for the EXL3 Hadamard path");
+            throw std::runtime_error(canonical_name + " is not 128-aligned for the EXL3 Hadamard path");
 
         strata::artifact::exl3::MaterializedMatrix materialized;
         archive.materialize(*descriptor, materialized);
@@ -225,7 +236,7 @@ bool Exl3Dense::load(const strata::artifact::exl3::Archive& archive, const std::
         scratch_elements_ = strata::kernels::exl3::exl3_gemm_scratch_elements(host_view, max_rows_);
 
         if (!copy_component(trellis_, materialized.trellis, "trellis", err) ||
-            !copy_component(suh_, materialized.suh, "suh", err) ||
+            !copy_component(suh_, materialized.suh, "suh", err) ||  // codespell:ignore suh
             !copy_component(svh_, materialized.svh, "svh", err) ||
             !copy_component(bias_, materialized.bias, "bias", err))
             throw std::runtime_error(err);

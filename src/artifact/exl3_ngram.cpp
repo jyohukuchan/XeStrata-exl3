@@ -116,6 +116,7 @@ struct Reader::Impl {
     int64_t row_count = 0;
     int64_t rows_per_shard = 0;
     std::vector<Tensor> shards;
+    std::vector<RowSpan> spans;
     std::vector<int64_t> shard_rows;
     std::vector<int64_t> cumulative;
     std::vector<uint16_t> head_bias;
@@ -169,6 +170,7 @@ Reader::Reader(const std::filesystem::path& path) : impl_(std::make_unique<Impl>
             if (rows != nonfinal_rows) fail("non-final shard row counts differ");
         }
         impl_->shards.push_back(tensor);
+        impl_->spans.push_back({static_cast<uint64_t>(impl_->row_count), static_cast<uint64_t>(rows), tensor.data_offset_absolute});
         impl_->shard_rows.push_back(rows);
         if (impl_->row_count > std::numeric_limits<int64_t>::max() - rows) fail("row count overflows int64");
         impl_->row_count += rows;
@@ -231,6 +233,7 @@ size_t Reader::words_per_row() const { return impl_->words; }
 int64_t Reader::row_count() const { return impl_->row_count; }
 int64_t Reader::rows_per_shard() const { return impl_->rows_per_shard; }
 int64_t Reader::num_heads() const { return static_cast<int64_t>(impl_->head_offsets.size()); }
+const std::vector<RowSpan>& Reader::row_spans() const { return impl_->spans; }
 const std::vector<int64_t>& Reader::head_offsets() const { return impl_->head_offsets; }
 const std::vector<int64_t>& Reader::head_vocab_sizes() const { return impl_->head_vocab_sizes; }
 const std::vector<int64_t>& Reader::layer_multipliers() const { return impl_->layer_multipliers; }

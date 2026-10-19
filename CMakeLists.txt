@@ -216,7 +216,7 @@ if(STRATA_BUILD_TESTS)
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/main/nlohmann-json)
   add_test(NAME exl3_expert_artifact_test COMMAND exl3_expert_artifact_test)
   add_executable(exl3_ngram_reader_test src/artifact/exl3_ngram_test.cpp)
-  target_link_libraries(exl3_ngram_reader_test PRIVATE strata_exl3_ngram_artifact)
+  target_link_libraries(exl3_ngram_reader_test PRIVATE strata_exl3_ngram_artifact strata_ngram)
   target_include_directories(exl3_ngram_reader_test SYSTEM PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/main/nlohmann-json)
   add_test(NAME exl3_ngram_reader_test COMMAND exl3_ngram_reader_test)
@@ -444,13 +444,15 @@ if(STRATA_ENABLE_XE)
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp
                                    src/core/remote_experts.cpp src/core/expert_cache.cpp src/core/native_head.cpp
                                    src/core/native_dense.cpp src/core/exl3_dense.cpp src/core/verify.cpp
+                                   src/core/exl3_expert_source.cpp src/core/exl3_expert_formats.cpp
                                    src/core/moe_window.cpp
                                    src/core/plain_model.cpp src/core/pcie_split.cpp src/core/mtp.cpp
                                    src/core/conversation_snapshot.cpp src/core/conversation_state.cpp
                                    src/core/conversation_memory.cpp src/core/conversation_disk.cpp
                                    src/core/conversation_file.cpp src/core/vmm.cpp)
   target_include_directories(strata_engine PUBLIC include)
-  target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu strata_exl3_artifact)
+  target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu
+    strata_exl3_expert_artifact)
   # c-blosc2 (libblosc2-dev; free, BSD-3), optional: --conversation-save-compress stores the saved conversations'
   # floating-point parts compressed.  Without it the engine builds and runs, and refuses that option.
   find_path(STRATA_BLOSC2_INCLUDE blosc2.h)
@@ -680,6 +682,19 @@ if(STRATA_ENABLE_XE)
   target_link_libraries(strata-image PRIVATE strata_image)
 
   if(STRATA_BUILD_TESTS)
+    add_executable(exl3_expert_formats_test src/core/exl3_expert_formats_test.cpp)
+    target_link_libraries(exl3_expert_formats_test PRIVATE strata_engine)
+    add_test(NAME exl3_expert_formats_test COMMAND exl3_expert_formats_test)
+    add_executable(expert_cache_buckets_test tests/core/expert_cache_buckets_test.cpp)
+    target_link_libraries(expert_cache_buckets_test PRIVATE strata_engine)
+    add_test(NAME expert_cache_buckets_test COMMAND expert_cache_buckets_test)
+    set_tests_properties(expert_cache_buckets_test PROPERTIES SKIP_RETURN_CODE 77)
+    add_executable(exl3_expert_source_test src/core/exl3_expert_source_test.cpp)
+    target_link_libraries(exl3_expert_source_test PRIVATE strata_engine)
+    target_include_directories(exl3_expert_source_test SYSTEM PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/third_party/main/nlohmann-json)
+    target_compile_options(exl3_expert_source_test PRIVATE -fno-fast-math -ffp-contract=off)
+    add_test(NAME exl3_expert_source_test COMMAND exl3_expert_source_test)
     add_executable(raw_linear_parity src/kernels/raw_linear_parity.cpp)
     target_link_libraries(raw_linear_parity PRIVATE strata_kernels strata_kernels_cpu)
     target_compile_options(raw_linear_parity PRIVATE -fno-fast-math -ffp-contract=off)
@@ -897,6 +912,11 @@ set_source_files_properties(src/kernels/xe/exl3.cpp src/kernels/cpu/exl3.cpp
                            src/kernels/cpu/raw_linear.cpp
                            PROPERTIES COMPILE_OPTIONS "-fno-fast-math;-ffp-contract=off;-Wall;-Wextra")
 if(STRATA_BUILD_TESTS)
+  add_executable(exl3_pool_test src/kernels/cpu/exl3_pool_test.cpp)
+  target_link_libraries(exl3_pool_test PRIVATE strata_kernels_cpu strata_warnings)
+  target_compile_options(exl3_pool_test PRIVATE -fno-fast-math -ffp-contract=off)
+  add_test(NAME exl3_pool_test COMMAND exl3_pool_test)
+  set_tests_properties(exl3_pool_test PROPERTIES TIMEOUT 120)
   add_executable(exl3_cpu_ngram_parity src/kernels/cpu/exl3_ngram_parity.cpp)
   target_link_libraries(exl3_cpu_ngram_parity PRIVATE strata_kernels_cpu strata_warnings)
   target_compile_options(exl3_cpu_ngram_parity PRIVATE -fno-fast-math -ffp-contract=off)

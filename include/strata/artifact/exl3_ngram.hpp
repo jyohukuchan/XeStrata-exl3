@@ -17,6 +17,12 @@
 
 namespace strata::artifact::exl3_ngram {
 
+struct RowSpan {
+    uint64_t first_row = 0;
+    uint64_t n_rows = 0;
+    uint64_t file_offset = 0;  // absolute byte offset in the sidecar
+};
+
 /// A blocking reader over one validated exl3_ngram_trellis sidecar.  It reads
 /// only requested rows; the complete table remains file-backed.
 class Reader {
@@ -35,6 +41,7 @@ public:
     int64_t row_count() const;
     int64_t rows_per_shard() const;
     int64_t num_heads() const;
+    const std::vector<RowSpan>& row_spans() const;
     const std::vector<int64_t>& head_offsets() const;
     const std::vector<int64_t>& head_vocab_sizes() const;
     const std::vector<int64_t>& layer_multipliers() const;
