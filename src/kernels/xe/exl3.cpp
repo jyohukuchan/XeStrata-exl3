@@ -4,15 +4,15 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // EXL3 trellis and codebook rules follow exllamav3's MIT-licensed implementation.
 //
-// This is deliberately a scalar correctness path.  It keeps the packed trellis in its original form and decodes a
-// state only when a GEMV term needs it.  A later optimized path can replace the launch bodies without changing the
-// descriptor or event contract established here.
+// The scalar launch remains a portable correctness fallback.  Devices with a suitable subgroup use the packed dot
+// path below, which keeps the trellis in its original form and preserves the descriptor and event contract.
 #include "strata/kernels/exl3.hpp"
 
 #include "strata/kernels/f16_bits.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_exl3
 #include "strata/kernels/device_arch_tag.hpp"
 
+#include <algorithm>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -122,6 +122,174 @@ inline float decoded_weight(const MatrixView& view, int64_t row, int64_t col) {
     const uint16_t* tile = view.trellis + tile_index * (size_t) (16 * view.bits);
     const int state = tile_state_for_element((int) ((row & 15) * 16 + (col & 15)));
     return f32_from_f16(decode_state(extract_state(tile, view.bits, state), view.codebook));
+}
+
+// The packed-dot path assigns one output tile to a subgroup. Bits and codebook are template parameters at the launch
+// site, so the compiler can fold the packed-word geometry and remove codec branches. The scalar path above remains
+// the capability/layout fallback and is retained as the correctness reference.
+template <int Codebook>
+inline uint16_t packed_decode_codebook(uint16_t state) {
+    uint32_t x = state;
+    if constexpr (Codebook == 0) {
+        x = x * 89226354u + 64248484u;
+        x = lop3_6a(x);
+        return f16_from_f32(f32_from_f16((uint16_t) x) + f32_from_f16((uint16_t) (x >> 16)));
+    } else if constexpr (Codebook == 1) {
+        x = x * 0xCBAC1FEDu;
+        x = lop3_6a(x);
+        return f16_from_f32(f32_from_f16((uint16_t) x) + f32_from_f16((uint16_t) (x >> 16)));
+    } else {
+        x = x * 0x83DCD12Du;
+        const uint32_t byte_sum = (x & 0xFFu) + ((x >> 8) & 0xFFu) + ((x >> 16) & 0xFFu) + ((x >> 24) & 0xFFu);
+        const int32_t numerator = 887 * static_cast<int32_t>(byte_sum) - 452608;
+        return f16_from_f32(static_cast<float>(numerator) * 0x1.0p-17f);
+    }
+}
+
+template <int Bits, int Codebook>
+inline uint16_t packed_decode_state(const uint16_t* tile, int state) {
+    constexpr int word_count = Bits * 8;
+    const int b0 = state * Bits + Bits - 16 + 256 * Bits;
+    const int b1 = b0 + 16;
+    const int i0 = b0 / 32;
+    const int i1 = (b1 - 1) / 32;
+    const int shift = (i1 + 1) * 32 - b1;
+    const uint64_t merged = ((uint64_t) load_word32(tile, i0, word_count) << 32) |
+                            (uint64_t) load_word32(tile, i1, word_count);
+    return packed_decode_codebook<Codebook>((uint16_t) ((merged >> shift) & 0xFFFFu));
+}
+
+template <int Bits, int Codebook>
+sycl::event submit_packed_dot(sycl::queue& queue, const MatrixView& view, const float* x, int64_t ldx, float* y,
+                              int64_t ldy, int64_t rows, const std::vector<sycl::event>& deps, bool add_bias,
+                              int split_k, int subgroup_size, int waves_per_group) {
+    const int64_t n_tiles = view.n / 16;
+    const int64_t k_tiles = view.k / 16;
+    const size_t groups = static_cast<size_t>(rows) * static_cast<size_t>(n_tiles);
+    const size_t local_size = static_cast<size_t>(waves_per_group * subgroup_size);
+    const size_t local_reduce_words = static_cast<size_t>(waves_per_group) * 16;
+    return queue.submit([&](sycl::handler& h) {
+        if (!deps.empty()) h.depends_on(deps);
+        sycl::local_accessor<float, 1> partial(sycl::range<1>(local_reduce_words), h);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>(groups * local_size), sycl::range<1>(local_size)),
+                       [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+            const sycl::sub_group subgroup = item.get_sub_group();
+            const int lane = static_cast<int>(subgroup.get_local_id()[0]);
+            const int wave = static_cast<int>(item.get_local_id(0)) / subgroup_size;
+            const size_t group = static_cast<size_t>(item.get_group_linear_id());
+            const int64_t row = static_cast<int64_t>(group / static_cast<size_t>(n_tiles));
+            const int64_t tile_n = static_cast<int64_t>(group % static_cast<size_t>(n_tiles));
+            const int64_t kb_begin = (k_tiles * wave) / split_k;
+            const int64_t kb_end = (k_tiles * (wave + 1)) / split_k;
+            float accum = 0.0f;
+            if (lane < 16) {
+                const float* input = x + row * ldx;
+                const int64_t col_in_tile = lane;
+                for (int64_t k_tile = kb_begin; k_tile < kb_end; ++k_tile) {
+                    const uint16_t* source = view.trellis +
+                        (static_cast<size_t>(k_tile) * static_cast<size_t>(n_tiles) + static_cast<size_t>(tile_n)) *
+                        static_cast<size_t>(16 * Bits);
+                    float sum = 0.0f;
+                    for (int r = 0; r < 16; ++r) {
+                        const int state = tile_state_for_element(r * 16 + static_cast<int>(col_in_tile));
+                        sum += input[k_tile * 16 + r] *
+                               f32_from_f16(packed_decode_state<Bits, Codebook>(source, state));
+                    }
+                    accum += sum;
+                }
+            }
+            if (lane < 16) partial[static_cast<size_t>(wave) * 16 + static_cast<size_t>(lane)] = accum;
+            item.barrier();
+            if (wave == 0 && lane < 16) {
+                float sum = 0.0f;
+                for (int w = 0; w < split_k; ++w)
+                    sum += partial[static_cast<size_t>(w) * 16 + static_cast<size_t>(lane)];
+                const int64_t col = tile_n * 16 + lane;
+                if (add_bias && view.bias != nullptr) sum += f32_from_f16(view.bias[col]);
+                y[row * ldy + col] = sum;
+            }
+        });
+    });
+}
+
+bool packed_dot_capability(const sycl::queue& queue, const MatrixView& view, int64_t rows,
+                           int& subgroup_size, int& split_k, int& waves_per_group) {
+    if (view.k % 16 != 0 || view.n % 16 != 0 || rows <= 0) return false;
+    const auto subgroup_sizes = queue.get_device().get_info<sycl::info::device::sub_group_sizes>();
+    if (std::find(subgroup_sizes.begin(), subgroup_sizes.end(), size_t(32)) == subgroup_sizes.end()) return false;
+    const size_t max_work_group = queue.get_device().get_info<sycl::info::device::max_work_group_size>();
+    const size_t local_mem = queue.get_device().get_info<sycl::info::device::local_mem_size>();
+    constexpr size_t bytes_per_wave = 16 * sizeof(float);
+    const int memory_waves = static_cast<int>(local_mem / bytes_per_wave);
+    const int workgroup_waves = static_cast<int>(max_work_group / 32);
+    const int max_waves = std::max(1, std::min(memory_waves, workgroup_waves));
+    if (memory_waves < 1 || workgroup_waves < 1) return false;
+    const int64_t n_tiles64 = view.n / 16;
+    const int64_t k_tiles64 = view.k / 16;
+    if (n_tiles64 > std::numeric_limits<int>::max() || k_tiles64 > std::numeric_limits<int>::max()) return false;
+    const int n_tiles = static_cast<int>(n_tiles64);
+    const int k_tiles = static_cast<int>(k_tiles64);
+    // When there are already many more independent output tiles than the device can keep occupied across the
+    // available K waves, the scalar one-work-item-per-output fallback has better parallel granularity.  Keep the
+    // packed path for shapes where a wave can amortize its packed decode over a useful K span; this is derived from
+    // the descriptor geometry and work-group capability rather than a model or vendor threshold.
+    const int64_t required_k_tiles =
+        static_cast<int64_t>(n_tiles) / max_waves + (static_cast<int64_t>(n_tiles) % max_waves != 0 ? 1 : 0);
+    if (static_cast<int64_t>(k_tiles) < required_k_tiles) return false;
+    // Balance K work against available N tiles. This derives the split from the matrix geometry and capability limits;
+    // no vendor or model threshold is used.
+    const int geometry_split = static_cast<int>(std::max<int64_t>(1, (static_cast<int64_t>(k_tiles) + n_tiles - 1) / n_tiles));
+    split_k = std::min(k_tiles, std::min(max_waves, geometry_split));
+    subgroup_size = 32;
+    waves_per_group = split_k;
+    return split_k >= 1;
+}
+
+bool submit_packed_dot_dispatch(sycl::queue& queue, const MatrixView& view, const float* x, int64_t ldx, float* y,
+                                int64_t ldy, int64_t rows, const std::vector<sycl::event>& deps, bool add_bias,
+                                sycl::event& result) {
+    int subgroup_size = 0, split_k = 0, waves_per_group = 0;
+    if (!packed_dot_capability(queue, view, rows, subgroup_size, split_k, waves_per_group)) return false;
+    #define EXL3_PACKED_DOT(B, C) \
+        do { \
+            result = submit_packed_dot<B, C>(queue, view, x, ldx, y, ldy, rows, deps, add_bias, split_k, subgroup_size, waves_per_group); \
+            return true; \
+        } while (false)
+    switch (view.bits) {
+        case 1:
+            if (view.codebook == 0) EXL3_PACKED_DOT(1, 0);
+            if (view.codebook == 1) EXL3_PACKED_DOT(1, 1);
+            EXL3_PACKED_DOT(1, 2);
+        case 2:
+            if (view.codebook == 0) EXL3_PACKED_DOT(2, 0);
+            if (view.codebook == 1) EXL3_PACKED_DOT(2, 1);
+            EXL3_PACKED_DOT(2, 2);
+        case 3:
+            if (view.codebook == 0) EXL3_PACKED_DOT(3, 0);
+            if (view.codebook == 1) EXL3_PACKED_DOT(3, 1);
+            EXL3_PACKED_DOT(3, 2);
+        case 4:
+            if (view.codebook == 0) EXL3_PACKED_DOT(4, 0);
+            if (view.codebook == 1) EXL3_PACKED_DOT(4, 1);
+            EXL3_PACKED_DOT(4, 2);
+        case 5:
+            if (view.codebook == 0) EXL3_PACKED_DOT(5, 0);
+            if (view.codebook == 1) EXL3_PACKED_DOT(5, 1);
+            EXL3_PACKED_DOT(5, 2);
+        case 6:
+            if (view.codebook == 0) EXL3_PACKED_DOT(6, 0);
+            if (view.codebook == 1) EXL3_PACKED_DOT(6, 1);
+            EXL3_PACKED_DOT(6, 2);
+        case 7:
+            if (view.codebook == 0) EXL3_PACKED_DOT(7, 0);
+            if (view.codebook == 1) EXL3_PACKED_DOT(7, 1);
+            EXL3_PACKED_DOT(7, 2);
+        default:
+            if (view.codebook == 0) EXL3_PACKED_DOT(8, 0);
+            if (view.codebook == 1) EXL3_PACKED_DOT(8, 1);
+            EXL3_PACKED_DOT(8, 2);
+    }
+    #undef EXL3_PACKED_DOT
 }
 
 inline int hadamard_sign(int row, int col) {
@@ -309,7 +477,10 @@ sycl::event exl3_gemv_fp32(sycl::queue& queue, const MatrixView& view, const flo
         dot_deps = {input_event};
     }
     const bool dot_add_bias = options.add_bias && !use_output;
-    const sycl::event dot_event = submit_dot(queue, view, dot_input, dot_output, dot_deps, dot_add_bias);
+    sycl::event dot_event;
+    if (!submit_packed_dot_dispatch(queue, view, dot_input, view.k, dot_output, view.n, 1, dot_deps, dot_add_bias,
+                                    dot_event))
+        dot_event = submit_dot(queue, view, dot_input, dot_output, dot_deps, dot_add_bias);
     if (profile != nullptr) profile->dot = dot_event;
     if (use_output) {
         const sycl::event output_event = submit_output_hadamard(queue, view, dot_output, y, {dot_event}, options.add_bias);
@@ -339,8 +510,10 @@ sycl::event exl3_gemm_fp32(sycl::queue& queue, const MatrixView& view, const flo
         dot_deps = {input_event};
     }
     const bool dot_add_bias = options.add_bias && !use_output;
-    const sycl::event dot_event =
-        submit_dot_rows(queue, view, dot_input, dot_ldx, dot_output, dot_ldy, rows, dot_deps, dot_add_bias);
+    sycl::event dot_event;
+    if (!submit_packed_dot_dispatch(queue, view, dot_input, dot_ldx, dot_output, dot_ldy, rows, dot_deps, dot_add_bias,
+                                    dot_event))
+        dot_event = submit_dot_rows(queue, view, dot_input, dot_ldx, dot_output, dot_ldy, rows, dot_deps, dot_add_bias);
     if (profile != nullptr) profile->dot = dot_event;
     if (use_output) {
         const sycl::event output_event =
