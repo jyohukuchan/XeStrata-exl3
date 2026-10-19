@@ -37,11 +37,20 @@ XeStrata の対象 revision と、参照用に clone した Strata の tag/revis
 
 記録する項目は、GPU ごとの device/backend、driver/runtime、build mode、CPU thread 数、モデル形式、実効 bpw、context、batch、KV 精度、MTP 設定、prefill tok/s、decode tok/s、VRAM/RAM、ログの主要な時間である。
 
+比較の主対象は、Strata でよく使われる IQuant 系とする。対象保存量に応じて IQ2、IQ3、IQ4_NL、IQ4_XS
+などを選び、GGUF の代表名だけでなく、各 tensor と expert の実際の型、混合比率、head/embedding の精度を
+記録する。既存 XeStrata の native IQuant 経路を主な速度基準とし、Strata の対応経路も参照する。
+Q4_K_M などの結果は補助比較として残し、IQuant 比較の代わりにはしない。
+
 ### 1. 精度の成立性を先に確認
 
 同じ元モデルから主対象の 2、3、4、5 bpw の EXL3 pack を作り、`mul1`、`mcg`、`legacy/default (cb0)` と代表的な混合精度 recipe を用意する。checkpoint に実在する head の bit 幅は付随する例外として保持する。BF16、既存 XeStrata 形式、EXL3 を同じ入力で比較し、perplexity または token log-likelihood、greedy token 一致率、固定した日本語・コード・長文・会話の評価を残す。
 
 この段階で、少なくとも対象 bpw ごとに代表構成の改善方向、または改善できる bit 配分が確認できることを精度ゲートとする。改善がないときは kernel の実装不足と量子化 recipe の不足を分け、recipe を見直す。精度ゲート未達のまま大規模な高速化へ進めず、前提条件が不成立ならその証拠を記録する。
+
+IQuant の imatrix は EXL3 と同じ校正 token 列から作る。通常の混合 recipe と、embedding/head の保存形式を
+そろえた比較を区別し、両者とも実効保存量を集計する。より小さい IQuant と、容量の大きい EXL3 の精度差を
+同 bpw の改善とは扱わない。評価に使った text、MTP、vision の範囲も一致させる。
 
 ### 2. 形式と数値の最小統合
 

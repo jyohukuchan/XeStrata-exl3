@@ -40,11 +40,22 @@ Record the XeStrata revision and the tag/revision of a cloned Strata reference. 
 
 Record each GPU's device/backend, driver/runtime, build mode, CPU thread count, model format, effective bpw, context, batch, KV precision, MTP settings, prefill tok/s, decode tok/s, VRAM/RAM and major logged timings.
 
+The primary comparisons use the IQuant formats common in Strata. Select IQ2, IQ3, IQ4_NL, IQ4_XS or other
+appropriate formats for the storage budget, recording actual tensor/expert types, mixing ratios and
+head/embedding precision rather than relying on a GGUF's representative name. Existing XeStrata native
+IQuant execution is the primary speed baseline; also consult Strata's corresponding path. Keep Q4_K_M
+and similar results as supplementary comparisons, not substitutes for IQuant.
+
 ### 1. Check precision feasibility first
 
 Create primary 2, 3, 4 and 5 bpw EXL3 packs from the same source model, covering `mul1`, `mcg`, `legacy/default (cb0)` and representative mixed precision recipes. Preserve valid checkpoint head bit widths as associated exceptions. Compare BF16, the existing XeStrata format and EXL3 on identical inputs. Keep perplexity or token log-likelihood, greedy token agreement and fixed Japanese, code, long-document and conversation evaluations.
 
 The precision gate is evidence of an improvement direction for a representative configuration at every target bpw, or a bit allocation that can produce it. If there is no improvement, distinguish a kernel limitation from a quantization recipe limitation and revisit the recipe. Do not proceed to large-scale performance work while the precision gate is missing; record evidence if the prerequisite is false.
+
+Build IQuant imatrices from the same calibration token sequences as EXL3. Separate standard mixed
+recipes from comparisons with controlled embedding/head storage, counting effective storage for both.
+Do not treat a larger EXL3 candidate's quality advantage over a smaller IQuant as a matched-bpw gain.
+Match the evaluated text, MTP and vision scopes as well.
 
 ### 2. Integrate the format and numerics minimally
 
