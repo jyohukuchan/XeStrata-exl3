@@ -344,10 +344,9 @@ bool packed_dot_capability(const sycl::queue& queue, const MatrixView& view, int
     const int64_t required_k_tiles =
         static_cast<int64_t>(n_tiles) / max_waves + (static_cast<int64_t>(n_tiles) % max_waves != 0 ? 1 : 0);
     if (static_cast<int64_t>(k_tiles) < required_k_tiles) return false;
-    // Balance K work against available N tiles. This derives the split from the matrix geometry and capability limits;
-    // no vendor or model threshold is used.
-    const int geometry_split = static_cast<int>(std::max<int64_t>(1, (static_cast<int64_t>(k_tiles) + n_tiles - 1) / n_tiles));
-    split_k = std::min(k_tiles, std::min(max_waves, geometry_split));
+    // Use the available K waves so a narrow output matrix can hide decode/load latency.
+    // Both the wave capacity and the useful K span come from device/descriptor limits.
+    split_k = std::min(k_tiles, max_waves);
     subgroup_size = 32;
     waves_per_group = split_k;
     return split_k >= 1;
