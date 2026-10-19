@@ -19,6 +19,8 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 - 量子化精度の主比較では `STRATA_ROUTE_TAIL_SKIP=0` とし、全 routed expert の計算を維持する。
   条件により低順位の非resident expert を省略する既定の高速設定は別に記録し、同じ省略方針同士で速度を比べる。
   cache 配置や量子化形式で省略量が変わった結果を、そのまま量子化精度の改善と扱わない。
+- engine の主精度比較では `STRATA_HC_Q8=0` とし、hyper-connection の BF16/Q8 読み出しを起動時の速度で
+  自動選択させない。既定の自動選択を含む速度比較は、両側で実際に選ばれた精度も記録する。
 
 indexed shard の外にある safetensors sidecar も artifact の一部として扱う。`ngram_embedding.safetensors` の
 `exl3_ngram_trellis` は通常の線形層の trellis ではなく、row 次元160の専用 n-gram codec なので、線形層の

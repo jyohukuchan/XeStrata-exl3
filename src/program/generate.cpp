@@ -55,6 +55,7 @@
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/core/native_head.hpp"
+#include "strata/core/exl3_dense.hpp"
 #include "strata/core/verify.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/core/coupled_draft.hpp"
@@ -288,6 +289,7 @@ struct Options {
     bool native_router = false;       // pinned fused 512-expert top-10 router
     bool cpu_oracle_q8_0 = false;      // pinned x86 activation scales/codes at both expert stages
     std::string native_head_gguf;      // native output.weight experiment; same model shard as the pack
+    std::string exl3_head;             // native EXL3 archive's lm_head, attached to output.weight
     std::vector<std::string> native_dense_gguf; // repeat for native GDN/QSA projection shards
     /// Plan v0.3 P1: the whole native arithmetic set as ONE switch (model shard 1). It enables exactly the
     /// combination recorded in bench/results/2026-09-23-attention-ple plus the native indexer, and never the
@@ -711,6 +713,7 @@ void usage() {
                  "  --no-fused-gr        A/B: the six-kernel hyper-connection read and a separate write (native)\n"
                  "  --prefill CHUNK      batched prompt processing in chunks of CHUNK tokens (needs --native); auto =\n"
                  "                       the largest chunk up to 32768 whose buffers the expert cache can lend\n"
+                 "  --exl3-head DIR      experimental packed EXL3 lm_head override (single-GPU CLI, no MTP)\n"
                  "  --prefill-cpu-share S  the CPU pool's share of a short chunk's streamed experts where the default\n"
                  "                       uses the pool (0-1; auto = measured each layer, the default; setup writes\n"
                  "                       the share it measured, so a prompt reads the same way every run)\n"
@@ -2392,6 +2395,7 @@ int main(int argc, char** argv) {
         else if (a == "--cpu-oracle-q8-0") o.cpu_oracle_q8_0 = true;
         else if (a == "--native") o.native_preset = next("--native");
         else if (a == "--native-head-gguf") o.native_head_gguf = next("--native-head-gguf");
+        else if (a == "--exl3-head") o.exl3_head = next("--exl3-head");
         else if (a == "--native-dense-gguf") o.native_dense_gguf.push_back(next("--native-dense-gguf"));
         else if (a == "--no-capture") o.no_capture = true;
         else if (a == "--no-pool") o.no_pool = true;
@@ -2907,7 +2911,7 @@ int main(int argc, char** argv) {
         o.native_bf16 = o.native_bf16_extra = true;
         o.native_ple_key = o.native_moe_combine = o.native_gdn = o.native_router = true;
         o.native_qsa = o.native_qsa_indexer = o.native_rope = o.native_ple_postops = true;
-        if (o.native_head_gguf.empty()) o.native_head_gguf = o.native_preset;
+        if (o.native_head_gguf.empty() && o.exl3_head.empty()) o.native_head_gguf = o.native_preset;
         if (o.native_dense_gguf.empty()) {
             // every shard of the model (<name>-0000N-of-0000M.gguf beside --native), then the PLE shard: a split
             // may put any layer in any shard (Swift's GGUFs: layers 13-47 in shard 2, the PLE table in shard 1)
@@ -3024,6 +3028,12 @@ int main(int argc, char** argv) {
     strata::kernels::cpu::expert_set_oracle_q8_0(o.cpu_oracle_q8_0);
 
     std::string err;
+    if (!o.exl3_head.empty() && (o.serve || !o.native_head_gguf.empty() || !o.mtp.empty() ||
+        !o.layer_split.empty() || !o.split_device.empty() || o.gpu_stages || o.batch != 0 || o.pipeline_windows != 0)) {
+        std::fprintf(stderr, "--exl3-head currently requires a single-GPU CLI run without --native-head-gguf, "
+                             "--mtp, --serve, --batch or pipeline windows\n");
+        return 2;
+    }
     if (!o.native_head_gguf.empty() && !o.stream_token) {
         std::fprintf(stderr, "--native-head-gguf requires --stream-token\n");
         return 2;
@@ -3221,7 +3231,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
-        if (!o.native_head_gguf.empty()) skip.insert("output.weight");
+        if (!o.native_head_gguf.empty() || !o.exl3_head.empty()) skip.insert("output.weight");
         // the PLE module validates its canonical key at construction (8 MB); a native pack has none to load
         if (!native_pack) skip.erase("blk.1.ple_key.weight");
         else if (!strata::core::NativeDense::keep_unquantized_ple_key(o.pack, skip, err)) {
@@ -4587,6 +4597,14 @@ int main(int argc, char** argv) {
     if (wo == nullptr) { std::fprintf(stderr, "strata generate: output.weight is missing\n"); return 1; }
     const int64_t n_vocab = wo->ne1;
     strata::core::NativeHead native_head;
+    strata::core::Exl3Dense exl3_head;
+    if (!o.exl3_head.empty()) {
+        if (!exl3_head.load(o.exl3_head, "lm_head", wt, err) || !exl3_head.prepare_stream(main_cs, err)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "strata generate: experimental packed EXL3 lm_head attached\n");
+    }
     if (!o.native_head_gguf.empty() && !multi_gpu) {   // a layer split's head is on its last stage
         const auto head_t0 = std::chrono::steady_clock::now();
         if (!native_head.load(o.native_head_gguf, g.n_embd, n_vocab, err)) {
@@ -12370,6 +12388,10 @@ int main(int argc, char** argv) {
         vh.h_res = host_res.empty() ? nullptr : host_res.data();   // every expert resident: windows without the host
         if (adapt_device_table_lags()) ver.set_always_publish(true);
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 1;
+        }
+        if (!o.exl3_head.empty() && !exl3_head.prepare_stream(ver.stream(), err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }

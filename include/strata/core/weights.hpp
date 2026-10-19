@@ -38,6 +38,8 @@
 
 namespace strata::core {
 
+class Exl3Dense;
+
 /// What the loader had to DO for a tensor, decided by `tools/pack_index.py` and written into the index
 /// rather than inferred here.  The four cases are distinguishable in the manifest only by combining
 /// `source_type` with `values_fp16`, and getting that combination wrong yields a plausible tensor.
@@ -93,6 +95,8 @@ struct WeightRef {
     const void* native_data = nullptr;
     void* native_q8_1 = nullptr;
     int native_type = -1;
+    /// Optional EXL3 dense projection, owned by Exl3Dense.
+    Exl3Dense* exl3 = nullptr;
     /// STRATA_HC_Q8=1: a hyper-connection projection's Q8_0 values as the GGUF stores them, in kNativeQ8Rows' layout
     /// (each row's qs, then its fp16 scales), owned by NativeDense, for the verify window's read
     const void* hc_q8 = nullptr;
@@ -140,6 +144,7 @@ public:
 
 private:
     friend class NativeDense;
+    friend class Exl3Dense;
     std::map<std::string, WeightRef> table_;
     LoadReport report_;
 };

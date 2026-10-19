@@ -14,7 +14,7 @@ namespace {
 // the switches and dumps of their kernels
 const char* const kQwen38Only[] = {
     "--pack", "--ple-gguf", "--no-ple", "--ple-io", "--ple-row-cache", "--ple-inflight", "--ple-delay-us",
-    "--ple-sync-submit", "--embd-gguf", "--native-dense-gguf", "--native-head-gguf", "--native-bf16",
+    "--ple-sync-submit", "--embd-gguf", "--native-dense-gguf", "--native-head-gguf", "--exl3-head", "--native-bf16",
     "--native-bf16-extra", "--native-ple-key", "--native-ple-postops", "--native-moe-combine", "--native-gdn",
     "--native-flash-attn-short", "--native-qsa", "--native-qsa-indexer", "--native-rope", "--native-router",
     "--gr-fp32-activations", "--gr-native-mmvf", "--no-fused-gr", "--no-fused-gdn", "--no-fast-attn",

@@ -20,6 +20,9 @@ This plan adds EXL3 at 2–5 bpw and mixed precision to XeStrata, with higher qu
   Record the stock fast setting, which conditionally skips low-ranked nonresident experts, separately and compare
   speed under matching skip policies. Do not attribute changes in skipped work caused by cache placement or
   quantization format directly to better quantization quality.
+- Set `STRATA_HC_Q8=0` for primary engine quality comparisons so startup timing does not choose between BF16 and
+  Q8 hyper-connection reads. Speed comparisons using the default automatic choice also record the precision
+  actually selected on each side.
 
 Safetensors sidecars outside the indexed shards are also part of the artifact. `ngram_embedding.safetensors` with
 `exl3_ngram_trellis` is not an ordinary linear trellis: it uses a dedicated n-gram codec with row dimension 160, so it

@@ -6,6 +6,7 @@
 #include "strata/core/layer.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/core/native_dense.hpp"
+#include "strata/core/exl3_dense.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
@@ -1252,6 +1253,10 @@ bool lm_head(const WeightTable& tables, const ModelGeometry& g, const BlockBuffe
              float* logits, void* stream, std::string& err) {
     const WeightRef* wo = tables.find("output.weight");
     if (!wo) { err = "output.weight is missing"; return false; }
+    if (wo->exl3 != nullptr) {
+        if (!lm_head_mix(tables, g, bb, stream, err)) return false;
+        return wo->exl3->run(bb.mixed, g.n_embd, logits, wo->ne1, 1, stream, err);
+    }
     strata::kernels::SForm form;
     Planes planes;
     if (!sform_of(*wo, form, "output.weight", err) ||

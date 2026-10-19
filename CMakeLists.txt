@@ -177,6 +177,13 @@ add_library(strata_artifact INTERFACE)
 target_include_directories(strata_artifact INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(strata_artifact INTERFACE strata_warnings)
 
+# Native EXL3 headers carry JSON metadata; keep the parser private to this
+# host-only archive instead of adding a dependency to every GGUF consumer.
+add_library(strata_exl3_artifact STATIC src/artifact/exl3.cpp)
+target_link_libraries(strata_exl3_artifact PUBLIC strata_artifact)
+target_include_directories(strata_exl3_artifact SYSTEM PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/main/nlohmann-json)
+
 add_executable(strata-gguf src/artifact/gguf_reader.cpp)
 target_link_libraries(strata-gguf PRIVATE strata_artifact)
 
@@ -185,6 +192,11 @@ target_link_libraries(strata-dequant PRIVATE strata_artifact)
 # this file is now nothing but the CLI entry point, and its inherited guard spells that as a "selftest"
 target_compile_definitions(strata-dequant PRIVATE STRATA_DEQUANT_SELFTEST)
 if(STRATA_BUILD_TESTS)
+  add_executable(exl3_artifact_test src/artifact/exl3_test.cpp)
+  target_link_libraries(exl3_artifact_test PRIVATE strata_exl3_artifact)
+  target_include_directories(exl3_artifact_test SYSTEM PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/main/nlohmann-json)
+  add_test(NAME exl3_artifact_test COMMAND exl3_artifact_test)
   # the reader refuses a duplicate tensor name at open, naming it (a synthetic GGUF: no model, no GPU)
   add_executable(gguf_split_test tests/core/gguf_split_test.cpp)
   target_link_libraries(gguf_split_test PRIVATE strata_artifact)
@@ -377,7 +389,7 @@ if(STRATA_ENABLE_XE)
   target_link_libraries(strata-load PRIVATE strata_core)
 
   add_library(strata_kernels STATIC src/kernels/xe/elementwise.cpp src/kernels/xe/iq_kernels.cpp
-                                    src/kernels/xe/exl3.cpp
+                                    src/kernels/xe/exl3.cpp src/kernels/xe/exl3_expert.cpp
                                     src/kernels/xe/native_mmvq.cpp src/kernels/xe/rope.cpp
                                     src/kernels/xe/router.cpp src/kernels/xe/bf16_gemv.cpp
                                     src/kernels/xe/quantize_act.cpp src/kernels/xe/qsa.cpp
@@ -407,13 +419,14 @@ if(STRATA_ENABLE_XE)
   # verify window and the MTP drafter.  Host code over strata_core's GPU operations (strata/core/gpu.hpp).
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp
                                    src/core/remote_experts.cpp src/core/expert_cache.cpp src/core/native_head.cpp
-                                   src/core/native_dense.cpp src/core/verify.cpp src/core/moe_window.cpp
+                                   src/core/native_dense.cpp src/core/exl3_dense.cpp src/core/verify.cpp
+                                   src/core/moe_window.cpp
                                    src/core/plain_model.cpp src/core/pcie_split.cpp src/core/mtp.cpp
                                    src/core/conversation_snapshot.cpp src/core/conversation_state.cpp
                                    src/core/conversation_memory.cpp src/core/conversation_disk.cpp
                                    src/core/conversation_file.cpp src/core/vmm.cpp)
   target_include_directories(strata_engine PUBLIC include)
-  target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu)
+  target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu strata_exl3_artifact)
   # c-blosc2 (libblosc2-dev; free, BSD-3), optional: --conversation-save-compress stores the saved conversations'
   # floating-point parts compressed.  Without it the engine builds and runs, and refuses that option.
   find_path(STRATA_BLOSC2_INCLUDE blosc2.h)
@@ -643,6 +656,18 @@ if(STRATA_ENABLE_XE)
   target_link_libraries(strata-image PRIVATE strata_image)
 
   if(STRATA_BUILD_TESTS)
+    add_executable(exl3_expert_parity src/kernels/exl3_expert_parity.cpp)
+    target_link_libraries(exl3_expert_parity PRIVATE strata_kernels)
+    target_compile_options(exl3_expert_parity PRIVATE -fno-fast-math -ffp-contract=off)
+    if(TARGET strata_exl3_fixture)
+      add_dependencies(exl3_expert_parity strata_exl3_fixture)
+      add_test(NAME exl3_expert_parity COMMAND exl3_expert_parity ${_strata_exl3_fixture})
+      set_tests_properties(exl3_expert_parity PROPERTIES TIMEOUT 120)
+    endif()
+    # Optional checkpoint probe; no model download is part of CTest.
+    add_executable(exl3_archive_parity src/kernels/exl3_archive_parity.cpp)
+    target_link_libraries(exl3_archive_parity PRIVATE strata_engine)
+    target_compile_options(exl3_archive_parity PRIVATE -fno-fast-math -ffp-contract=off)
     add_executable(exl3_parity src/kernels/exl3_parity.cpp)
     target_link_libraries(exl3_parity PRIVATE strata_kernels)
     target_compile_options(exl3_parity PRIVATE -fno-fast-math -ffp-contract=off)
@@ -822,11 +847,20 @@ if(STRATA_BUILD_TESTS)
 endif()
 
 add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
-            src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp src/kernels/cpu/exl3.cpp)
+            src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp src/kernels/cpu/exl3.cpp
+            src/kernels/cpu/exl3_expert.cpp)
 target_include_directories(strata_kernels_cpu PUBLIC include)
-set_source_files_properties(src/kernels/xe/exl3.cpp src/kernels/cpu/exl3.cpp
+set_source_files_properties(src/kernels/xe/exl3.cpp src/kernels/cpu/exl3.cpp src/kernels/cpu/exl3_expert.cpp
                            PROPERTIES COMPILE_OPTIONS "-fno-fast-math;-ffp-contract=off;-Wall;-Wextra")
 if(STRATA_BUILD_TESTS)
+  add_executable(exl3_cpu_expert_parity src/kernels/cpu/exl3_expert_parity.cpp)
+  target_link_libraries(exl3_cpu_expert_parity PRIVATE strata_kernels_cpu strata_warnings)
+  target_compile_options(exl3_cpu_expert_parity PRIVATE -fno-fast-math -ffp-contract=off)
+  if(TARGET strata_exl3_fixture)
+    add_dependencies(exl3_cpu_expert_parity strata_exl3_fixture)
+    add_test(NAME exl3_cpu_expert_parity COMMAND exl3_cpu_expert_parity ${_strata_exl3_fixture})
+    set_tests_properties(exl3_cpu_expert_parity PROPERTIES TIMEOUT 120)
+  endif()
   add_executable(exl3_cpu_parity src/kernels/cpu/exl3_parity.cpp)
   target_link_libraries(exl3_cpu_parity PRIVATE strata_kernels_cpu strata_warnings)
   target_compile_options(exl3_cpu_parity PRIVATE -fno-fast-math -ffp-contract=off)
