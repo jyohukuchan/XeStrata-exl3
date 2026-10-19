@@ -3,6 +3,7 @@
 #pragma once
 
 #include "strata/kernels/exl3_format.hpp"
+#include "strata/kernels/raw_linear_format.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -36,7 +37,7 @@ public:
     bool load(const std::filesystem::path& directory, const std::string& hf_name, WeightTable& table,
               std::string& err, int64_t max_rows = 1);
     /// Reuses an already validated archive.  No archive-wide host metadata is
-    /// retained after upload; only the selected packed components are owned.
+    /// retained after upload; only the selected matrix components are owned.
     bool load(const strata::artifact::exl3::Archive& archive, const std::string& hf_name, WeightTable& table,
               std::string& err, int64_t max_rows = 1);
 
@@ -46,9 +47,12 @@ public:
     /// allocates a workspace sized from this matrix and `max_rows`.
     bool prepare_stream(void* stream, std::string& err);
 
-    /// Runs the packed matrix with FP32 input/output and caller-owned strides.
+    /// Runs the packed or raw matrix with FP32 input/output and caller-owned strides.
     /// The stream must have been registered with `prepare_stream` first.
     bool run(const float* x, int64_t ldx, float* y, int64_t ldy, int64_t rows, void* stream, std::string& err);
+
+    bool raw() const { return raw_; }
+    strata::kernels::raw::DType raw_dtype() const { return raw_view_.dtype; }
 
 private:
     struct StreamScratch {
@@ -60,13 +64,17 @@ private:
     bool pointers_owned_by(const Runtime* runtime) const;
 
     strata::kernels::exl3::MatrixView view_;
+    strata::kernels::raw::LinearView raw_view_;
     void* trellis_ = nullptr;
     void* suh_ = nullptr;  // codespell:ignore suh
     void* svh_ = nullptr;
     void* bias_ = nullptr;
+    void* raw_weights_ = nullptr;
+    void* raw_bias_ = nullptr;
     size_t scratch_elements_ = 0;
     int64_t max_rows_ = 0;
     Runtime* runtime_ = nullptr;
+    bool raw_ = false;
     std::vector<StreamScratch> streams_;
     WeightRef* attached_ = nullptr;
 };

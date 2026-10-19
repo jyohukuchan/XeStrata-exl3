@@ -192,6 +192,11 @@ target_link_libraries(strata_exl3_artifact PUBLIC strata_artifact)
 target_include_directories(strata_exl3_artifact SYSTEM PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/main/nlohmann-json)
 
+add_library(strata_exl3_expert_artifact STATIC src/artifact/exl3_expert.cpp)
+target_link_libraries(strata_exl3_expert_artifact PUBLIC strata_exl3_artifact)
+add_library(strata_exl3_ngram_artifact STATIC src/artifact/exl3_ngram.cpp)
+target_link_libraries(strata_exl3_ngram_artifact PUBLIC strata_exl3_artifact strata_kernels_cpu)
+
 add_executable(strata-gguf src/artifact/gguf_reader.cpp)
 target_link_libraries(strata-gguf PRIVATE strata_artifact)
 
@@ -205,6 +210,16 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(exl3_artifact_test SYSTEM PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/main/nlohmann-json)
   add_test(NAME exl3_artifact_test COMMAND exl3_artifact_test)
+  add_executable(exl3_expert_artifact_test src/artifact/exl3_expert_test.cpp)
+  target_link_libraries(exl3_expert_artifact_test PRIVATE strata_exl3_expert_artifact)
+  target_include_directories(exl3_expert_artifact_test SYSTEM PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/main/nlohmann-json)
+  add_test(NAME exl3_expert_artifact_test COMMAND exl3_expert_artifact_test)
+  add_executable(exl3_ngram_reader_test src/artifact/exl3_ngram_test.cpp)
+  target_link_libraries(exl3_ngram_reader_test PRIVATE strata_exl3_ngram_artifact)
+  target_include_directories(exl3_ngram_reader_test SYSTEM PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/main/nlohmann-json)
+  add_test(NAME exl3_ngram_reader_test COMMAND exl3_ngram_reader_test)
   # the reader refuses a duplicate tensor name at open, naming it (a synthetic GGUF: no model, no GPU)
   add_executable(gguf_split_test tests/core/gguf_split_test.cpp)
   target_link_libraries(gguf_split_test PRIVATE strata_artifact)
@@ -398,6 +413,7 @@ if(STRATA_ENABLE_XE)
 
   add_library(strata_kernels STATIC src/kernels/xe/elementwise.cpp src/kernels/xe/iq_kernels.cpp
                                     src/kernels/xe/exl3.cpp src/kernels/xe/exl3_expert.cpp src/kernels/xe/exl3_ngram.cpp
+                                    src/kernels/xe/raw_linear.cpp
                                     src/kernels/xe/native_mmvq.cpp src/kernels/xe/rope.cpp
                                     src/kernels/xe/router.cpp src/kernels/xe/bf16_gemv.cpp
                                     src/kernels/xe/quantize_act.cpp src/kernels/xe/qsa.cpp
@@ -664,6 +680,16 @@ if(STRATA_ENABLE_XE)
   target_link_libraries(strata-image PRIVATE strata_image)
 
   if(STRATA_BUILD_TESTS)
+    add_executable(raw_linear_parity src/kernels/raw_linear_parity.cpp)
+    target_link_libraries(raw_linear_parity PRIVATE strata_kernels strata_kernels_cpu)
+    target_compile_options(raw_linear_parity PRIVATE -fno-fast-math -ffp-contract=off)
+    add_test(NAME raw_linear_parity COMMAND raw_linear_parity)
+    add_executable(exl3_dense_raw_parity src/core/exl3_dense_raw_parity.cpp)
+    target_link_libraries(exl3_dense_raw_parity PRIVATE strata_engine)
+    target_include_directories(exl3_dense_raw_parity SYSTEM PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/third_party/main/nlohmann-json)
+    target_compile_options(exl3_dense_raw_parity PRIVATE -fno-fast-math -ffp-contract=off)
+    add_test(NAME exl3_dense_raw_parity COMMAND exl3_dense_raw_parity)
     add_executable(exl3_ngram_parity src/kernels/exl3_ngram_parity.cpp)
     target_link_libraries(exl3_ngram_parity PRIVATE strata_kernels strata_kernels_cpu)
     target_compile_options(exl3_ngram_parity PRIVATE -fno-fast-math -ffp-contract=off)
@@ -864,10 +890,11 @@ endif()
 
 add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
             src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp src/kernels/cpu/exl3.cpp
-            src/kernels/cpu/exl3_expert.cpp src/kernels/cpu/exl3_ngram.cpp)
+            src/kernels/cpu/exl3_expert.cpp src/kernels/cpu/exl3_ngram.cpp src/kernels/cpu/raw_linear.cpp)
 target_include_directories(strata_kernels_cpu PUBLIC include)
 set_source_files_properties(src/kernels/xe/exl3.cpp src/kernels/cpu/exl3.cpp
                            src/kernels/cpu/exl3_expert.cpp src/kernels/cpu/exl3_ngram.cpp
+                           src/kernels/cpu/raw_linear.cpp
                            PROPERTIES COMPILE_OPTIONS "-fno-fast-math;-ffp-contract=off;-Wall;-Wextra")
 if(STRATA_BUILD_TESTS)
   add_executable(exl3_cpu_ngram_parity src/kernels/cpu/exl3_ngram_parity.cpp)

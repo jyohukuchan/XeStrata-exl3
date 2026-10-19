@@ -7,9 +7,13 @@
 #include "strata/core/on_device.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/core/weights.hpp"
+#include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/exl3.hpp"
+#include "strata/kernels/f16_bits.hpp"
+#include "strata/kernels/raw_linear.hpp"
 
 #include <limits>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -21,6 +25,66 @@ void free_device(void*& pointer) {
         strata::gpu::free(pointer);
         pointer = nullptr;
     }
+}
+
+bool copy_bytes(void*& destination, const std::vector<uint8_t>& source, const char* label, std::string& err) {
+    if (source.empty()) {
+        err = std::string("exl3 dense: ") + label + " is empty";
+        return false;
+    }
+    destination = strata::gpu::alloc_device(source.size());
+    if (destination == nullptr || !strata::gpu::copy(destination, source.data(), source.size())) {
+        if (destination != nullptr) strata::gpu::free(destination);
+        destination = nullptr;
+        err = std::string("exl3 dense: uploading ") + label + " failed: " + strata::gpu::last_error();
+        return false;
+    }
+    return true;
+}
+
+uint16_t read_u16(const uint8_t* data) {
+    return static_cast<uint16_t>(data[0]) | static_cast<uint16_t>(data[1] << 8);
+}
+
+uint32_t read_u32(const uint8_t* data) {
+    return static_cast<uint32_t>(data[0]) | (static_cast<uint32_t>(data[1]) << 8) |
+           (static_cast<uint32_t>(data[2]) << 16) | (static_cast<uint32_t>(data[3]) << 24);
+}
+
+bool raw_dtype_of(const std::string& dtype, strata::kernels::raw::DType& result) {
+    if (dtype == "F16") result = strata::kernels::raw::DType::F16;
+    else if (dtype == "BF16") result = strata::kernels::raw::DType::BF16;
+    else if (dtype == "F32") result = strata::kernels::raw::DType::F32;
+    else return false;
+    return true;
+}
+
+bool materialize_raw_bias(const strata::artifact::exl3::TensorDescriptor& tensor, const std::vector<uint8_t>& raw,
+                          std::vector<float>& result,
+                          std::string& err) {
+    if (tensor.shape.size() != 1 || tensor.shape[0] > std::numeric_limits<size_t>::max()) {
+        err = "exl3 dense: raw bias must be one-dimensional";
+        return false;
+    }
+    const size_t count = static_cast<size_t>(tensor.shape[0]);
+    result.resize(count);
+    if (tensor.dtype == "F16") {
+        if (raw.size() != count * 2) { err = "exl3 dense: raw F16 bias size"; return false; }
+        for (size_t i = 0; i < count; ++i) result[i] = strata::kernels::f32_from_f16(read_u16(raw.data() + i * 2));
+    } else if (tensor.dtype == "BF16") {
+        if (raw.size() != count * 2) { err = "exl3 dense: raw BF16 bias size"; return false; }
+        for (size_t i = 0; i < count; ++i) result[i] = strata::kernels::f32_from_bf16(read_u16(raw.data() + i * 2));
+    } else if (tensor.dtype == "F32") {
+        if (raw.size() != count * 4) { err = "exl3 dense: raw F32 bias size"; return false; }
+        for (size_t i = 0; i < count; ++i) {
+            const uint32_t bits = read_u32(raw.data() + i * 4);
+            std::memcpy(&result[i], &bits, sizeof bits);
+        }
+    } else {
+        err = "exl3 dense: raw bias dtype is not F16/BF16/F32";
+        return false;
+    }
+    return true;
 }
 
 bool copy_component(void*& destination, const std::vector<uint16_t>& source, const char* label, std::string& err) {
@@ -54,18 +118,22 @@ void Exl3Dense::reset() {
     free_device(suh_);  // codespell:ignore suh
     free_device(svh_);
     free_device(bias_);
+    free_device(raw_weights_);
+    free_device(raw_bias_);
     for (StreamScratch& stream : streams_) free_device(stream.data);
     streams_.clear();
     view_ = {};
+    raw_view_ = {};
     scratch_elements_ = 0;
     max_rows_ = 0;
     runtime_ = nullptr;
+    raw_ = false;
     attached_ = nullptr;
 }
 
 bool Exl3Dense::pointers_owned_by(const Runtime* runtime) const {
     if (runtime == nullptr) return false;
-    const void* pointers[] = {view_.trellis, view_.suh, view_.svh, view_.bias};
+    const void* pointers[] = {view_.trellis, view_.suh, view_.svh, view_.bias, raw_view_.data, raw_view_.bias};
     for (const void* pointer : pointers)
         if (pointer != nullptr && Runtime::owner(pointer) != runtime) return false;
     for (const StreamScratch& stream : streams_)
@@ -100,20 +168,50 @@ bool Exl3Dense::load(const strata::artifact::exl3::Archive& archive, const std::
         return false;
     }
     try {
-        const strata::artifact::exl3::LinearDescriptor* descriptor = nullptr;
-        for (const auto& candidate : archive.linears()) {
-            if (candidate.name == hf_name) {
-                descriptor = &candidate;
-                break;
-            }
-        }
-        if (descriptor == nullptr) throw std::runtime_error("linear is missing: " + hf_name);
-
         auto canonical = table.table_.find("output.weight");
         if (canonical == table.table_.end()) throw std::runtime_error("output.weight is missing from WeightTable");
         WeightRef& ref = canonical->second;
         if (ref.exl3 != nullptr) throw std::runtime_error("output.weight already has an EXL3 owner");
         if (ref.native_data != nullptr) throw std::runtime_error("output.weight already has a native projection");
+        const strata::artifact::exl3::LinearDescriptor* descriptor = archive.find_linear(hf_name);
+        if (descriptor == nullptr) {
+            const strata::artifact::exl3::TensorDescriptor* weight = archive.find_tensor(hf_name + ".weight");
+            if (weight == nullptr) {
+                throw std::runtime_error("head weight is missing from both EXL3 and raw archive forms: " + hf_name);
+            }
+            if (ref.ne0 <= 0 || ref.ne1 <= 0 || weight->shape.size() != 2 ||
+                weight->shape[0] != static_cast<uint64_t>(ref.ne1) ||
+                weight->shape[1] != static_cast<uint64_t>(ref.ne0))
+                throw std::runtime_error("raw output.weight shape does not match the HF tensor");
+            strata::kernels::raw::DType dtype;
+            if (!raw_dtype_of(weight->dtype, dtype))
+                throw std::runtime_error("raw output.weight dtype is not F16/BF16/F32");
+            std::vector<uint8_t> raw;
+            archive.read_tensor(*weight, raw);
+            if (!copy_bytes(raw_weights_, raw, "raw weight", err)) throw std::runtime_error(err);
+            const strata::artifact::exl3::TensorDescriptor* bias = archive.find_tensor(hf_name + ".bias");
+            std::vector<float> bias_values;
+            if (bias != nullptr) {
+                if (bias->shape != std::vector<uint64_t>{static_cast<uint64_t>(ref.ne1)})
+                    throw std::runtime_error("raw output.weight bias shape does not match output width");
+                std::vector<uint8_t> bias_raw;
+                archive.read_tensor(*bias, bias_raw);
+                if (!materialize_raw_bias(*bias, bias_raw, bias_values, err)) throw std::runtime_error(err);
+                std::vector<uint8_t> bias_bytes(bias_values.size() * sizeof(float));
+                std::memcpy(bias_bytes.data(), bias_values.data(), bias_bytes.size());
+                if (!bias_values.empty() && !copy_bytes(raw_bias_, bias_bytes, "raw bias", err))
+                    throw std::runtime_error(err);
+            }
+            runtime_ = &Runtime::get();
+            raw_view_ = {raw_weights_, raw_bias_ == nullptr ? nullptr : static_cast<const float*>(raw_bias_), ref.ne0,
+                         ref.ne1, dtype};
+            raw_ = true;
+            max_rows_ = max_rows;
+            ref.exl3 = this;
+            attached_ = &ref;
+            if (!prepare_stream(nullptr, err)) throw std::runtime_error(err);
+            return true;
+        }
         if (descriptor->k != ref.ne0 || descriptor->n != ref.ne1 || descriptor->k <= 0 || descriptor->n <= 0)
             throw std::runtime_error("output.weight shape does not match the EXL3 descriptor");
         if (descriptor->k % 128 != 0 || descriptor->n % 128 != 0)
@@ -155,7 +253,7 @@ bool Exl3Dense::load(const strata::artifact::exl3::Archive& archive, const std::
 
 bool Exl3Dense::prepare_stream(void* stream, std::string& err) {
     err.clear();
-    if (runtime_ == nullptr || view_.trellis == nullptr) {
+    if (runtime_ == nullptr || (raw_ ? raw_view_.data == nullptr : view_.trellis == nullptr)) {
         err = "exl3 dense: the owner is not loaded";
         return false;
     }
@@ -169,6 +267,10 @@ bool Exl3Dense::prepare_stream(void* stream, std::string& err) {
         const void* queue_identity = &queue;
         for (const StreamScratch& prepared : streams_)
             if (prepared.queue == queue_identity) return true;
+        if (raw_) {
+            streams_.push_back(StreamScratch{queue_identity, nullptr});
+            return true;
+        }
         if (scratch_elements_ > std::numeric_limits<size_t>::max() / sizeof(float)) {
             err = "exl3 dense: scratch size overflows size_t";
             return false;
@@ -202,11 +304,14 @@ bool Exl3Dense::prepare_stream(void* stream, std::string& err) {
 
 bool Exl3Dense::run(const float* x, int64_t ldx, float* y, int64_t ldy, int64_t rows, void* stream,
                     std::string& err) {
-    if (runtime_ == nullptr || view_.trellis == nullptr) {
+    if (runtime_ == nullptr || (raw_ ? raw_view_.data == nullptr : view_.trellis == nullptr)) {
         err = "exl3 dense: the owner is not loaded";
         return false;
     }
-    if (x == nullptr || y == nullptr || rows <= 0 || rows > max_rows_ || ldx < view_.k || ldy < view_.n) {
+    const int64_t input_width = raw_ ? raw_view_.k : view_.k;
+    const int64_t output_width = raw_ ? raw_view_.n : view_.n;
+    if (x == nullptr || y == nullptr || rows <= 0 || rows > max_rows_ || input_width <= 0 || output_width <= 0 ||
+        ldx < input_width || ldy < output_width) {
         err = "exl3 dense: invalid input/output shape";
         return false;
     }
@@ -232,6 +337,10 @@ bool Exl3Dense::run(const float* x, int64_t ldx, float* y, int64_t ldy, int64_t 
         if (prepared == nullptr) {
             err = "exl3 dense: stream was not prepared before graph capture";
             return false;
+        }
+        if (raw_) {
+            strata::kernels::raw::linear_fp32(queue, raw_view_, x, ldx, y, ldy, rows);
+            return true;
         }
         const size_t needed = strata::kernels::exl3::exl3_gemm_scratch_elements(view_, rows);
         if (needed > scratch_elements_) {

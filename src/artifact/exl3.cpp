@@ -32,6 +32,9 @@ constexpr const char* kKnownPatch = "mtp_hyper_connection_mixer_patch.safetensor
 
 struct ParsedFile {
     std::string name;
+    uint64_t data_start = 0;
+    uint64_t file_bytes = 0;
+    std::map<std::string, std::string> metadata;
     std::vector<TensorDescriptor> tensors;
     std::string format = "safetensors";
 };
@@ -148,16 +151,19 @@ ParsedFile parse_safetensors(const std::filesystem::path& path) {
 
     ParsedFile result;
     result.name = path.filename().string();
+    result.file_bytes = file_size;
     if (header.contains("__metadata__")) {
         const Json& metadata = header.at("__metadata__");
         if (!metadata.is_object()) fail(result.name + ": __metadata__ must be an object");
         for (auto it = metadata.begin(); it != metadata.end(); ++it)
             if (!it.value().is_string()) fail(result.name + ": __metadata__ values must be strings");
+        for (auto it = metadata.begin(); it != metadata.end(); ++it) result.metadata.emplace(it.key(), it.value().get<std::string>());
         const auto format = metadata.find("format");
         if (format != metadata.end()) result.format = format->get<std::string>();
     }
 
     const uint64_t data_start = 8 + header_bytes;
+    result.data_start = data_start;
     std::vector<Span> spans;
     for (auto it = header.begin(); it != header.end(); ++it) {
         if (it.key() == "__metadata__") continue;
@@ -230,38 +236,7 @@ bool same_descriptor(const TensorDescriptor& a, const TensorDescriptor& b) {
            a.data_offset == b.data_offset && a.data_offset_absolute == b.data_offset_absolute && a.bytes == b.bytes;
 }
 
-}  // namespace
-
-struct Archive::Impl {
-    std::filesystem::path directory;
-    std::string config;
-    std::string quantization_config;
-    std::vector<TensorDescriptor> indexed;
-    std::vector<TensorDescriptor> effective;
-    std::vector<LinearDescriptor> linears;
-    std::vector<SidecarDescriptor> sidecars;
-    std::unordered_map<std::string, size_t> effective_by_name;
-    std::unordered_map<std::string, uint32_t> marker_values;
-    std::vector<TensorDescriptor> all_known;
-    bool has_total = false;
-    uint64_t total = 0;
-    uint64_t payload_bytes = 0;
-
-    const TensorDescriptor* find(const std::string& name) const {
-        const auto it = effective_by_name.find(name);
-        return it == effective_by_name.end() ? nullptr : &effective[it->second];
-    }
-
-    bool known(const TensorDescriptor& tensor) const {
-        return std::any_of(all_known.begin(), all_known.end(), [&](const TensorDescriptor& candidate) {
-            return same_descriptor(candidate, tensor);
-        });
-    }
-};
-
-static void read_payload(const Archive::Impl& impl, const TensorDescriptor& tensor, std::vector<uint8_t>& output) {
-    if (!impl.known(tensor)) fail(tensor.name + ": descriptor does not belong to this archive");
-    const std::filesystem::path path = impl.directory / tensor.file;
+void read_file_payload(const std::filesystem::path& path, const TensorDescriptor& tensor, std::vector<uint8_t>& output) {
     std::error_code ec;
     const uintmax_t file_size = std::filesystem::file_size(path, ec);
     if (ec || tensor.data_offset_absolute > file_size || tensor.bytes > file_size - tensor.data_offset_absolute)
@@ -277,6 +252,68 @@ static void read_payload(const Archive::Impl& impl, const TensorDescriptor& tens
         fail(tensor.name + ": payload is truncated");
 }
 
+}  // namespace
+
+const TensorDescriptor* SafetensorsHeader::find(const std::string& name) const {
+    for (const TensorDescriptor& tensor : tensors)
+        if (tensor.name == name) return &tensor;
+    return nullptr;
+}
+
+SafetensorsHeader inspect_safetensors(const std::filesystem::path& path) {
+    const ParsedFile parsed = parse_safetensors(path);
+    SafetensorsHeader result;
+    result.path = std::filesystem::absolute(path).lexically_normal();
+    result.file = parsed.name;
+    result.data_start = parsed.data_start;
+    result.file_bytes = parsed.file_bytes;
+    result.metadata = parsed.metadata;
+    result.tensors = parsed.tensors;
+    return result;
+}
+
+void read_tensor(const SafetensorsHeader& header, const TensorDescriptor& tensor, std::vector<uint8_t>& bytes) {
+    const TensorDescriptor* known = header.find(tensor.name);
+    if (known == nullptr || !same_descriptor(*known, tensor)) fail(tensor.name + ": descriptor does not belong to this header");
+    read_file_payload(header.path, tensor, bytes);
+}
+
+struct Archive::Impl {
+    std::filesystem::path directory;
+    std::string config;
+    std::string quantization_config;
+    std::vector<TensorDescriptor> indexed;
+    std::vector<TensorDescriptor> effective;
+    std::vector<LinearDescriptor> linears;
+    std::vector<SidecarDescriptor> sidecars;
+    std::unordered_map<std::string, size_t> effective_by_name;
+    std::unordered_map<std::string, std::vector<size_t>> known_by_name;
+    std::unordered_map<std::string, size_t> linear_by_name;
+    std::unordered_map<std::string, uint32_t> marker_values;
+    std::vector<TensorDescriptor> all_known;
+    bool has_total = false;
+    uint64_t total = 0;
+    uint64_t payload_bytes = 0;
+
+    const TensorDescriptor* find(const std::string& name) const {
+        const auto it = effective_by_name.find(name);
+        return it == effective_by_name.end() ? nullptr : &effective[it->second];
+    }
+
+    bool known(const TensorDescriptor& tensor) const {
+        const auto it = known_by_name.find(tensor.name);
+        if (it == known_by_name.end()) return false;
+        for (const size_t index : it->second)
+            if (same_descriptor(all_known[index], tensor)) return true;
+        return false;
+    }
+};
+
+static void read_payload(const Archive::Impl& impl, const TensorDescriptor& tensor, std::vector<uint8_t>& output) {
+    if (!impl.known(tensor)) fail(tensor.name + ": descriptor does not belong to this archive");
+    read_file_payload(impl.directory / tensor.file, tensor, output);
+}
+
 static uint32_t marker_for(const Archive::Impl& impl, const TensorDescriptor& tensor) {
     if ((tensor.dtype != "I32" && tensor.dtype != "U32") || !(tensor.shape.empty() || tensor.shape == std::vector<uint64_t>{1}) || tensor.bytes != 4)
         fail(tensor.name + ": codebook marker must be an I32/U32 scalar");
@@ -289,7 +326,7 @@ static uint32_t marker_for(const Archive::Impl& impl, const TensorDescriptor& te
 
 static void preload_markers(Archive::Impl& impl) {
     std::map<std::string, std::vector<const TensorDescriptor*>> by_file;
-    for (const TensorDescriptor& tensor : impl.all_known) {
+    for (const TensorDescriptor& tensor : impl.effective) {
         const size_t dot = tensor.name.rfind('.');
         if (dot == std::string::npos) continue;
         const std::string suffix = tensor.name.substr(dot);
@@ -499,8 +536,11 @@ Archive::Archive(const std::filesystem::path& directory) : impl_(std::make_uniqu
     std::sort(impl_->effective.begin(), impl_->effective.end(), [](const auto& a, const auto& b) { return a.name < b.name; });
     impl_->effective_by_name.clear();
     for (size_t i = 0; i < impl_->effective.size(); ++i) impl_->effective_by_name.emplace(impl_->effective[i].name, i);
+    impl_->known_by_name.clear();
+    for (size_t i = 0; i < impl_->all_known.size(); ++i) impl_->known_by_name[impl_->all_known[i].name].push_back(i);
     preload_markers(*impl_);
     build_linears(*impl_);
+    for (size_t i = 0; i < impl_->linears.size(); ++i) impl_->linear_by_name.emplace(impl_->linears[i].name, i);
 }
 
 Archive::~Archive() = default;
@@ -515,6 +555,10 @@ const std::vector<TensorDescriptor>& Archive::tensors() const { return impl_->ef
 const std::vector<LinearDescriptor>& Archive::linears() const { return impl_->linears; }
 const std::vector<SidecarDescriptor>& Archive::sidecars() const { return impl_->sidecars; }
 const TensorDescriptor* Archive::find_tensor(const std::string& name) const { return impl_->find(name); }
+const LinearDescriptor* Archive::find_linear(const std::string& name) const {
+    const auto it = impl_->linear_by_name.find(name);
+    return it == impl_->linear_by_name.end() ? nullptr : &impl_->linears[it->second];
+}
 bool Archive::has_declared_total_size() const { return impl_->has_total; }
 uint64_t Archive::declared_total_size() const { return impl_->total; }
 uint64_t Archive::indexed_payload_bytes() const { return impl_->payload_bytes; }
@@ -522,13 +566,7 @@ uint64_t Archive::indexed_payload_bytes() const { return impl_->payload_bytes; }
 void Archive::read_tensor(const TensorDescriptor& tensor, std::vector<uint8_t>& bytes) const { read_payload(*impl_, tensor, bytes); }
 
 void Archive::materialize(const LinearDescriptor& linear, MaterializedMatrix& output) const {
-    const LinearDescriptor* canonical = nullptr;
-    for (const LinearDescriptor& candidate : impl_->linears) {
-        if (candidate.name == linear.name) {
-            canonical = &candidate;
-            break;
-        }
-    }
+    const LinearDescriptor* canonical = find_linear(linear.name);
     if (canonical == nullptr) fail(linear.name + ": linear descriptor is not from this archive");
     const auto same_optional = [](const std::optional<TensorDescriptor>& a,
                                   const std::optional<TensorDescriptor>& b) {

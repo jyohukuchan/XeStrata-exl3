@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -31,6 +32,27 @@ struct TensorDescriptor {
     uint64_t data_offset_absolute = 0;
     uint64_t bytes = 0;
 };
+
+/// A single validated safetensors header.  This public inspector is useful for
+/// specialized sidecars that must be opened without scanning an indexed model
+/// archive.  JSON types stay private to the implementation.
+struct SafetensorsHeader {
+    std::filesystem::path path;
+    std::string file;
+    uint64_t data_start = 0;
+    uint64_t file_bytes = 0;
+    std::map<std::string, std::string> metadata;
+    std::vector<TensorDescriptor> tensors;
+
+    const TensorDescriptor* find(const std::string& name) const;
+};
+
+/// Validate one safetensors file's JSON, dtype/shape byte spans, duplicate
+/// keys and non-overlap.  This performs header-only inspection.
+SafetensorsHeader inspect_safetensors(const std::filesystem::path& path);
+
+/// Blocking read of one descriptor from a previously inspected header.
+void read_tensor(const SafetensorsHeader& header, const TensorDescriptor& tensor, std::vector<uint8_t>& bytes);
 
 enum class SidecarRole {
     specialized_ngram_codec,
@@ -110,6 +132,7 @@ public:
     const std::vector<LinearDescriptor>& linears() const;
     const std::vector<SidecarDescriptor>& sidecars() const;
     const TensorDescriptor* find_tensor(const std::string& name) const;
+    const LinearDescriptor* find_linear(const std::string& name) const;
 
     /// `metadata.total_size` is advisory.  A stale value is exposed to callers
     /// for reporting but never makes a valid header fail to open.

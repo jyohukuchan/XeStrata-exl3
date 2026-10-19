@@ -19,6 +19,9 @@ but execution bit widths and codebooks come from the trellis tensors and markers
 exceptions, cb0, mcg, mul1, F16 scales, legacy sign bitfields and F16/F32 biases. `materialize()` reads only
 the selected matrix's compressed components without producing an expanded weight matrix. Unquantized
 tensors retain their raw descriptors.
+`find_linear()` looks up descriptors by name. The expert factory packs gate/up/down into one blob,
+preserving each component's offset, bit width and codebook. The same layout recreates views after
+copying the blob to a different address. This factory does not include raw experts.
 
 Safetensors outside the index are enumerated as well. `exl3_ngram_trellis` is kept separate from ordinary
 linears. The known `mtp_hyper_connection_mixer_patch.safetensors` is applied after the base, with its
@@ -45,6 +48,8 @@ The dedicated n-gram decoder treats its leading F16 row scale and 160-value ring
 linears. CPU can select requested row IDs; SYCL processes packed rows already fetched by the caller.
 Head bias uses explicit head IDs. Outputs are FP32 with padded strides; callers separately choose any final
 F16 rounding required by model arithmetic. This row codec is separate from model-runtime sidecar I/O and caches.
+The dedicated blocking `exl3_ngram::Reader` validates sidecar shards and head ranges and reads only
+requested rows. It also computes row IDs using the sidecar's multipliers, signed-int64 overflow and EOS boundaries.
 
 With NumPy available and tests enabled, build and run the CTests backed by independent fixtures.
 
@@ -69,7 +74,9 @@ Shapes must match: rows are neither silently truncated nor converted to another 
 currently serves single-GPU CLI runs and rejects combinations with a GGUF native head, MTP, serve, batch
 or pipeline windows. The trunk and embedding keep using the existing pack/native paths.
 
-`Exl3Dense` uploads and owns the compressed device components. Each participating stream's scratch is
+`Exl3Dense` uploads and owns the compressed device components. When an unquantized `lm_head.weight`
+is present, it retains the original F16/BF16/F32 dtype on upload and uses a dedicated raw linear operation.
+Bias shapes are validated before conversion to FP32. Each participating stream's scratch is
 prepared before graph capture, and the owner outlives those graphs. `lm_head()` selects EXL3 before
 interpreting canonical planes and passes the head mixer's FP32 output directly.
 

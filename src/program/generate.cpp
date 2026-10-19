@@ -4603,7 +4603,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
-        std::fprintf(stderr, "strata generate: experimental packed EXL3 lm_head attached\n");
+        std::fprintf(stderr, "strata generate: experimental EXL3 archive lm_head attached\n");
     }
     if (!o.native_head_gguf.empty() && !multi_gpu) {   // a layer split's head is on its last stage
         const auto head_t0 = std::chrono::steady_clock::now();

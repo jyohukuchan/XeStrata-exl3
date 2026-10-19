@@ -18,6 +18,9 @@ codebook は trellis と marker から決める。
 `linears()` は各行列の独立した descriptor を返す。2～5bit に加え、head などの1・6・7・8bitの例外、
 cb0、mcg、mul1、F16 scale、旧形式の符号 bitfield、F16/F32 biasを扱う。`materialize()` は指定した
 行列の圧縮成分だけを読み、展開済みの重み全体は作らない。非量子化 tensor は raw descriptor として残る。
+`find_linear()` は名前で descriptor を検索する。expert factory は gate/up/down を一つの blob にまとめ、
+各成分の offset、bit 幅、codebook を保持する。blob を別のアドレスへコピーした後も同じ layout から
+view を作れる。raw expert はこの factory の対象に含まない。
 
 index 外の safetensors も列挙する。`exl3_ngram_trellis` は通常の linear と区別する。
 既知の `mtp_hyper_connection_mixer_patch.safetensors` は本体より後に適用し、元のファイルと override を
@@ -43,6 +46,8 @@ event 依存を受け取り、scratch は呼び出し側が確保する。CPU �
 CPU は要求した row ID を選べ、SYCL は取得済みの packed rowを処理する。head bias は明示した head IDで
 選ぶ。FP32 出力と padding を扱い、呼び出し側はモデルの演算に必要な最後の F16 丸めを別に行う。
 これは row codec の部品であり、model runtime の sidecar I/O と cache への接続は別に行う。
+専用の blocking `exl3_ngram::Reader` は sidecar の shard と head 範囲を検証し、要求された行だけを読む。
+sidecar の multiplier、signed-int64 overflow、EOS 境界を使う row ID 計算も提供する。
 
 NumPy のある環境で tests を有効にしてビルドすると、独立した fixture を使った CTest を実行できる。
 
@@ -67,7 +72,9 @@ Flash の CLI に `--exl3-head DIR` を加えると、その archive の `lm_hea
 現在の接続は single GPU の CLI 用で、GGUF native head、MTP、serve、batch、pipeline windows との併用は
 拒否する。trunk と embedding は既存の pack/native 経路を使う。
 
-`Exl3Dense` が圧縮成分を device へ転送して所有する。使用する各 stream の scratch は graph capture 前に
+`Exl3Dense` が圧縮成分を device へ転送して所有する。非量子化の `lm_head.weight` がある場合は
+F16/BF16/F32 の元 dtype を保って転送し、専用の raw linear で計算する。bias は shape を検証して FP32 にする。
+使用する各 stream の scratch は graph capture 前に
 準備し、owner はその graph より長く生存する。`lm_head()` は canonical の plane を解釈する前に EXL3 を
 選び、head mixer の FP32 出力をそのまま渡す。
 

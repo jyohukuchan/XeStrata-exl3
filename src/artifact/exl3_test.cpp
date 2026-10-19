@@ -278,6 +278,14 @@ void run_malformed() {
 
     make_base(R"({"model_type":"bad"})");
     write_safetensors(base / "model.safetensors",
+                      {{"x.trellis", trellis(2, 1)}, {"x.suh", f16_vector(128)}, {"x.svh", f16_vector(128)},
+                       {"x.mul1", Tensor{"U32", {}, u32(0x83DCD12Du)}}});
+    write_safetensors(base / kPatchFile, {{"x.mul1", Tensor{"U32", {}, u32(0x12345678u)}}});
+    check(rejected([&] { artifact::Archive archive(base); }), "invalid known-patch marker overrides valid base marker");
+    std::filesystem::remove_all(base);
+
+    make_base(R"({"model_type":"bad"})");
+    write_safetensors(base / "model.safetensors",
                       {{"x.trellis", trellis(9, 1)}, {"x.suh", f16_vector(128)}, {"x.svh", f16_vector(128)}});
     check(rejected([&] { artifact::Archive archive(base); }), "bit width above 8 is rejected");
     std::filesystem::remove_all(base);
