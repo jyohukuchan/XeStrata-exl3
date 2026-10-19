@@ -157,6 +157,28 @@ const void* NativeEmbed::table_for(void* stream) const {
     return copies_[(size_t) dev];
 }
 
+bool NativeEmbed::prepare_stream(void* stream, std::string& err) const {
+    err.clear();
+    if (host_ == nullptr || dev_ == nullptr) {
+        err = "native embedding: prepare_stream requires a loaded table";
+        return false;
+    }
+    try {
+        if (stream != nullptr && Runtime::owner_of_stream(stream) == nullptr) {
+            err = "native embedding: stream has no runtime owner";
+            return false;
+        }
+        if (table_for(stream) == nullptr) {
+            err = "native embedding: stream has no table mapping";
+            return false;
+        }
+        return true;
+    } catch (const std::exception& e) {
+        err = std::string("native embedding: preparing stream: ") + e.what();
+        return false;
+    }
+}
+
 bool NativeEmbed::load(const std::string& path, int64_t n_embd, int64_t n_vocab, std::string& err) {
     if (host_ != nullptr) { err = "native embedding is already loaded"; return false; }
     try {

@@ -190,8 +190,19 @@ FP32 activation を受け取る。HC norm は別の F32 vector を使う。モ�
 借用した `WeightTable` に登録する。head と最後の HC mixer は明示して追加できる。各 stream の準備を
 capture 前に済ませ、解放時は device の処理完了を待って自分の登録だけを戻す。embedding、routed expert、
 PLE、MTP は別の owner に接続する。
+`read_exl3_model_spec()` は archive の HF config から Qwen3.5/Qwen3.8 の geometry を読み、
+GGUF の weight や仮の pack を必要としない。trunk と MTP を区別し、Qwen3.8 の MTP は
+専用 loader へ接続するまで要求時に拒否する。
+`Exl3Ple` は PLE の key/value projection を packed/raw のまま所有し、三つの norm は `+1` を適用して
+FP32、conv は元の F16 として保持する。layer/verify は事前投影した FP32 の key/value を既存 PLE
+post-op に渡す。norm、conv、projection の shape と PLE config は読み込み時に検証する。
 `NativeEmbed::load_exl3()` は raw F16/BF16/F32 embedding の元の dtype を保ち、host token と device token ID
-の両方から行を取得する。owner と embedding の stream は capture 前に準備する。
+の両方から行を取得する。`prepare_stream()` は必要な device ごとの host table copy を capture 前に用意する。
+owner と embedding は、それを使う graph より長く生存させる。
+
+`Exl3FlashModel` は Qwen3.8 の単 token AR を所有する。device ごとの層範囲、embedding、PLE、
+expert の CPU/GPU merge、HC、head を接続し、stage 間では residual を転送する。開発用の
+`exl3_flash_probe` は token ID を直接受け取る。現時点では MTP、vision、複数 token の window を要求すると拒否する。
 
 この経路の数値・機能確認と、同じ元重み・実効保存量での品質比較は別に行う。最適化前の部品や初期接続の
 速度は診断値として扱い、decode 速度を維持できるかの判定には使わない。

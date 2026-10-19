@@ -19,6 +19,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
+#include <utility>
 
 namespace strata::artifact::exl3 {
 namespace {
@@ -276,6 +277,25 @@ void read_tensor(const SafetensorsHeader& header, const TensorDescriptor& tensor
     const TensorDescriptor* known = header.find(tensor.name);
     if (known == nullptr || !same_descriptor(*known, tensor)) fail(tensor.name + ": descriptor does not belong to this header");
     read_file_payload(header.path, tensor, bytes);
+}
+
+void read_tensor_range(const SafetensorsHeader& header, const TensorDescriptor& tensor, uint64_t relative_offset,
+                       uint64_t bytes, std::vector<uint8_t>& output) {
+    const TensorDescriptor* known = header.find(tensor.name);
+    if (known == nullptr || !same_descriptor(*known, tensor))
+        fail(tensor.name + ": descriptor does not belong to this header");
+    if (relative_offset > tensor.bytes || bytes > tensor.bytes - relative_offset)
+        fail(tensor.name + ": requested tensor range is outside its payload");
+    if (relative_offset > std::numeric_limits<uint64_t>::max() - tensor.data_offset ||
+        relative_offset > std::numeric_limits<uint64_t>::max() - tensor.data_offset_absolute)
+        fail(tensor.name + ": requested tensor range offset overflows");
+    TensorDescriptor range = tensor;
+    range.data_offset += relative_offset;
+    range.data_offset_absolute += relative_offset;
+    range.bytes = bytes;
+    std::vector<uint8_t> result;
+    read_file_payload(header.path, range, result);
+    output = std::move(result);
 }
 
 struct Archive::Impl {
@@ -564,6 +584,23 @@ uint64_t Archive::declared_total_size() const { return impl_->total; }
 uint64_t Archive::indexed_payload_bytes() const { return impl_->payload_bytes; }
 
 void Archive::read_tensor(const TensorDescriptor& tensor, std::vector<uint8_t>& bytes) const { read_payload(*impl_, tensor, bytes); }
+
+void Archive::read_tensor_range(const TensorDescriptor& tensor, uint64_t relative_offset, uint64_t bytes,
+                                std::vector<uint8_t>& output) const {
+    if (!impl_->known(tensor)) fail(tensor.name + ": descriptor does not belong to this archive");
+    if (relative_offset > tensor.bytes || bytes > tensor.bytes - relative_offset)
+        fail(tensor.name + ": requested tensor range is outside its payload");
+    if (relative_offset > std::numeric_limits<uint64_t>::max() - tensor.data_offset ||
+        relative_offset > std::numeric_limits<uint64_t>::max() - tensor.data_offset_absolute)
+        fail(tensor.name + ": requested tensor range offset overflows");
+    TensorDescriptor range = tensor;
+    range.data_offset += relative_offset;
+    range.data_offset_absolute += relative_offset;
+    range.bytes = bytes;
+    std::vector<uint8_t> result;
+    read_file_payload(impl_->directory / range.file, range, result);
+    output = std::move(result);
+}
 
 void Archive::materialize(const LinearDescriptor& linear, MaterializedMatrix& output) const {
     const LinearDescriptor* canonical = find_linear(linear.name);

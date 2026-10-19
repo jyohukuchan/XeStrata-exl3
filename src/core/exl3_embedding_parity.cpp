@@ -194,6 +194,9 @@ int main() {
             if (!embed.load_exl3(archive, "token_embd", fixture.n_embd, fixture.n_vocab, error)) {
                 std::cerr << dtype << " load: " << error << '\n'; ++failures; continue;
             }
+            if (!embed.prepare_stream(stream, error)) {
+                std::cerr << dtype << " stream prepare: " << error << '\n'; ++failures; continue;
+            }
             const int expected_type = dtype == "F16" ? 1 : dtype == "BF16" ? 30 : 0;
             if (embed.type() != expected_type) { std::cerr << dtype << " type mismatch\n"; ++failures; }
             const int gather_failures = check_gather(embed, fixture, dtype, stream);

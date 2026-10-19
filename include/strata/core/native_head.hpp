@@ -56,6 +56,8 @@ public:
     bool load(const std::string& gguf, int64_t n_embd, int64_t n_vocab, std::string& err);
     bool load_exl3(const strata::artifact::exl3::Archive& archive, const std::string& hf_name, int64_t n_embd,
                    int64_t n_vocab, std::string& err);
+    /// Pin any copy needed by this stream's device before graph capture.
+    bool prepare_stream(void* stream, std::string& err) const;
     /// Rows for device token ids.
     void gather_dev(const int32_t* tokens, int64_t n_tok, float* out, void* stream) const;
     /// One row for a host token id.

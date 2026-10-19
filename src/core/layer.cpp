@@ -1458,8 +1458,23 @@ bool block_layer_pre(const WeightTable& tables, const ModelGeometry& g, int64_t 
         // `result` IS THE RESIDUAL, in place: the block computes `hidden[i] + gated[i] + conv[i]` elementwise,
         // so reading and writing `R` at the same index is well-defined.
         po.result = bb.R;
+        strata::kernels::PleWeights pw = ple->w;
+        if (ple->key_exl3 != nullptr || ple->value_exl3 != nullptr) {
+            if (ple->key_exl3 == nullptr || ple->value_exl3 == nullptr || ple->pre_key_out == nullptr ||
+                ple->pre_value_out == nullptr) {
+                err = "block_layer_pre PLE: EXL3 key/value owners and preprojection outputs must be paired";
+                return false;
+            }
+            if (!ple->key_exl3->run(ple->emb_dev, strata::kernels::NG_N_EMBD, ple->pre_key_out,
+                                    strata::kernels::NG_HC_DIM, 1, stream, err) ||
+                !ple->value_exl3->run(ple->emb_dev, strata::kernels::NG_N_EMBD, ple->pre_value_out,
+                                       strata::kernels::NG_N_EMBD, 1, stream, err))
+                return false;
+            pw.pre_key = ple->pre_key_out;
+            pw.pre_value = ple->pre_value_out;
+        }
         try {
-            strata::kernels::ple_block(ple->emb_dev, bb.R, ple->hist, ple->w, po, ple->scratch, stream);
+            strata::kernels::ple_block(ple->emb_dev, bb.R, ple->hist, pw, po, ple->scratch, stream);
         } catch (const std::exception& error) {
             err = std::string("block_layer_pre PLE: ") + error.what();
             return false;
@@ -1530,8 +1545,13 @@ st_begin(layer, 0, stream);
     if (run3) {
 st_begin(layer, 3, stream);
     if (hc_owner[1]) {
-        gr_write(R, bb.block_out, bb.inject, gs, R, stream);
-        if (!gr_read_exl3(*w_norm[1], *w_down[1], *w_up[1], w_inject[1], R, gs, bb.gr, bb.mixed, bb.inject2, stream, err))
+        // Stage 2 already applied attention unless the fused legacy read
+        // deferred it. Never add that same residual twice for EXL3 owners.
+        if (fused && !hc_owner[0]) gr_write(R, bb.block_out, bb.inject, gs, R, stream);
+        // The unfused post consumes the reused inject buffer; only the
+        // fused pending-write protocol carries a separate FFN injection.
+        float* ffn_inject = fused ? bb.inject2 : bb.inject;
+        if (!gr_read_exl3(*w_norm[1], *w_down[1], *w_up[1], w_inject[1], R, gs, bb.gr, bb.mixed, ffn_inject, stream, err))
             return false;
     } else if (fused) {
         strata::kernels::FusedGrArgs fa;
@@ -1556,7 +1576,7 @@ st_begin(layer, 3, stream);
 bool ple_issue_token(const PleRun& p, std::string& err) {
     if (!p.ready()) { err = "ple_issue_token: the PLE run is not ready"; return false; }
     uint32_t rows[strata::kernels::PLE_N_HEADS];
-    strata::kernels::ngram_rows(p.token, p.prev, 1, p.consts, rows);
+    p.table->lookup_rows(p.token, p.prev, 1, p.consts, rows);
     if (!p.table->issue(rows)) { err = "ple_issue_token: the previous token's rows were never collected"; return false; }
     return true;
 }

@@ -197,8 +197,19 @@ norm transformations; these components alone do not start a complete EXL3 model.
 registering them in a borrowed `WeightTable`. The head and final HC mixer can be included explicitly. Prepare each
 stream before capture; teardown waits for the device and restores only its own registrations. Embeddings, routed
 experts, PLE and MTP connect through separate owners.
+`read_exl3_model_spec()` reads Qwen3.5/Qwen3.8 geometry directly from the archive's HF config without GGUF
+weights or a synthetic pack. It separates trunk and MTP; requesting Qwen3.8 MTP is rejected until
+its dedicated loader is connected.
+`Exl3Ple` owns PLE key/value projections in packed/raw storage, applies `+1` to its three norms for FP32 kernels,
+and retains the original F16 convolution. Layer/verify paths pass preprojected FP32 keys and values to the existing
+PLE post-ops. Loading validates norm, convolution and projection shapes and the PLE config.
 `NativeEmbed::load_exl3()` preserves raw F16/BF16/F32 embedding dtypes and gathers rows from either host tokens
-or device token IDs. Owner and embedding streams are prepared before capture.
+or device token IDs. `prepare_stream()` prepares any host-table copy needed by each device before capture.
+Owners and embedding tables must outlive their captured graphs.
+
+`Exl3FlashModel` owns single-token Qwen3.8 AR execution. It connects per-device layer ranges, embedding, PLE,
+CPU/GPU expert merging, HC, and the head, transferring the residual between stages. The developer
+`exl3_flash_probe` accepts token IDs directly. Requests for MTP, vision, or multi-token windows are currently rejected.
 
 Numerical and functional checks of this path are separate from quality comparisons at the same source
 weights and effective storage. Speeds from components and early integration before optimization are

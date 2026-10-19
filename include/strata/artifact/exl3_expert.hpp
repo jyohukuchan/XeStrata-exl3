@@ -21,6 +21,34 @@ struct ExpertTensorNames {
     std::string down;
 };
 
+/// Names and optional geometry for a fused raw MTP expert source. The source
+/// stores gate/up as [experts, 2*ff, hidden] and down as [experts, hidden, ff].
+/// Zero geometry fields mean "derive from the validated headers".
+struct RawExpertTensorNames {
+    std::string gate_up;
+    std::string down;
+    int64_t experts = 0;
+    int64_t hidden = 0;
+    int64_t feed_forward = 0;
+};
+
+/// One 2-D projection slice inside a fused raw tensor. Offsets are relative
+/// to that tensor's payload and are consumed by Archive::read_tensor_range.
+struct RawExpertSlice {
+    std::string tensor;
+    uint64_t relative_offset = 0;
+    uint64_t bytes = 0;
+    int64_t k = 0;
+    int64_t n = 0;
+    strata::kernels::raw::DType dtype = strata::kernels::raw::DType::F32;
+};
+
+struct RawExpertSlices {
+    RawExpertSlice gate;
+    RawExpertSlice up;
+    RawExpertSlice down;
+};
+
 /// Typed host storage for one packed or raw expert.  The uint64_t backing
 /// storage provides a stable alignment for raw F32 projections while packed
 /// component bytes remain byte exact.
@@ -45,5 +73,18 @@ bool describe_expert(const Archive& archive, const ExpertTensorNames& names,
 /// source bytes and dtype metadata. No full decoded matrix is created.
 bool materialize_expert(const Archive& archive, const ExpertTensorNames& names, ExpertBlob& output, std::string& err,
                         size_t alignment = 8);
+
+/// Describe one expert's three 2-D slices without reading tensor payloads.
+bool describe_raw_expert_slices(const Archive& archive, const RawExpertTensorNames& names, int64_t expert,
+                                RawExpertSlices& output, std::string& err);
+bool describe_raw_expert_slices(const SafetensorsHeader& header, const RawExpertTensorNames& names, int64_t expert,
+                                RawExpertSlices& output, std::string& err);
+
+/// Read only the described slices into the existing raw ExpertBlob format.
+/// The destination remains unchanged on failure and source dtypes are retained.
+bool materialize_raw_expert_slices(const Archive& archive, const RawExpertSlices& slices, ExpertBlob& output,
+                                   std::string& err, size_t alignment = 8);
+bool materialize_raw_expert_slices(const SafetensorsHeader& header, const RawExpertSlices& slices, ExpertBlob& output,
+                                   std::string& err, size_t alignment = 8);
 
 }  // namespace strata::artifact::exl3

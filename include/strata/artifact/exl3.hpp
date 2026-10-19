@@ -54,6 +54,12 @@ SafetensorsHeader inspect_safetensors(const std::filesystem::path& path);
 /// Blocking read of one descriptor from a previously inspected header.
 void read_tensor(const SafetensorsHeader& header, const TensorDescriptor& tensor, std::vector<uint8_t>& bytes);
 
+/// Read one bounded byte range from a standalone inspected safetensors file.
+/// The offset is relative to the tensor payload and the destination is left
+/// unchanged when validation or I/O fails.
+void read_tensor_range(const SafetensorsHeader& header, const TensorDescriptor& tensor, uint64_t relative_offset,
+                       uint64_t bytes, std::vector<uint8_t>& output);
+
 enum class SidecarRole {
     specialized_ngram_codec,
     known_override_patch,
@@ -143,6 +149,12 @@ public:
     /// Read exactly one validated tensor payload into caller-owned storage.
     /// This is deliberately per-tensor and never loads a model or shard set.
     void read_tensor(const TensorDescriptor& tensor, std::vector<uint8_t>& bytes) const;
+
+    /// Read one bounded byte range from one validated tensor payload. The
+    /// offset is relative to the tensor's data span; no range outside that
+    /// span or the physical shard can be requested.
+    void read_tensor_range(const TensorDescriptor& tensor, uint64_t relative_offset, uint64_t bytes,
+                           std::vector<uint8_t>& output) const;
 
     /// Read and materialize one linear, converting legacy I16 sign bitfields
     /// and F32 bias values to binary16 bits.  Only the selected linear's

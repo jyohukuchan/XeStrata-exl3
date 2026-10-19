@@ -53,6 +53,8 @@
 
 namespace strata::core {
 
+class Exl3Dense;
+
 /// Select pinned CUDA BF16/F32 projections for SSM gates, routing and the sparse indexer.
 /// Configure before session capture; captured graphs retain the selected implementation.
 /// Does not change GR, PLE or the shared expert's scalar gate.
@@ -566,6 +568,14 @@ struct PleRun {
     /// SKIPS the module entirely, which is what every measurement before this change did.
     strata::kernels::PleTable* table = nullptr;
     strata::kernels::PleWeights w;
+    /// Optional EXL3 PLE projection owners.  Their FP32 outputs are bound to
+    /// `w.pre_key`/`w.pre_value` before the captured PLE block runs.
+    Exl3Dense* key_exl3 = nullptr;
+    Exl3Dense* value_exl3 = nullptr;
+    /// Persistent one-row device outputs used by the captured single-token
+    /// layer path. Verify supplies its existing `ple_key_`/`ple_val_` rows.
+    float* pre_key_out = nullptr;
+    float* pre_value_out = nullptr;
     /// The session's PLE state, by pointer so `block_layer_pre` needs no `SessionState`.
     const int32_t* token = nullptr;    ///< the token being decoded
     const int32_t* prev = nullptr;     ///< (2,) predecessors, OLDEST FIRST, `-1` where there is none
@@ -579,11 +589,14 @@ struct PleRun {
     float* scratch = nullptr;
     strata::kernels::PleConsts consts;
     bool ready() const {
+        const bool key_projection = key_exl3 != nullptr ||
+                                    (w.key_codes != nullptr && w.key_scales != nullptr) ||
+                                    w.key_bf16 != nullptr || w.key_native_data != nullptr;
+        const bool value_projection = value_exl3 != nullptr || w.value_bf16 != nullptr;
+        const bool owner_pair = (key_exl3 == nullptr) == (value_exl3 == nullptr);
         return table != nullptr && table->is_open() && hist != nullptr && emb_dev != nullptr &&
                emb_host != nullptr && scratch != nullptr && token != nullptr && prev != nullptr &&
-               ((w.key_codes != nullptr && w.key_scales != nullptr) || w.key_bf16 != nullptr ||
-                w.key_native_data != nullptr) &&
-               w.value_bf16 != nullptr &&
+               owner_pair && key_projection && value_projection &&
                w.norm_key != nullptr && w.norm_query != nullptr && w.norm_conv != nullptr &&
                w.conv1d_f16 != nullptr;
     }

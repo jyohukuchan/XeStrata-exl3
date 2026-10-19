@@ -188,7 +188,8 @@ target_link_libraries(strata_artifact INTERFACE strata_warnings)
 # Native EXL3 headers carry JSON metadata; keep the parser private to this
 # host-only archive instead of adding a dependency to every GGUF consumer.
 add_library(strata_exl3_artifact STATIC src/artifact/exl3.cpp src/artifact/exl3_remap.cpp
-                                         src/artifact/exl3_raw.cpp src/artifact/exl3_model_map.cpp)
+                                         src/artifact/exl3_raw.cpp src/artifact/exl3_model_map.cpp
+                                         src/artifact/exl3_model_spec.cpp)
 target_link_libraries(strata_exl3_artifact PUBLIC strata_artifact)
 target_include_directories(strata_exl3_artifact SYSTEM PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/main/nlohmann-json)
@@ -217,9 +218,19 @@ if(STRATA_BUILD_TESTS)
   add_executable(exl3_raw_test src/artifact/exl3_raw_test.cpp)
   target_link_libraries(exl3_raw_test PRIVATE strata_exl3_artifact)
   add_test(NAME exl3_raw_test COMMAND exl3_raw_test)
+  add_executable(exl3_raw_slice_test src/artifact/exl3_raw_slice_test.cpp)
+  target_link_libraries(exl3_raw_slice_test PRIVATE strata_exl3_expert_artifact)
+  target_include_directories(exl3_raw_slice_test SYSTEM PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/main/nlohmann-json)
+  add_test(NAME exl3_raw_slice_test COMMAND exl3_raw_slice_test)
   add_executable(exl3_model_map_test src/artifact/exl3_model_map_test.cpp)
   target_link_libraries(exl3_model_map_test PRIVATE strata_exl3_artifact)
   add_test(NAME exl3_model_map_test COMMAND exl3_model_map_test)
+  add_executable(exl3_model_spec_test src/artifact/exl3_model_spec_test.cpp)
+  target_link_libraries(exl3_model_spec_test PRIVATE strata_exl3_artifact)
+  target_include_directories(exl3_model_spec_test SYSTEM PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/main/nlohmann-json)
+  add_test(NAME exl3_model_spec_test COMMAND exl3_model_spec_test)
   add_executable(exl3_expert_artifact_test src/artifact/exl3_expert_test.cpp)
   target_link_libraries(exl3_expert_artifact_test PRIVATE strata_exl3_expert_artifact)
   target_include_directories(exl3_expert_artifact_test SYSTEM PRIVATE
@@ -297,6 +308,11 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(exl3_table_test SYSTEM PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/main/nlohmann-json)
   add_test(NAME exl3_table_test COMMAND exl3_table_test)
+  add_executable(exl3_hash_test src/ngram/exl3_hash_test.cpp)
+  target_link_libraries(exl3_hash_test PRIVATE strata_ngram)
+  target_include_directories(exl3_hash_test SYSTEM PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/main/nlohmann-json)
+  add_test(NAME exl3_hash_test COMMAND exl3_hash_test)
 endif()
 
 # ---- Intel Xe foundation --------------------------------------------------
@@ -463,7 +479,8 @@ if(STRATA_ENABLE_XE)
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp
                                    src/core/remote_experts.cpp src/core/expert_cache.cpp src/core/native_head.cpp
                                    src/core/native_dense.cpp src/core/exl3_dense.cpp
-                                   src/core/exl3_weight_set.cpp src/core/verify.cpp
+                                   src/core/exl3_weight_set.cpp src/core/exl3_ple.cpp
+                                   src/core/exl3_flash_model.cpp src/core/verify.cpp
                                    src/core/exl3_expert_source.cpp src/core/exl3_expert_formats.cpp
                                    src/core/exl3_expert_runtime.cpp
                                    src/core/moe_window.cpp
@@ -472,6 +489,8 @@ if(STRATA_ENABLE_XE)
                                    src/core/conversation_memory.cpp src/core/conversation_disk.cpp
                                    src/core/conversation_file.cpp src/core/vmm.cpp)
   target_include_directories(strata_engine PUBLIC include)
+  target_include_directories(strata_engine SYSTEM PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/main/nlohmann-json)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu
     strata_exl3_expert_artifact)
   # c-blosc2 (libblosc2-dev; free, BSD-3), optional: --conversation-save-compress stores the saved conversations'
@@ -732,6 +751,11 @@ if(STRATA_ENABLE_XE)
       ${CMAKE_CURRENT_SOURCE_DIR}/third_party/main/nlohmann-json)
     add_test(NAME exl3_layout_test COMMAND exl3_layout_test)
     set_tests_properties(exl3_layout_test PROPERTIES SKIP_RETURN_CODE 77)
+    add_executable(exl3_ple_test src/core/exl3_ple_test.cpp)
+    target_link_libraries(exl3_ple_test PRIVATE strata_engine)
+    add_test(NAME exl3_ple_test COMMAND exl3_ple_test)
+    add_executable(exl3_flash_probe src/core/exl3_flash_probe.cpp)
+    target_link_libraries(exl3_flash_probe PRIVATE strata_engine)
     add_executable(exl3_projection_parity src/core/exl3_projection_parity.cpp)
     target_link_libraries(exl3_projection_parity PRIVATE strata_engine)
     target_include_directories(exl3_projection_parity SYSTEM PRIVATE

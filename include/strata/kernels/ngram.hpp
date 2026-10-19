@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2025 Turboderp
+// SPDX-FileCopyrightText: 2026 jyohukuchan
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
@@ -191,6 +193,13 @@ public:
     /// `gather_batch` takes them when its rows are the ones read ahead, in order.  Elsewhere a no-op.
     void prefetch_rows(const uint32_t* rows16);
     void wait_prefetches();
+
+    /// Produce token-major PLE row IDs without allocating. Legacy GGUF tables
+    /// use `ngram_rows` exactly; an EXL3 sidecar uses its signed-int64 wrap,
+    /// remainder and EOS metadata. `prev` is oldest-first, two entries per
+    /// token, matching `ngram_rows`' existing caller contract.
+    void lookup_rows(const int32_t* tokens, const int32_t* prev, int n_tokens, const PleConsts& legacy,
+                     uint32_t* out) const;
 
     /// Fault injection (Direct mode): every row read completes no earlier than `us` after issue.
     void set_injected_delay_us(double us);

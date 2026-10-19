@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2025 Turboderp
+// SPDX-FileCopyrightText: 2026 jyohukuchan
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
@@ -71,7 +73,7 @@ void ngram_rows(const int32_t* tokens, const int32_t* prev, int n_tokens, const 
             // `prev` is OLDEST FIRST, so predecessor `s` positions back is entry (n_prev - s): s=1 reads the
             // NEWEST.  Reading index (s-1) instead walks the window backwards, which still produces indices
             // in range and so cannot be caught by a range check - only by an oracle.
-            const int32_t t = cut ? TOKEN_NULL : prev[i * n_prev + (n_prev - s)];
+            const int32_t t = cut ? TOKEN_NULL : prev[static_cast<size_t>(i) * n_prev + (n_prev - s)];
             // The cut is evaluated BEFORE the value is stored, so the position whose predecessor was EOS is
             // itself EOS.  Storing first and then cutting would leave position s holding the real token while
             // position s+1 became EOS - one token of history too much.
@@ -254,6 +256,47 @@ struct PleTable::Impl {
         return true;
     }
 };
+
+void PleTable::lookup_rows(const int32_t* tokens, const int32_t* prev, int n_tokens, const PleConsts& legacy,
+                           uint32_t* out) const {
+    if (!impl_->exl3_mode || !impl_->exl3_reader) {
+        ngram_rows(tokens, prev, n_tokens, legacy, out);
+        return;
+    }
+    const auto& multipliers = impl_->exl3_reader->layer_multipliers();
+    const auto& offsets = impl_->exl3_reader->head_offsets();
+    const auto& vocab = impl_->exl3_reader->head_vocab_sizes();
+    if (multipliers.size() != NGRAM_SIZE || offsets.size() != PLE_N_HEADS || vocab.size() != PLE_N_HEADS)
+        throw std::runtime_error("EXL3 n-gram hash metadata dimensions disagree");
+    if (tokens == nullptr || prev == nullptr || out == nullptr || n_tokens <= 0)
+        throw std::invalid_argument("EXL3 n-gram hash arguments are invalid");
+    constexpr int n_prev = NGRAM_SIZE - 1;
+    for (int i = 0; i < n_tokens; ++i) {
+        int64_t context[NGRAM_SIZE];
+        context[0] = tokens[i];
+        bool cut = false;
+        for (int s = 1; s < NGRAM_SIZE; ++s) {
+            const int32_t value = prev[static_cast<size_t>(i) * n_prev + (n_prev - s)];
+            cut = cut || value < 0 || value == PLE_EOS_TOKEN_ID;
+            context[s] = cut ? PLE_EOS_TOKEN_ID : value;
+        }
+        for (int n = 2; n <= NGRAM_SIZE; ++n) {
+            uint64_t mixed = static_cast<uint64_t>(context[0]) * static_cast<uint64_t>(multipliers[0]);
+            const size_t base = static_cast<size_t>(n - 2) * static_cast<size_t>(HEADS_PER_NGRAM);
+            for (int s = 1; s < n; ++s) {
+                mixed ^= static_cast<uint64_t>(context[s]) * static_cast<uint64_t>(multipliers[static_cast<size_t>(s)]);
+            }
+            for (int g = 0; g < HEADS_PER_NGRAM; ++g) {
+                const size_t head = base + static_cast<size_t>(g);
+                int64_t signed_mixed = 0;
+                std::memcpy(&signed_mixed, &mixed, sizeof(signed_mixed));
+                const int64_t modulo = signed_mixed % vocab[head];
+                out[static_cast<size_t>(i) * PLE_N_HEADS + head] =
+                    static_cast<uint32_t>(offsets[head] + (modulo < 0 ? modulo + vocab[head] : modulo));
+            }
+        }
+    }
+}
 
 PleTable::PleTable() : impl_(new Impl) {}
 PleTable::~PleTable() { close(); delete impl_; }

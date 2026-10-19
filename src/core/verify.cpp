@@ -729,9 +729,25 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                 return v == nullptr || std::strtol(v, nullptr, 10) != 0;
             }();
             PleWeights pw = ss.ple.w;
+            const bool exl3_ple = ss.ple.key_exl3 != nullptr || ss.ple.value_exl3 != nullptr;
+            if (exl3_ple && (ss.ple.key_exl3 == nullptr || ss.ple.value_exl3 == nullptr)) {
+                err = "verify PLE: EXL3 key/value owners must be paired";
+                return false;
+            }
             const bool nkey = pw.key_native_data != nullptr && pw.key_bf16 == nullptr;
-            const bool batched = ple_batch && n > 1 && (pw.key_bf16 != nullptr || nkey) && ple_native_bf16();
-            if (batched) {
+            const bool batched = exl3_ple || (ple_batch && n > 1 && (pw.key_bf16 != nullptr || nkey) && ple_native_bf16());
+            if (exl3_ple) {
+                try {
+                    if (!ss.ple.key_exl3->run(ple_ + (size_t) tb * N, N,
+                                              ple_key_ + (size_t) tb * NG_HC_DIM, NG_HC_DIM, n, cs, err) ||
+                        !ss.ple.value_exl3->run(ple_ + (size_t) tb * N, N,
+                                                ple_val_ + (size_t) tb * N, N, n, cs, err))
+                        return false;
+                } catch (const std::exception& e) {
+                    err = std::string("verify PLE EXL3 projection: ") + e.what();
+                    return false;
+                }
+            } else if (batched) {
                 try {
                     if (pw.key_bf16 != nullptr) {
                         bf16_gemv_fp32_mmvf_multi(ple_ + tb * N, N, pw.key_bf16, ple_key_ + (size_t) tb * NG_HC_DIM,
@@ -1802,7 +1818,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     if (do_ple) {
         int32_t prev[2] = {ss.ple_prev[0], ss.ple_prev[1]};
         for (int t = 0; t < T; ++t) {
-            ngram_rows(&tokens[t], prev, 1, ss.ple.consts, ple_rows + (size_t) t * PLE_N_HEADS);
+            ss.ple.table->lookup_rows(&tokens[t], prev, 1, ss.ple.consts, ple_rows + (size_t) t * PLE_N_HEADS);
             prev[0] = prev[1];
             prev[1] = tokens[t];
             ss.ple.table->prefetch_rows(ple_rows + (size_t) t * PLE_N_HEADS);   // the rows the drafter did not read ahead
@@ -2312,7 +2328,7 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
                 prev[0] = t > 1 && rows[t - 2] == rows[t] ? tokens[t - 2] : sx.ple_prev[1];
                 prev[1] = tokens[t - 1];
             }
-            ngram_rows(&tokens[t], prev, 1, ss_->ple.consts, ple_rows + (size_t) t * PLE_N_HEADS);
+            ss_->ple.table->lookup_rows(&tokens[t], prev, 1, ss_->ple.consts, ple_rows + (size_t) t * PLE_N_HEADS);
         }
         if (!ss_->ple.table->gather_batch(ple_rows, (size_t) S, h_ple_, err)) return false;
     }
@@ -2792,7 +2808,7 @@ bool Verifier::pl_stage(int T, const int32_t* tokens, int64_t pos0, const int32_
         uint32_t rows[kVerifyMaxT * PLE_N_HEADS];
         int32_t prev[2] = {ple_prev[0], ple_prev[1]};
         for (int t = 0; t < T; ++t) {
-            ngram_rows(&tokens[t], prev, 1, ss.ple.consts, rows + (size_t) t * PLE_N_HEADS);
+            ss.ple.table->lookup_rows(&tokens[t], prev, 1, ss.ple.consts, rows + (size_t) t * PLE_N_HEADS);
             prev[0] = prev[1];
             prev[1] = tokens[t];
         }
