@@ -7,6 +7,7 @@
 //     build/native_expert_parity --synthetic GU/DOWN[@HxFF]   random weights quantized by ggml (e.g. q4_K/q5_1,
 //                                                             q6_K/q6_K@2048x512); 2560x640 when no shape is given
 //     build/native_expert_parity --q5_1-min                   the Q5_1 min term on crafted activations
+//     build/native_expert_parity --iq-down                  IQ2_XXS / IQ3_XXS grouped down with per-32 scales
 //
 // (a) float reference: ggml's own dequantizer (`to_float`) and a float SwiGLU expert, (b) the CPU path
 // (ggml-cpu vec_dot with its quantized activations), (c) the GPU path (`native_expert_grouped`, q8_1
@@ -25,6 +26,7 @@
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "ggml-cpu.h"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/f16_bits.hpp"
 
 #include "ggml.h"
 
@@ -510,11 +512,152 @@ static int check_synthetic(const std::string& arg, void* s) {
     return failures ? 1 : 0;
 }
 
+// Exercise the newly admitted down formats without comparing q8_1 GPU activations to ggml-cpu's different Q8_K
+// quantization. Dequantize the actual GPU intermediate q8_1 blocks and ggml's weights, then use an independent
+// FP64 dot. Two distinct nontrivial experts, repeated/shuffled tokens and shuffled destinations cover grouping.
+static int check_iq_down(void* s) {
+    namespace par = strata::parity;
+    constexpr int H = 256, FF = 512, NT = 3, NG = 2, NE = 5, CAP = 6;
+    constexpr int QB = 32, QBYTES = 36;
+    const int32_t starts[NG + 1] = {0, 3, NE}, tokens[NE] = {2, 0, 1, 1, 2}, dst[NE] = {4, 1, 3, 0, 2};
+    const float route_weights[NE] = {0.625f, 1.0f, 0.25f, 0.75f, 0.375f};
+    int failures = 0;
+    for (int type : {16, 18}) {
+        if (!strata::kernels::native_expert_supported(type, type, 2048, FF) ||
+            strata::kernels::native_expert_supported(type, type, 2048, FF - 1)) {
+            std::printf("IQ down type %d: support guard geometry mismatch\n", type);
+            ++failures;
+            continue;
+        }
+        cpu::NativeFmt f;
+        std::string err;
+        if (!cpu::native_fmt(type, type, H, FF, f, err)) {
+            std::printf("IQ down type %d: %s\n", type, err.c_str());
+            ++failures;
+            continue;
+        }
+        std::array<std::vector<uint8_t>, NG> blobs;
+        std::array<std::vector<float>, NG> down;
+        std::vector<float> importance((size_t) std::max(H, FF), 1.0f);
+        const auto* traits = ggml_get_type_traits((ggml_type) type);
+        for (int g = 0; g < NG; ++g) {
+            blobs[g].resize(f.bytes);
+            XorShift32 rng{static_cast<uint32_t>(1234 + g * 7717)};
+            std::vector<float> w((size_t) H * FF);
+            for (int part = 0; part < 2; ++part) {
+                for (int row = 0; row < FF; ++row)
+                    for (int col = 0; col < H; ++col) {
+                        const float scale = std::ldexp(0.0125f, (row / QB + part) % 4 - 2);
+                        w[(size_t) row * H + col] = scale * float(int(rng() % 257) - 128) / 128.0f;
+                        if (part == 0 && row % 31 == 0) w[(size_t) row * H + col] = 0.0f;
+                    }
+                // IQ2_XXS requires importance weights even in a synthetic fixture; these are not model calibration.
+                ggml_quantize_chunk((ggml_type) type, w.data(), blobs[g].data() + (size_t) part * f.up_off,
+                                    0, FF, H, importance.data());
+            }
+            for (size_t i = 0; i < w.size(); ++i) {
+                w[i] = 0.03125f * float(int(rng() % 257) - 128) / 128.0f;
+                if (i % 97 == 0) w[i] = 0.0f;
+                if (i % 113 == 0) w[i] = -0.125f;
+                if (i % 127 == 0) w[i] = 0.125f;
+            }
+            ggml_quantize_chunk((ggml_type) type, w.data(), blobs[g].data() + f.down_off,
+                                0, H, FF, importance.data());
+            down[g].resize((size_t) H * FF);
+            for (int row = 0; row < H; ++row)
+                traits->to_float(blobs[g].data() + f.down_off + (size_t) row * f.d_row,
+                                  down[g].data() + (size_t) row * FF, FF);
+        }
+        std::vector<float> x((size_t) NT * H);
+        for (int t = 0; t < NT; ++t)
+            for (int col = 0; col < H; ++col) {
+                const int value = ((col * 37 + t * 19) % 127) - 63;
+                x[(size_t) t * H + col] = std::ldexp(float(value) / 32.0f, t - 1);
+                if (col % 41 == 0) x[(size_t) t * H + col] = 0.0f;
+                if (col % 43 == 0) x[(size_t) t * H + col] = t == 1 ? -0x1p-14f : 0x1p-14f;
+            }
+        par::Device device;
+        std::vector<unsigned long long> pointers;
+        for (const auto& blob : blobs)
+            pointers.push_back((unsigned long long) device.upload(blob));
+        const auto* dptr = device.upload(pointers);
+        const auto* dstart = device.upload(std::vector<int32_t>(starts, starts + NG + 1));
+        const auto* dtok = device.upload(std::vector<int32_t>(tokens, tokens + NE));
+        const auto* ddst = device.upload(std::vector<int32_t>(dst, dst + NE));
+        const auto* dng = device.upload(std::vector<int32_t>{NG});
+        const auto* dx = device.upload(x);
+        void* dxq = device.alloc<uint8_t>((size_t) NT * H / QB * QBYTES);
+        void* scratch = device.alloc<uint8_t>(strata::kernels::native_expert_scratch_bytes(CAP, FF));
+        constexpr float sentinel = 24680.5f;
+        auto* out = device.upload(std::vector<float>((size_t) CAP * H, sentinel));
+        const auto layout = strata::kernels::native_expert_layout(type, type, H, FF);
+        strata::kernels::quantize_q8_1_rows(dx, NT, H, dxq, s);
+        strata::kernels::native_expert_grouped(layout, dptr, dstart, dng, ddst, dtok, NG, CAP, dxq, scratch, out, s);
+        par::sync();
+        std::vector<float> got((size_t) CAP * H), expected((size_t) CAP * H, sentinel);
+        par::copy_out(got.data(), out, got.size());
+        // native_expert_scratch_bytes' three aligned FP32 planes precede its intermediate q8_1 blocks. Reading the
+        // actual blocks isolates the down dot: an accidental shared-256 scale cannot hide in another quantizer.
+        const size_t plane = ((size_t) CAP * FF * sizeof(float) + 255) & ~size_t(255);
+        std::vector<uint8_t> hq((size_t) NE * (FF / QB) * QBYTES);
+        par::copy_bytes_out(hq.data(), static_cast<const uint8_t*>(scratch) + 3 * plane, hq.size());
+        bool unequal = true, negative = false, positive = false, zero = false, extreme = false;
+        for (int g = 0; g < NG; ++g)
+            for (int entry = starts[g]; entry < starts[g + 1]; ++entry) {
+                std::vector<float> activated(FF);
+                std::vector<uint16_t> scales(FF / QB);
+                for (int block = 0; block < FF / QB; ++block) {
+                    const uint8_t* q8 = hq.data() + ((size_t) entry * (FF / QB) + block) * QBYTES;
+                    scales[block] = static_cast<uint16_t>(q8[0] | (q8[1] << 8));
+                    const float scale = strata::kernels::f32_from_f16(scales[block]);
+                    for (int col = 0; col < QB; ++col) {
+                        const int value = q8[4 + col] < 128 ? q8[4 + col] : int(q8[4 + col]) - 256;
+                        activated[(size_t) block * QB + col] = scale * float(value);
+                        negative |= value < 0; positive |= value > 0; zero |= value == 0;
+                        extreme |= value == -127 || value == 127;
+                    }
+                }
+                for (int block = 0; block < FF / QB; block += 8)
+                    unequal &= std::any_of(scales.begin() + block + 1, scales.begin() + block + 8,
+                                           [&](uint16_t scale) { return scale != scales[block]; });
+                for (int row = 0; row < H; ++row) {
+                    double sum = 0.0;
+                    for (int col = 0; col < FF; ++col)
+                        sum += double(down[g][(size_t) row * FF + col]) * activated[col];
+                    expected[(size_t) dst[entry] * H + row] = static_cast<float>(sum);
+                }
+            }
+        bool ok = unequal && negative && positive && zero && extreme;
+        double max_abs = 0.0;
+        for (size_t i = 0; i < got.size(); ++i) {
+            const double error = std::fabs(double(got[i]) - expected[i]);
+            max_abs = std::max(max_abs, error);
+            ok &= std::isfinite(got[i]) && (i >= (size_t) NE * H ? got[i] == sentinel :
+                                            error <= 2e-5 * (1.0 + std::fabs(double(expected[i]))));
+        }
+        for (int t = 0; t < NT; ++t)
+            for (int row = 0; row < H; ++row) {
+                double actual = 0.0, want = 0.0;
+                for (int e = 0; e < NE; ++e) if (tokens[e] == t) {
+                    actual += route_weights[e] * double(got[(size_t) dst[e] * H + row]);
+                    want += route_weights[e] * double(expected[(size_t) dst[e] * H + row]);
+                }
+                ok &= std::fabs(actual - want) <= 2e-5 * (1.0 + std::fabs(want));
+            }
+        std::printf("IQ down %s: 2 experts, 5 routes, per32 unequal=%d signed/zero/edge=%d, max abs %.3e: %s\n",
+                    ggml_type_name((ggml_type) type), unequal, negative && positive && zero && extreme,
+                    max_abs, ok ? "OK" : "FAIL");
+        if (!ok) ++failures;
+    }
+    return failures ? 1 : 0;
+}
+
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);   // keep the trail on a crash
     if (argc == 2 && std::string(argv[1]) == "--bf16-embd") return check_bf16_embd(strata::parity::stream());
+    if (argc == 2 && std::string(argv[1]) == "--iq-down") return check_iq_down(strata::parity::stream());
     if (argc == 3 && std::string(argv[1]) == "--synthetic") return check_synthetic(argv[2], strata::parity::stream());
-    if (argc < 2) { std::fprintf(stderr, "usage: native_expert_parity <shard1.gguf> [layer ...] | --bf16-embd | --synthetic GU/DOWN[@HxFF]\n"); return 2; }
+    if (argc < 2) { std::fprintf(stderr, "usage: native_expert_parity <shard1.gguf> [layer ...] | --bf16-embd | --iq-down | --synthetic GU/DOWN[@HxFF]\n"); return 2; }
     strata::GgufFile gguf(argv[1]);
     std::vector<int> layers;
     for (int i = 2; i < argc; ++i) layers.push_back(std::atoi(argv[i]));

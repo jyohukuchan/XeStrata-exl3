@@ -1160,6 +1160,9 @@ if(STRATA_NATIVE_EXPERTS)
     target_link_libraries(native_expert_parity PRIVATE strata_kernels strata_kernels_cpu strata_artifact)
     # the BF16 token embedding (--embd-gguf) gathered and dequantized bit for bit: synthetic, so in CTest
     add_test(NAME native_expert_parity_bf16_embd COMMAND native_expert_parity --bf16-embd)
+    # Grid-format down projections keep an independent activation scale for every 32 values.
+    add_test(NAME native_expert_parity_iq_down COMMAND native_expert_parity --iq-down)
+    set_tests_properties(native_expert_parity_iq_down PROPERTIES TIMEOUT 120)
     # UD-Q4_K_XL's expert pairs (and Q8_0 alone) and OrcaRouter Q4_K_S's q4_K/q5_0 on synthetic ggml-quantized
     # weights at 2560/640 (upstream efeffd8, d652cd6): GPU and CPU experts against the float reference, GPU
     # dequantizers against to_float

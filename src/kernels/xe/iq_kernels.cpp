@@ -2014,7 +2014,8 @@ bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_
     // and the down-row kernel already accepted type 20.
     const bool gu = in_iq_gemm(gu_type) || gu_type == 12 || gu_type == 13 || gu_type == 14 || gu_type == 8 ||
                     gu_type == 6 || gu_type == 2 || gu_type == 3 || gu_type == 10 || gu_type == 11;
-    const bool d = d_type == 20 || d_type == 23 || d_type == 42 || d_type == 6 || d_type == 7 || d_type == 8 ||
+    const bool d = d_type == 16 || d_type == 18 || d_type == 20 || d_type == 23 || d_type == 42 ||
+                   d_type == 6 || d_type == 7 || d_type == 8 ||
                    d_type == 2 || d_type == 3 || d_type == 14 || d_type == 10 || d_type == 11 || d_type == 12 ||
                    d_type == 13;
     const auto qk = [](int t) { return t == 20 || t == 6 || t == 7 || t == 8 || t == 2 || t == 3 ? 32 : t == 42 ? 64 : 256; };
@@ -2149,6 +2150,10 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         else e = launch_native_down_lds<42, down_lpr<42>()>(q, cgs, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
     } else
     switch (L.d_type) {
+        // These grid formats use a separate q8_1 scale for each 32-value down sub-block. The existing launcher
+        // selects S256=false, so it must not group their integer parts under the gate/up's shared 256-value scale.
+        case 16: e = launch_native_down<16, down_lpr<16>()>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        case 18: e = launch_native_down<18, down_lpr<18>()>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         case 20: e = launch_native_down<20, down_lpr<20>()>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         case 23: e = launch_native_down<23, down_lpr<23>()>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         case 42: e = launch_native_down<42, down_lpr<42>()>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
