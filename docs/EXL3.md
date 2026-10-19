@@ -23,6 +23,11 @@ tensors retain their raw descriptors.
 preserving each component's offset, bit width and codebook. The same layout recreates views after
 copying the blob to a different address. This factory does not include raw experts.
 
+The raw materializer applies explicit per-axis permutations and subsets. Identity value transforms preserve
+original F16/BF16/F32 bits. Norm `+1` and GDN `A_log` `-exp` transformations produce F32 only when explicitly
+requested. Widening for kernels that require F32 weights is a separate operation; shapes and payload lengths
+are validated.
+
 Safetensors outside the index are enumerated as well. `exl3_ngram_trellis` is kept separate from ordinary
 linears. The known `mtp_hyper_connection_mixer_patch.safetensors` is applied after the base, with its
 source file and override recorded in a sidecar descriptor. Other sidecars that overwrite a tensor name

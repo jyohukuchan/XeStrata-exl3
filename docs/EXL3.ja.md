@@ -22,6 +22,10 @@ cb0、mcg、mul1、F16 scale、旧形式の符号 bitfield、F16/F32 biasを扱�
 各成分の offset、bit 幅、codebook を保持する。blob を別のアドレスへコピーした後も同じ layout から
 view を作れる。raw expert はこの factory の対象に含まない。
 
+raw materializer は明示した軸ごとの並べ替え・部分選択を扱い、identity 変換では F16/BF16/F32 の
+元の bit 列を保つ。norm の `+1` と GDN `A_log` の `-exp` は明示した場合だけ F32 で適用する。
+F32 weight を要求する kernel 用の widening も別操作として提供し、shape と payload 長を検証する。
+
 index 外の safetensors も列挙する。`exl3_ngram_trellis` は通常の linear と区別する。
 既知の `mtp_hyper_connection_mixer_patch.safetensors` は本体より後に適用し、元のファイルと override を
 sidecar descriptor に残す。その他の sidecar が同じ tensor 名を上書きする場合は拒否する。

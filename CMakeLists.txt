@@ -187,7 +187,8 @@ target_link_libraries(strata_artifact INTERFACE strata_warnings)
 
 # Native EXL3 headers carry JSON metadata; keep the parser private to this
 # host-only archive instead of adding a dependency to every GGUF consumer.
-add_library(strata_exl3_artifact STATIC src/artifact/exl3.cpp src/artifact/exl3_remap.cpp)
+add_library(strata_exl3_artifact STATIC src/artifact/exl3.cpp src/artifact/exl3_remap.cpp
+                                         src/artifact/exl3_raw.cpp)
 target_link_libraries(strata_exl3_artifact PUBLIC strata_artifact)
 target_include_directories(strata_exl3_artifact SYSTEM PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/main/nlohmann-json)
@@ -213,6 +214,9 @@ if(STRATA_BUILD_TESTS)
   add_executable(exl3_remap_test src/artifact/exl3_remap_test.cpp)
   target_link_libraries(exl3_remap_test PRIVATE strata_exl3_artifact strata_kernels_cpu)
   add_test(NAME exl3_remap_test COMMAND exl3_remap_test)
+  add_executable(exl3_raw_test src/artifact/exl3_raw_test.cpp)
+  target_link_libraries(exl3_raw_test PRIVATE strata_exl3_artifact)
+  add_test(NAME exl3_raw_test COMMAND exl3_raw_test)
   add_executable(exl3_expert_artifact_test src/artifact/exl3_expert_test.cpp)
   target_link_libraries(exl3_expert_artifact_test PRIVATE strata_exl3_expert_artifact)
   target_include_directories(exl3_expert_artifact_test SYSTEM PRIVATE
