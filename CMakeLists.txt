@@ -188,7 +188,7 @@ target_link_libraries(strata_artifact INTERFACE strata_warnings)
 # Native EXL3 headers carry JSON metadata; keep the parser private to this
 # host-only archive instead of adding a dependency to every GGUF consumer.
 add_library(strata_exl3_artifact STATIC src/artifact/exl3.cpp src/artifact/exl3_remap.cpp
-                                         src/artifact/exl3_raw.cpp)
+                                         src/artifact/exl3_raw.cpp src/artifact/exl3_model_map.cpp)
 target_link_libraries(strata_exl3_artifact PUBLIC strata_artifact)
 target_include_directories(strata_exl3_artifact SYSTEM PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/main/nlohmann-json)
@@ -217,6 +217,9 @@ if(STRATA_BUILD_TESTS)
   add_executable(exl3_raw_test src/artifact/exl3_raw_test.cpp)
   target_link_libraries(exl3_raw_test PRIVATE strata_exl3_artifact)
   add_test(NAME exl3_raw_test COMMAND exl3_raw_test)
+  add_executable(exl3_model_map_test src/artifact/exl3_model_map_test.cpp)
+  target_link_libraries(exl3_model_map_test PRIVATE strata_exl3_artifact)
+  add_test(NAME exl3_model_map_test COMMAND exl3_model_map_test)
   add_executable(exl3_expert_artifact_test src/artifact/exl3_expert_test.cpp)
   target_link_libraries(exl3_expert_artifact_test PRIVATE strata_exl3_expert_artifact)
   target_include_directories(exl3_expert_artifact_test SYSTEM PRIVATE
@@ -699,6 +702,9 @@ if(STRATA_ENABLE_XE)
   target_link_libraries(strata-image PRIVATE strata_image)
 
   if(STRATA_BUILD_TESTS)
+    add_executable(exl3_bench src/kernels/exl3_bench.cpp)
+    target_link_libraries(exl3_bench PRIVATE strata_engine)
+    target_compile_options(exl3_bench PRIVATE -fno-fast-math -ffp-contract=off)
     add_executable(exl3_grouped_parity src/kernels/exl3_grouped_parity.cpp)
     target_link_libraries(exl3_grouped_parity PRIVATE strata_engine)
     target_compile_options(exl3_grouped_parity PRIVATE -fno-fast-math -ffp-contract=off)
@@ -707,6 +713,13 @@ if(STRATA_ENABLE_XE)
       add_test(NAME exl3_grouped_parity COMMAND exl3_grouped_parity --fixture ${_strata_exl3_fixture})
       set_tests_properties(exl3_grouped_parity PROPERTIES TIMEOUT 120)
     endif()
+    add_executable(plain_model_logits src/core/plain_model_logits.cpp)
+    target_link_libraries(plain_model_logits PRIVATE strata_engine strata_prefill)
+    target_include_directories(plain_model_logits SYSTEM PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/third_party/main/nlohmann-json)
+    add_executable(plain_model_exl3_test src/core/plain_model_exl3_test.cpp)
+    target_link_libraries(plain_model_exl3_test PRIVATE strata_engine strata_prefill)
+    add_test(NAME plain_model_exl3_test COMMAND plain_model_exl3_test)
     add_executable(exl3_projection_parity src/core/exl3_projection_parity.cpp)
     target_link_libraries(exl3_projection_parity PRIVATE strata_engine)
     target_include_directories(exl3_projection_parity SYSTEM PRIVATE

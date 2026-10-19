@@ -5,8 +5,8 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 # EXL3 の開発用読み込み経路
 
 モデル全体の対応範囲と、同じ実効 bpw での精度・最適化後の decode 速度の判定は
-[EXL3 対応計画](EXL3_PLAN.ja.md)に従う。以下は形式の読み込みと数値照合に使う開発用の部品であり、
-モデル全体の EXL3 対応を示すものではない。
+[EXL3 対応計画](EXL3_PLAN.ja.md)に従う。以下は開発用の読み込み経路と数値照合の部品を説明する。Qwen3.5 MoE の single GPU AR 経路を
+接続しており、全対象モデル・prefill・MTP の対応と性能の判定は段階的に進める。
 
 ## Artifact
 
@@ -60,7 +60,7 @@ format registry は実際の blob layout の全成分を比較し、process 内�
 CPU miss と GPU hit の出力を router 順の行へ配置する。永続的な計画を graph に記録できる。
 `ExpertDispatch::exl3_runtime` と `MoeWindowTier::exl3_runtime` は、この runtime を既存の CPU-row/GPU-hit
 merge に接続する。現在は segmented graph の1 group 構成を使い、2 group と monolithic graph は拒否する。
-各 ring と最後の segment を同期してから永続計画を再利用する。モデル起動時の binding と prefill は別に行う。
+各 ring と最後の segment を同期してから永続計画を再利用する。Qwen3.5 MoE の起動時 binding は以下の経路を使う。prefill は別に行う。
 
 専用 n-gram decoder は、先頭の F16 row scale と160値の ringを通常の linear と区別して復号する。
 CPU は要求した row ID を選べ、SYCL は取得済みの packed rowを処理する。head bias は明示した head IDで
@@ -91,6 +91,32 @@ ctest --test-dir build/free -R '^exl3_' --output-on-failure
 cmake --build build/free --target exl3_archive_parity
 build/free/exl3_archive_parity /path/to/exl3-model model.layers.0.mlp.experts.0.down_proj
 ```
+
+## Qwen3.5 MoE の AR 接続
+
+`--exl3 DIR --metadata-gguf GGUF` は `PlainModel` の embedding、GDN、attention、router、
+shared/routed expert、norm と出力 head を EXL3 archive から読み込む。GGUF はモデルの幾何形状と
+tokenizer のための bootstrap に使い、重みの fallback には使わない。tensor 数ゼロの metadata-only
+GGUF も使える。config と bootstrap の形状を照合し、補助 tensor の要素数も kernel の要求に合わせて検証する。
+
+```sh
+strata --exl3 /path/to/exl3-model --metadata-gguf /path/to/metadata-only.gguf \
+    --prompt-chunk 0 --spec 0 --max-t 1 --tokens 16,10,16,28 --max-new 2
+```
+
+packed projection は H128 block の並べ替えを行い、GDN の V-head の順序を canonical 配置へ移す。
+raw projection は軸ごとの明示的な変換で元の F16/BF16/F32 を保持する。norm の `+1`、GDN の
+`A_log` の `-exp` と FP32 を要求する補助 weight の widening だけを個別に適用する。
+expert の residency は実際の blob byte 数と device の容量から決め、既存の segmented graph に接続する。
+
+現在この CLI 経路では `--prompt-chunk 0 --spec 0` を使う。正の prefill chunk と MTP は明示的に拒否する。
+Qwen3.8 の projection map と n-gram codec/table はあり、同モデルの起動時 binding は別に行う。
+
+開発用 `plain_model_logits` は `qbench-trace/1` の token ID を再 tokenize せず順に入力し、指定した行の
+FP32 logits と manifest を保存する。`--exl3 DIR --metadata-gguf GGUF` または `--native GGUF` を選び、
+`--trace TRACE.json --out-dir DIR` を指定する。`--rows 0,4` で対象行を限定でき、native 経路の
+`--expert-profile FILE` は同じ residency 条件で照合するために使える。精度判定は元の BF16 教師に対する
+`KL(P_BF16 || P_candidate)` だけを使う。速度の判定にはこの診断用 dump の実行時間を使わない。
 
 ## 出力 head の早期接続
 

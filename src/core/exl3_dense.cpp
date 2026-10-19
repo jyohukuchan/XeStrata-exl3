@@ -3,6 +3,7 @@
 #include "strata/core/exl3_dense.hpp"
 
 #include "strata/artifact/exl3.hpp"
+#include "strata/artifact/exl3_raw.hpp"
 #include "strata/artifact/exl3_remap.hpp"
 #include "strata/core/gpu.hpp"
 #include "strata/core/on_device.hpp"
@@ -250,7 +251,9 @@ bool Exl3Dense::load_remapped(const strata::artifact::exl3::Archive& archive, co
             materialized = std::move(remapped);
         }
         if (materialized.k != ref.ne0 || materialized.n != ref.ne1)
-            throw std::runtime_error(canonical_name + " shape does not match the remapped EXL3 matrix");
+            throw std::runtime_error(hf_name + " remapped shape [" + std::to_string(materialized.k) + "," +
+                                     std::to_string(materialized.n) + "] does not match target [" +
+                                     std::to_string(ref.ne0) + "," + std::to_string(ref.ne1) + "]");
         const auto host_view = materialized.view();
         runtime_ = &Runtime::get();
         max_rows_ = max_rows;
@@ -305,6 +308,50 @@ bool Exl3Dense::load_detached(const strata::artifact::exl3::Archive& archive, co
         return false;
     detached_table_ = std::move(table);
     return true;
+}
+
+bool Exl3Dense::load_raw_detached(const strata::artifact::exl3::RawTensor& weights,
+                                  const strata::artifact::exl3::RawTensor* bias, std::string& err,
+                                  int64_t max_rows) {
+    err.clear();
+    if (runtime_ != nullptr || attached_ != nullptr) {
+        err = "exl3 dense: the owner is already loaded";
+        return false;
+    }
+    try {
+        strata::kernels::raw::DType dtype;
+        if (!raw_dtype_of(weights.dtype, dtype) || weights.shape.size() != 2 || max_rows <= 0)
+            throw std::invalid_argument("raw projection requires a F16/BF16/F32 matrix and positive row capacity");
+        const uint64_t n = weights.shape[0], k = weights.shape[1];
+        const uint64_t width = weights.dtype == "F32" ? 4 : 2;
+        const uint64_t limit = static_cast<uint64_t>(std::numeric_limits<ptrdiff_t>::max()) / width;
+        if (n == 0 || k == 0 || n > limit / k || weights.data.size() != n * k * width)
+            throw std::invalid_argument("raw projection payload does not match its dimensions");
+        std::vector<float> bias_values;
+        if (bias != nullptr) {
+            if (bias->shape != std::vector<uint64_t>{n})
+                throw std::invalid_argument("raw projection bias does not match output width");
+            if (!strata::artifact::exl3::raw_to_f32(*bias, bias_values, err)) throw std::runtime_error(err);
+        }
+        if (!copy_bytes(raw_weights_, weights.data, "raw weight", err)) throw std::runtime_error(err);
+        if (!bias_values.empty()) {
+            std::vector<uint8_t> bytes(bias_values.size() * sizeof(float));
+            std::memcpy(bytes.data(), bias_values.data(), bytes.size());
+            if (!copy_bytes(raw_bias_, bytes, "raw bias", err)) throw std::runtime_error(err);
+        }
+        runtime_ = &Runtime::get();
+        raw_view_ = {raw_weights_, static_cast<const float*>(raw_bias_), static_cast<int64_t>(k),
+                     static_cast<int64_t>(n), dtype};
+        raw_ = true;
+        max_rows_ = max_rows;
+        if (!pointers_owned_by(runtime_)) throw std::runtime_error("raw allocations belong to another runtime");
+        if (!prepare_stream(nullptr, err)) throw std::runtime_error(err);
+        return true;
+    } catch (const std::exception& e) {
+        if (err.empty()) err = std::string("exl3 dense: ") + e.what();
+        reset();
+        return false;
+    }
 }
 
 bool Exl3Dense::prepare_stream(void* stream, std::string& err) {

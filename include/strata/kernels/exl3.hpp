@@ -25,6 +25,14 @@ struct GemvOptions {
     bool add_bias = true;
 };
 
+/// Optional stage events for diagnostics. Events are valid when their corresponding stage was submitted; the queue
+/// must have profiling enabled before callers ask SYCL for command timestamps.
+struct GemvProfile {
+    sycl::event input_hadamard;
+    sycl::event dot;
+    sycl::event output_hadamard;
+};
+
 /// Number of float elements required by `exl3_gemv_fp32`'s caller-owned scratch buffer.
 ///
 /// The input transform occupies the first `k` elements and the output transform occupies the next `n` elements.
@@ -48,7 +56,7 @@ sycl::event exl3_reconstruct(sycl::queue& queue, const MatrixView& view, uint16_
 /// caller and remains live until the returned event completes.  Input/output and scratch ranges must not overlap.
 sycl::event exl3_gemv_fp32(sycl::queue& queue, const MatrixView& view, const float* x, float* y, float* scratch,
                            size_t scratch_elements, GemvOptions options = {},
-                           const std::vector<sycl::event>& deps = {});
+                           const std::vector<sycl::event>& deps = {}, GemvProfile* profile = nullptr);
 
 /// Number of float elements required by exl3_gemm_fp32 for rows input rows.
 /// Scratch is laid out as rows*k input-transform values followed by rows*n dot values.
@@ -62,6 +70,7 @@ size_t exl3_gemm_scratch_elements(const MatrixView& view, int64_t rows, GemvOpti
 /// exl3_gemm_scratch_elements when a Hadamard stage is active.
 sycl::event exl3_gemm_fp32(sycl::queue& queue, const MatrixView& view, const float* x, int64_t ldx, float* y,
                            int64_t ldy, int64_t rows, float* scratch, size_t scratch_elements,
-                           GemvOptions options = {}, const std::vector<sycl::event>& deps = {});
+                           GemvOptions options = {}, const std::vector<sycl::event>& deps = {},
+                           GemvProfile* profile = nullptr);
 
 }  // namespace strata::kernels::exl3

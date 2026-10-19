@@ -25,10 +25,15 @@
 #pragma once
 
 #include "strata/artifact/model_spec.hpp"
+#include "strata/artifact/exl3_model_map.hpp"
+#include "strata/core/exl3_dense.hpp"
+#include "strata/core/exl3_expert_runtime.hpp"
+#include "strata/core/exl3_expert_source.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/gpu.hpp"
 #include "strata/core/moe_window.hpp"
+#include "strata/core/native_head.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/sampler.hpp"
 
@@ -44,7 +49,9 @@ class GgufModel;
 namespace strata::core {
 
 struct PlainOptions {
-    std::string gguf;               ///< any shard of the model
+    std::string gguf;               ///< any shard of the model, or metadata bootstrap for EXL3
+    std::string exl3_dir;           ///< EXL3 archive directory; empty keeps the legacy GGUF path
+    std::string metadata_gguf;      ///< optional explicit metadata/tokenizer bootstrap for EXL3
     int64_t max_cells = 4096;       ///< the context the K/V cache holds
     int max_t = 8;                  ///< the largest window
     int pool_workers = 0;           ///< CPU pool workers (0: every physical core but the first)
@@ -154,6 +161,7 @@ private:
         const void* data = nullptr;
         int type = -1;
         int n_in = 0, n_out = 0;
+        Exl3Dense* exl3 = nullptr;  ///< EXL3 owner; data/type are unused in this mode
     };
     struct Block {
         bool recurrent = false;
@@ -175,6 +183,15 @@ private:
     /// An F32 vector or matrix, or a BF16 one widened to F32 at load (exact: Qwen3.6's MTP layer keeps its two routers
     /// in BF16).
     bool upload_f32(const GgufModel& m, const std::string& name, uint64_t elements, const float*& out, std::string& err);
+    bool load_exl3(std::string& err);
+    bool load_exl3_block(int64_t layer, Block& b, std::string& err);
+    bool run_projection(const W& w, const float* x, float* y, int rows, bool quantize, strata::gpu::Stream cs,
+                        std::string& err);
+    bool raw_aux_f32(const strata::artifact::exl3::ProjectionMapping& mapping, const float*& out, uint64_t expected_count,
+                     std::string& err);
+    const strata::artifact::exl3::ProjectionMapping* exl3_projection(
+        strata::artifact::exl3::ProjectionKind kind, int64_t layer = -1, int64_t expert = -1) const;
+    bool reject_exl3_features(std::string& err) const;
     bool open_experts(std::string& err);
     bool record(int T, bool mtp, std::string& err);
     /// The window's inputs (embeddings, steps, positions) for `tokens` at pos .. pos + T - 1 into the mapped staging.
@@ -277,6 +294,14 @@ private:
                         int64_t layer);
 
     PlainOptions opt_;
+    bool exl3_mode_ = false;
+    std::shared_ptr<const strata::artifact::exl3::Archive> exl3_archive_;
+    strata::artifact::exl3::ModelMap exl3_map_;
+    std::unique_ptr<Exl3ExpertSource> exl3_source_;
+    std::unique_ptr<Exl3ExpertRuntime> exl3_runtime_;
+    std::vector<std::unique_ptr<Exl3Dense>> exl3_dense_;
+    std::vector<void*> exl3_aux_allocs_;
+    NativeEmbed exl3_embed_;
     ModelSpec spec_;
     std::unique_ptr<GgufModel> model_;
     int64_t n_vocab_ = 0;
@@ -349,7 +374,8 @@ private:
     std::vector<std::vector<strata::gpu::Graph*>> segs_;         ///< per T: the segments (MoeWindow::segmented)
     std::vector<strata::gpu::Graph*> mexec_;                     ///< per T: the MTP layer
     std::vector<std::vector<strata::gpu::Graph*>> msegs_;
-    float *h_emb_ = nullptr, *m_emb_ = nullptr;                  ///< mapped: T rows of n_embd
+    float *h_emb_ = nullptr, *m_emb_ = nullptr;                  ///< mapped: T rows of n_embd (legacy GGUF)
+    int32_t *h_tokens_ = nullptr, *m_tokens_ = nullptr;         ///< mapped: EXL3 token IDs for device embedding gather
     int32_t *h_step_ = nullptr, *m_step_ = nullptr;              ///< mapped: T x kStepCount
     int32_t *h_pos_ = nullptr, *m_pos_ = nullptr;                ///< mapped: T x n_head, then T x n_head_kv
     int32_t *h_out_ = nullptr, *m_out_ = nullptr;                ///< mapped: T picked tokens

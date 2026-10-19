@@ -14,6 +14,7 @@
 
 namespace strata::artifact::exl3 {
 class Archive;
+struct RawTensor;
 }  // namespace strata::artifact::exl3
 
 namespace strata::core {
@@ -64,6 +65,11 @@ public:
     bool load_detached(const strata::artifact::exl3::Archive& archive, const std::string& hf_name,
                        int64_t input_width, int64_t output_width, const std::vector<int64_t>& input_blocks,
                        const std::vector<int64_t>& output_blocks, std::string& err, int64_t max_rows = 1);
+
+    /// Upload an explicitly materialized raw [output,input] matrix after axis
+    /// mapping. Weight dtype is preserved; an optional bias is widened to F32.
+    bool load_raw_detached(const strata::artifact::exl3::RawTensor& weights,
+                           const strata::artifact::exl3::RawTensor* bias, std::string& err, int64_t max_rows = 1);
 
     /// Prepare one runtime queue's persistent scratch before graph capture.
     /// The default compute queue is prepared by `load`; callers must prepare

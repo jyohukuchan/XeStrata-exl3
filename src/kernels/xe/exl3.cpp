@@ -292,7 +292,8 @@ sycl::event exl3_reconstruct(sycl::queue& queue, const MatrixView& view, uint16_
 }
 
 sycl::event exl3_gemv_fp32(sycl::queue& queue, const MatrixView& view, const float* x, float* y, float* scratch,
-                           size_t scratch_elements, GemvOptions options, const std::vector<sycl::event>& deps) {
+                           size_t scratch_elements, GemvOptions options, const std::vector<sycl::event>& deps,
+                           GemvProfile* profile) {
     check_gemv(view, x, y, scratch, scratch_elements, options);
     const bool use_input = options.input_hadamard && view.suh != nullptr;
     const bool use_output = options.output_hadamard && view.svh != nullptr;
@@ -304,18 +305,23 @@ sycl::event exl3_gemv_fp32(sycl::queue& queue, const MatrixView& view, const flo
     std::vector<sycl::event> dot_deps = deps;
     if (use_input) {
         const sycl::event input_event = submit_input_hadamard(queue, view, x, scratch + input_offset, deps);
+        if (profile != nullptr) profile->input_hadamard = input_event;
         dot_deps = {input_event};
     }
     const bool dot_add_bias = options.add_bias && !use_output;
     const sycl::event dot_event = submit_dot(queue, view, dot_input, dot_output, dot_deps, dot_add_bias);
-    if (use_output)
-        return submit_output_hadamard(queue, view, dot_output, y, {dot_event}, options.add_bias);
+    if (profile != nullptr) profile->dot = dot_event;
+    if (use_output) {
+        const sycl::event output_event = submit_output_hadamard(queue, view, dot_output, y, {dot_event}, options.add_bias);
+        if (profile != nullptr) profile->output_hadamard = output_event;
+        return output_event;
+    }
     return dot_event;
 }
 
 sycl::event exl3_gemm_fp32(sycl::queue& queue, const MatrixView& view, const float* x, int64_t ldx, float* y,
                            int64_t ldy, int64_t rows, float* scratch, size_t scratch_elements, GemvOptions options,
-                           const std::vector<sycl::event>& deps) {
+                           const std::vector<sycl::event>& deps, GemvProfile* profile) {
     check_gemm(view, x, y, ldx, ldy, rows, scratch, scratch_elements, options);
     const bool use_input = options.input_hadamard && view.suh != nullptr;
     const bool use_output = options.output_hadamard && view.svh != nullptr;
@@ -329,13 +335,19 @@ sycl::event exl3_gemm_fp32(sycl::queue& queue, const MatrixView& view, const flo
     std::vector<sycl::event> dot_deps = deps;
     if (use_input) {
         const sycl::event input_event = submit_input_hadamard_rows(queue, view, x, ldx, scratch, rows, deps);
+        if (profile != nullptr) profile->input_hadamard = input_event;
         dot_deps = {input_event};
     }
     const bool dot_add_bias = options.add_bias && !use_output;
     const sycl::event dot_event =
         submit_dot_rows(queue, view, dot_input, dot_ldx, dot_output, dot_ldy, rows, dot_deps, dot_add_bias);
-    if (use_output)
-        return submit_output_hadamard_rows(queue, view, dot_output, y, ldy, rows, {dot_event}, options.add_bias);
+    if (profile != nullptr) profile->dot = dot_event;
+    if (use_output) {
+        const sycl::event output_event =
+            submit_output_hadamard_rows(queue, view, dot_output, y, ldy, rows, {dot_event}, options.add_bias);
+        if (profile != nullptr) profile->output_hadamard = output_event;
+        return output_event;
+    }
     return dot_event;
 }
 

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // Raw F16/BF16/F32 EXL3-head owner parity on synthetic safetensors.
 #include "strata/artifact/exl3.hpp"
+#include "strata/artifact/exl3_raw.hpp"
 #include "strata/core/exl3_dense.hpp"
 #include "strata/core/gpu.hpp"
 #include "strata/core/weights.hpp"
@@ -353,6 +354,47 @@ int run_case(const std::filesystem::path& root, const RawCase& raw_case) {
         ok = ok && close(actual[(size_t) out], expected[(size_t) out]);
     for (int64_t out = n; out < ldy; ++out) ok = ok && actual[(size_t) out] == 9917.0f;
     strata::gpu::graph_destroy(graph);
+    {
+        const strata::artifact::exl3::Archive archive(root);
+        const auto* weight_tensor = archive.find_tensor("lm_head.weight");
+        const auto* bias_tensor = archive.find_tensor("lm_head.bias");
+        std::vector<int64_t> columns(static_cast<size_t>(k));
+        for (int64_t i = 0; i < k; ++i) columns[static_cast<size_t>(i)] = k - 1 - i;
+        const std::vector<int64_t> selected{n - 1, 7, 0};
+        strata::artifact::exl3::RawTensor mapped_weights, mapped_bias;
+        strata::core::Exl3Dense detached;
+        bool mapped_ok = weight_tensor != nullptr && bias_tensor != nullptr &&
+            strata::artifact::exl3::materialize_raw(archive, *weight_tensor, {selected, columns},
+                strata::artifact::exl3::ValueTransform::identity, mapped_weights, err) &&
+            strata::artifact::exl3::materialize_raw(archive, *bias_tensor, {selected},
+                strata::artifact::exl3::ValueTransform::identity, mapped_bias, err) &&
+            detached.load_raw_detached(mapped_weights, &mapped_bias, err, rows) && detached.prepare_stream(stream, err);
+        std::vector<float> mapped_expected(actual.size(), 9917.0f), initial(actual.size(), 9917.0f);
+        for (int64_t row = 0; row < rows; ++row) for (size_t out = 0; out < selected.size(); ++out) {
+            double sum = rounded_raw(raw_case.bias_dtype, bias[static_cast<size_t>(selected[out])]);
+            for (int64_t col = 0; col < k; ++col)
+                sum += static_cast<double>(input[static_cast<size_t>(row * ldx + col)]) *
+                    rounded_raw(raw_case.weight_dtype, weights[static_cast<size_t>(selected[out] * k + k - 1 - col)]);
+            mapped_expected[static_cast<size_t>(row * ldy) + out] = static_cast<float>(sum);
+        }
+        if (mapped_ok) mapped_ok = strata::gpu::copy(d_output, initial.data(), initial.size() * sizeof(float)) &&
+            detached.run(d_input, ldx, d_output, ldy, rows, stream, err) && strata::gpu::stream_sync(stream) &&
+            strata::gpu::copy(actual.data(), d_output, actual.size() * sizeof(float));
+        if (mapped_ok) for (size_t at = 0; at < actual.size(); ++at)
+            mapped_ok = mapped_ok && close(actual[at], mapped_expected[at]);
+        graph = nullptr;
+        if (mapped_ok) mapped_ok = strata::gpu::copy(d_output, initial.data(), initial.size() * sizeof(float)) &&
+            strata::gpu::begin_capture(stream) && detached.run(d_input, ldx, d_output, ldy, 1, stream, err) &&
+            strata::gpu::end_capture(stream, &graph) && strata::gpu::graph_launch(graph, stream) &&
+            strata::gpu::stream_sync(stream) && strata::gpu::copy(actual.data(), d_output, actual.size() * sizeof(float));
+        if (!mapped_ok && strata::gpu::is_capturing(stream)) strata::gpu::abandon_capture(stream);
+        if (mapped_ok) for (size_t at = 0; at < actual.size(); ++at)
+            mapped_ok = mapped_ok && close(actual[at], at < selected.size() ? mapped_expected[at] : initial[at]);
+        if (graph != nullptr) strata::gpu::graph_destroy(graph);
+        std::cout << "raw " << raw_case.weight_dtype << " detached axis map / three outputs / graph: "
+                  << (mapped_ok ? "OK" : err) << '\n';
+        ok = ok && mapped_ok;
+    }
     strata::gpu::free(d_input); strata::gpu::free(d_output);
     strata::gpu::stream_destroy(stream); strata::gpu::free(arena);
     return ok ? 0 : 1;

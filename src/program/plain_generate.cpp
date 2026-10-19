@@ -323,14 +323,24 @@ static void plain_usage(const std::string& arch) {
                  "  --rope-scaling none|linear|yarn, --rope-scale F, --yarn-orig-ctx N   context extension\n"
                  "  --dump-logits PATH   each generated token's logits, FP32 rows\n"
                  "  --serve              stay resident and take requests on stdin (server.py's protocol, text requests)\n"
-                 "  --gpu PCI            the GPU (its PCI address)\n",
+                 "  --gpu PCI            the GPU (its PCI address)\n"
+                 "  --exl3 DIR           decode-only EXL3 archive (requires --metadata-gguf)\n"
+                 "  --metadata-gguf PATH metadata/tokenizer bootstrap for --exl3; no weights are read\n",
                  arch.c_str());
 }
 
 int plain_main(int argc, char** argv) {
     std::string gguf;
+    std::string exl3_dir, metadata_gguf;
     for (int i = 1; i + 1 < argc; ++i)
         if (std::strcmp(argv[i], "--native") == 0) gguf = argv[i + 1];
+        else if (std::strcmp(argv[i], "--exl3") == 0) exl3_dir = argv[i + 1];
+        else if (std::strcmp(argv[i], "--metadata-gguf") == 0) metadata_gguf = argv[i + 1];
+    if (gguf.empty() && !metadata_gguf.empty()) gguf = metadata_gguf;
+    if (!exl3_dir.empty() && metadata_gguf.empty()) {
+        std::fprintf(stderr, "strata plain: --exl3 requires --metadata-gguf\n");
+        return 2;
+    }
     if (gguf.empty()) return -1;
     const std::string arch = architecture(gguf);
     if (arch.empty() || arch == "qwen4exp") return -1;
@@ -342,6 +352,7 @@ int plain_main(int argc, char** argv) {
     strata::kernels::SamplerParams sp;   // greedy unless --seed
     sp.greedy = true;
     bool stop_eos = false, serve = false;
+    bool prompt_chunk_set = false, spec_set = false;
     std::vector<int32_t> eos;
     std::string dump_path, profile_save;
     double save_min = 10.0;   // --expert-profile-save-every (serve)
@@ -352,6 +363,8 @@ int plain_main(int argc, char** argv) {
             return argv[++i];
         };
         if (a == "--native") (void) next("--native");
+        else if (a == "--exl3") exl3_dir = next("--exl3");
+        else if (a == "--metadata-gguf") metadata_gguf = next("--metadata-gguf");
         else if (a == "--tokens") {
             if (!parse_ids(next("--tokens"), prompt)) { std::fprintf(stderr, "--tokens: a list of token ids\n"); return 2; }
         } else if (a == "--tokens-file") {
@@ -375,7 +388,7 @@ int plain_main(int argc, char** argv) {
         }
         else if (a == "--max-context") opt.max_cells = std::strtoll(next("--max-context"), nullptr, 10);
         else if (a == "--max-t") opt.max_t = (int) std::strtol(next("--max-t"), nullptr, 10);
-        else if (a == "--spec") opt.spec = (int) std::strtol(next("--spec"), nullptr, 10);
+        else if (a == "--spec") { opt.spec = (int) std::strtol(next("--spec"), nullptr, 10); spec_set = true; }
         else if (a == "--pool-workers") opt.pool_workers = (int) std::strtol(next("--pool-workers"), nullptr, 10);
         else if (a == "--dump-logits") dump_path = next("--dump-logits");
         else if (a == "--adapt-every") opt.adapt_every = (int) std::strtol(next("--adapt-every"), nullptr, 10);
@@ -387,7 +400,7 @@ int plain_main(int argc, char** argv) {
         else if (a == "--no-pcie-split") opt.pcie_split = false;
         else if (a == "--expert-profile") opt.profile = next("--expert-profile");
         else if (a == "--draft-vocab") opt.draft_vocab = next("--draft-vocab");
-        else if (a == "--prompt-chunk") opt.prompt_chunk = std::strtoll(next("--prompt-chunk"), nullptr, 10);
+        else if (a == "--prompt-chunk") { opt.prompt_chunk = std::strtoll(next("--prompt-chunk"), nullptr, 10); prompt_chunk_set = true; }
         else if (a == "--rope-scaling") opt.rope_scaling = next("--rope-scaling");
         else if (a == "--rope-scale") opt.rope_scale = std::strtod(next("--rope-scale"), nullptr);
         else if (a == "--yarn-orig-ctx") opt.yarn_orig_ctx = std::strtod(next("--yarn-orig-ctx"), nullptr);
@@ -409,6 +422,25 @@ int plain_main(int argc, char** argv) {
             }
             return 2;
         }
+    }
+    if (!exl3_dir.empty()) {
+        if (metadata_gguf.empty()) {
+            std::fprintf(stderr, "strata plain: --exl3 requires --metadata-gguf\n");
+            return 2;
+        }
+        if (prompt_chunk_set && opt.prompt_chunk > 0) {
+            std::fprintf(stderr, "strata plain: EXL3 decode-only mode rejects positive --prompt-chunk\n");
+            return 2;
+        }
+        if (spec_set && opt.spec > 0) {
+            std::fprintf(stderr, "strata plain: EXL3 decode-only mode rejects positive --spec\n");
+            return 2;
+        }
+        opt.exl3_dir = exl3_dir;
+        opt.metadata_gguf = metadata_gguf;
+        opt.prompt_chunk = 0;
+        opt.spec = 0;
+        gguf = metadata_gguf;
     }
     if (!serve && (prompt.empty() || n_new < 1)) {
         std::fprintf(stderr, "strata (%s): needs --tokens and --max-new >= 1\n", arch.c_str());

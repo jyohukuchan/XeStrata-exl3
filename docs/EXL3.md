@@ -5,8 +5,8 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 # EXL3 development loading path
 
 Whole-model coverage, quality at matched effective bpw, and optimized decode speed follow the
-[EXL3 support plan](EXL3_PLAN.md). The components below load the format and check numerical results;
-they do not establish whole-model EXL3 support.
+[EXL3 support plan](EXL3_PLAN.md). The following describes the development loading path and numerical checks. A single-GPU AR path is
+connected for Qwen3.5 MoE; coverage and performance of all target models, prefill and MTP proceed in stages.
 
 ## Artifact
 
@@ -66,7 +66,7 @@ hits before source I/O, and places CPU-miss and GPU-hit outputs in router order.
 recorded in a graph. `ExpertDispatch::exl3_runtime` and `MoeWindowTier::exl3_runtime` connect it to the existing
 CPU-row/GPU-hit merge. The current path uses one group and segmented graphs; two groups and monolithic graphs
 are rejected. Each ring and the final segment are synchronized before reusing the persistent plan.
-Model-startup binding and prefill remain separate.
+Qwen3.5 MoE startup uses the path below. Prefill remains separate.
 
 The dedicated n-gram decoder treats its leading F16 row scale and 160-value ring separately from ordinary
 linears. CPU can select requested row IDs; SYCL processes packed rows already fetched by the caller.
@@ -97,6 +97,32 @@ weight owner together for one requested matrix. Only diagnostic reconstruction e
 cmake --build build/free --target exl3_archive_parity
 build/free/exl3_archive_parity /path/to/exl3-model model.layers.0.mlp.experts.0.down_proj
 ```
+
+## Qwen3.5 MoE AR integration
+
+`--exl3 DIR --metadata-gguf GGUF` loads `PlainModel` embeddings, GDN, attention, routers, shared/routed
+experts, norms and output head from the EXL3 archive. GGUF bootstraps model geometry and tokenizer metadata;
+it never supplies fallback weights. A metadata-only GGUF containing zero tensors also works. Config and
+bootstrap geometry are checked, including auxiliary tensor element counts required by each kernel.
+
+```sh
+strata --exl3 /path/to/exl3-model --metadata-gguf /path/to/metadata-only.gguf \
+    --prompt-chunk 0 --spec 0 --max-t 1 --tokens 16,10,16,28 --max-new 2
+```
+
+Packed projections reorder H128 blocks, moving GDN V-heads to canonical order. Raw projections use explicit
+axis maps and retain their original F16/BF16/F32 dtype. Norm `+1`, GDN `A_log` `-exp`, and widening auxiliary
+weights required by F32 kernels are separate operations. Expert residency derives from actual blob bytes
+and device capacity and connects to the existing segmented graphs.
+
+This CLI path currently uses `--prompt-chunk 0 --spec 0`. Positive prefill chunks and MTP are explicitly
+rejected. Qwen3.8 projection maps and n-gram codecs/tables exist; its startup binding remains separate.
+
+The development tool `plain_model_logits` feeds `qbench-trace/1` token IDs in order without retokenizing,
+saving FP32 logits and a manifest for selected rows. Choose `--exl3 DIR --metadata-gguf GGUF` or `--native GGUF`,
+and supply `--trace TRACE.json --out-dir DIR`. `--rows 0,4` limits rows; native `--expert-profile FILE` supports
+checks with matched residency. Quality acceptance uses only `KL(P_BF16 || P_candidate)` against the original
+BF16 teacher. The diagnostic dump's runtime is not a decode speed acceptance measurement.
 
 ## Early output-head integration
 

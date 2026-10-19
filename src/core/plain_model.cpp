@@ -93,7 +93,14 @@ PlainModel::~PlainModel() {
     for (auto& v : msegs_)
         for (auto* g : v) strata::gpu::graph_destroy(g);
     for (void* p : allocs_) strata::gpu::free(p);
-    for (void* p : {(void*) h_emb_, (void*) h_step_, (void*) h_pos_, (void*) h_out_, (void*) fill_tmp_})
+    for (void* p : exl3_aux_allocs_) strata::gpu::free(p);
+    // Exl3ExpertRuntime borrows the CPU pool and source. Destroy it while both
+    // owners are still alive; member declaration order cannot express this
+    // because the legacy pool/cache fields are interleaved with the EXL3 state.
+    exl3_runtime_.reset();
+    exl3_source_.reset();
+    exl3_dense_.clear();
+    for (void* p : {(void*) h_emb_, (void*) h_tokens_, (void*) h_step_, (void*) h_pos_, (void*) h_out_, (void*) fill_tmp_})
         strata::gpu::free(p);
     if (swap_ev_ != nullptr) strata::gpu::event_destroy(swap_ev_);
     if (swap_cs_ != nullptr) strata::gpu::stream_destroy(swap_cs_);
@@ -169,6 +176,257 @@ bool PlainModel::upload_f32(const GgufModel& m, const std::string& name, uint64_
     return true;
 }
 
+const strata::artifact::exl3::ProjectionMapping* PlainModel::exl3_projection(
+    strata::artifact::exl3::ProjectionKind kind, int64_t layer, int64_t expert) const {
+    for (const auto& mapping : exl3_map_.projections)
+        if (mapping.kind == kind && mapping.layer == layer && mapping.expert == expert) return &mapping;
+    return nullptr;
+}
+
+bool PlainModel::reject_exl3_features(std::string& err) const {
+    if (opt_.prompt_chunk > 0) {
+        err = "plain model: EXL3 decode-only mode does not support prefill; use --prompt-chunk 0";
+        return false;
+    }
+    if (opt_.spec > 0) {
+        err = "plain model: EXL3 decode-only mode does not support MTP; use --spec 0";
+        return false;
+    }
+    return true;
+}
+
+namespace {
+
+bool exl3_axis_map(const strata::artifact::exl3::AxisMapping& axis, std::vector<int64_t>& result, std::string& err) {
+    result.clear();
+    if (!axis.permutation.empty()) { result = axis.permutation; return true; }
+    if (axis.transform == strata::artifact::exl3::AxisTransform::identity ||
+        axis.transform == strata::artifact::exl3::AxisTransform::raw_rows)
+        return true;
+    if (axis.transform == strata::artifact::exl3::AxisTransform::h128_block_permutation) {
+        if (axis.block_size <= 0 || axis.block_offset < 0 || axis.target_size <= 0 ||
+            axis.block_permutation.empty() || axis.target_size < axis.block_offset ||
+            (axis.target_size - axis.block_offset) % axis.block_size != 0 ||
+            axis.block_permutation.size() != static_cast<size_t>((axis.target_size - axis.block_offset) / axis.block_size)) {
+            err = "EXL3 raw axis has an invalid H128 block map";
+            return false;
+        }
+        result.resize(static_cast<size_t>(axis.target_size));
+        for (int64_t i = 0; i < axis.target_size; ++i) result[(size_t) i] = i;
+        for (size_t block = 0; block < axis.block_permutation.size(); ++block)
+            for (int64_t d = 0; d < axis.block_size; ++d) {
+                const int64_t target = axis.block_offset + (int64_t) block * axis.block_size + d;
+                const int64_t source = axis.block_offset + axis.block_permutation[block] * axis.block_size + d;
+                if (source < 0 || source >= axis.source_size) {
+                    err = "EXL3 raw axis H128 map is outside the source";
+                    return false;
+                }
+                result[(size_t) target] = source;
+            }
+        return true;
+    }
+    if (axis.transform == strata::artifact::exl3::AxisTransform::slices) {
+        if (axis.target_size <= 0) { err = "EXL3 raw axis slice map has no target"; return false; }
+        result.resize(static_cast<size_t>(axis.target_size), -1);
+        for (const auto& slice : axis.slices)
+            for (int64_t i = 0; i < slice.elements; ++i) {
+                const int64_t target = slice.target_offset + i;
+                const int64_t source = slice.source_offset + i;
+                if (target < 0 || target >= axis.target_size || source < 0 || source >= axis.source_size ||
+                    result[(size_t) target] != -1) {
+                    err = "EXL3 raw axis slices overlap or are outside bounds";
+                    return false;
+                }
+                result[(size_t) target] = source;
+            }
+        if (std::find(result.begin(), result.end(), -1) != result.end()) {
+            err = "EXL3 raw axis slices do not cover the target";
+            return false;
+        }
+        return true;
+    }
+    err = "EXL3 raw axis transform is unsupported";
+    return false;
+}
+
+std::vector<int64_t> exl3_block_map(const strata::artifact::exl3::AxisMapping& axis) {
+    // The map may permute only the V-head region after an unchanged Q/K
+    // prefix. Packed remapping needs the complete axis in H128 units.
+    std::vector<int64_t> elements;
+    std::string error;
+    if (!exl3_axis_map(axis, elements, error)) throw std::runtime_error(error);
+    if (elements.empty()) return {};
+    if (axis.source_size % 128 != 0 || elements.size() % 128 != 0)
+        throw std::runtime_error("EXL3 packed axis map is not H128 aligned");
+    std::vector<int64_t> blocks(elements.size() / 128);
+    for (size_t block = 0; block < blocks.size(); ++block) {
+        const int64_t first = elements[block * 128];
+        if (first < 0 || first % 128 != 0)
+            throw std::runtime_error("EXL3 packed axis starts inside an H128 block");
+        for (int64_t lane = 0; lane < 128; ++lane)
+            if (elements[block * 128 + static_cast<size_t>(lane)] != first + lane)
+                throw std::runtime_error("EXL3 packed axis reorders values within an H128 block");
+        blocks[block] = first / 128;
+    }
+    return blocks;
+}
+
+}  // namespace
+
+bool PlainModel::raw_aux_f32(const strata::artifact::exl3::ProjectionMapping& mapping, const float*& out, uint64_t expected_count,
+                             std::string& err) {
+    const auto* tensor = exl3_archive_ == nullptr ? nullptr : exl3_archive_->find_tensor(mapping.source_name);
+    if (tensor == nullptr) {
+        err = "plain model: EXL3 raw tensor is missing: " + mapping.source_name;
+        return false;
+    }
+    strata::artifact::exl3::RawTensor raw;
+    std::vector<std::vector<int64_t>> axes;
+    axes.reserve(mapping.raw_axes.size());
+    for (const auto& axis : mapping.raw_axes) {
+        std::vector<int64_t> map;
+        if (!exl3_axis_map(axis, map, err)) return false;
+        axes.push_back(std::move(map));
+    }
+    if (!strata::artifact::exl3::materialize_raw(*exl3_archive_, *tensor, axes, mapping.value_transform, raw, err))
+        return false;
+    std::vector<float> values;
+    if (!strata::artifact::exl3::raw_to_f32(raw, values, err)) return false;
+    if (values.empty() || values.size() != expected_count ||
+        values.size() > std::numeric_limits<size_t>::max() / sizeof(float)) {
+        err = "plain model: EXL3 raw auxiliary tensor has an invalid size: " + mapping.source_name;
+        return false;
+    }
+    void* device = nullptr;
+    if (!strata::gpu::alloc_device(&device, values.size() * sizeof(float)) ||
+        !strata::gpu::copy(device, values.data(), values.size() * sizeof(float))) {
+        err = "plain model: uploading EXL3 raw auxiliary tensor failed: " + mapping.source_name;
+        if (device != nullptr) strata::gpu::free(device);
+        return false;
+    }
+    exl3_aux_allocs_.push_back(device);
+    out = static_cast<const float*>(device);
+    return true;
+}
+
+bool PlainModel::run_projection(const W& w, const float* x, float* y, int rows, bool, strata::gpu::Stream cs,
+                                std::string& err) {
+    if (w.exl3 == nullptr || w.n_in <= 0 || w.n_out <= 0 || rows <= 0) {
+        err = "plain model: EXL3 projection owner is not loaded";
+        return false;
+    }
+    return w.exl3->run(x, w.n_in, y, w.n_out, rows, cs, err);
+}
+
+bool PlainModel::load_exl3(std::string& err) {
+    err.clear();
+    try {
+        if (!reject_exl3_features(err)) return false;
+        exl3_archive_ = std::make_shared<strata::artifact::exl3::Archive>(opt_.exl3_dir);
+        if (!strata::artifact::exl3::build_model_map(*exl3_archive_, exl3_map_, err) ||
+            !exl3_map_.require_supported(err))
+            return false;
+        if (exl3_map_.family != strata::artifact::exl3::ModelFamily::qwen35) {
+            err = "plain model: this EXL3 integration currently supports Qwen3.5 only";
+            return false;
+        }
+        const auto& g = exl3_map_.geometry;
+        int64_t bootstrap_kv = 0;
+        for (int64_t l = 0; l < spec_.n_layer; ++l)
+            if (!spec_.recurrent[(size_t) l]) { bootstrap_kv = spec_.n_head_kv[(size_t) l]; break; }
+        const bool geometry_ok = g.hidden_size == spec_.n_embd && g.layers == spec_.n_layer &&
+            g.experts == spec_.n_expert && g.experts_per_token == spec_.n_expert_used &&
+            g.moe_intermediate == spec_.n_ff_exp && g.shared_intermediate == spec_.n_ff_shexp &&
+            g.vocab_size > 0 && g.vocab_size == exl3_map_.geometry.vocab_size &&
+            g.q_heads == spec_.n_head && g.kv_heads == bootstrap_kv && g.head_dim == spec_.key_length &&
+            g.linear_k_heads == spec_.ssm_n_group && g.linear_v_heads == spec_.ssm_dt_rank &&
+            g.linear_k_dim == spec_.ssm_d_state && g.linear_v_dim == spec_.ssm_d_state &&
+            g.full_attention_interval == (spec_.full_attention_interval > 0 ? spec_.full_attention_interval : 4) &&
+            spec_.key_length == spec_.value_length;
+        for (int64_t l = 0; geometry_ok && l < spec_.n_layer; ++l) {
+            const bool mapped_recurrent = exl3_projection(strata::artifact::exl3::ProjectionKind::gdn_qkv, l) != nullptr;
+            if (mapped_recurrent != spec_.recurrent[(size_t) l]) {
+                err = "plain model: EXL3 layer attention pattern disagrees with metadata bootstrap";
+                return false;
+            }
+        }
+        if (!geometry_ok) {
+            err = "plain model: EXL3 geometry disagrees with metadata bootstrap";
+            return false;
+        }
+        const auto* embedding = exl3_projection(strata::artifact::exl3::ProjectionKind::embedding);
+        if (embedding == nullptr || embedding->source_name.size() <= 7 ||
+            embedding->source_name.compare(embedding->source_name.size() - 7, 7, ".weight") != 0) {
+            err = "plain model: EXL3 embedding mapping is missing";
+            return false;
+        }
+        const std::string embedding_name = embedding->source_name.substr(0, embedding->source_name.size() - 7);
+        if (!exl3_embed_.load_exl3(*exl3_archive_, embedding_name, spec_.n_embd, g.vocab_size, err)) return false;
+        n_vocab_ = g.vocab_size;
+        const auto* head = exl3_projection(strata::artifact::exl3::ProjectionKind::lm_head);
+        const auto* norm = exl3_projection(strata::artifact::exl3::ProjectionKind::final_norm);
+        if (head == nullptr || norm == nullptr) {
+            err = "plain model: EXL3 head or final norm mapping is missing";
+            return false;
+        }
+        auto dense = std::make_unique<Exl3Dense>();
+        if (head->transform == strata::artifact::exl3::MappingTransform::raw_rows) {
+            const auto* tensor = exl3_archive_->find_tensor(head->source_name);
+            if (tensor == nullptr) { err = "plain model: EXL3 raw head is missing"; return false; }
+            strata::artifact::exl3::RawTensor raw;
+            std::vector<std::vector<int64_t>> axes;
+            for (const auto& axis : head->raw_axes) {
+                std::vector<int64_t> map;
+                if (!exl3_axis_map(axis, map, err)) return false;
+                axes.push_back(std::move(map));
+            }
+            if (!strata::artifact::exl3::materialize_raw(*exl3_archive_, *tensor, axes, head->value_transform, raw, err))
+                return false;
+            strata::artifact::exl3::RawTensor bias;
+            const std::string suffix = ".weight";
+            const std::string base = head->source_name.size() > suffix.size() &&
+                                             head->source_name.compare(head->source_name.size() - suffix.size(), suffix.size(), suffix) == 0
+                                         ? head->source_name.substr(0, head->source_name.size() - suffix.size())
+                                         : head->source_name;
+            const auto* bias_tensor = exl3_archive_->find_tensor(base + ".bias");
+            const strata::artifact::exl3::RawTensor* bias_ptr = nullptr;
+            if (bias_tensor != nullptr) {
+                if (!strata::artifact::exl3::materialize_raw(*exl3_archive_, *bias_tensor, {},
+                                                             strata::artifact::exl3::ValueTransform::identity, bias, err))
+                    return false;
+                bias_ptr = &bias;
+            }
+            if (!dense->load_raw_detached(raw, bias_ptr, err, opt_.max_t)) return false;
+        } else if (!dense->load_detached(*exl3_archive_, head->source_name, spec_.n_embd, n_vocab_,
+                                         exl3_block_map(head->input_axis), exl3_block_map(head->output_axis), err,
+                                         opt_.max_t))
+            return false;
+        if (!dense->prepare_stream(cs_, err)) return false;
+        head_.n_in = (int) spec_.n_embd;
+        head_.n_out = (int) n_vocab_;
+        head_.exl3 = dense.get();
+        exl3_dense_.push_back(std::move(dense));
+        if (!raw_aux_f32(*norm, out_norm_, static_cast<uint64_t>(spec_.n_embd), err)) return false;
+        emb_type_ = -1;
+        emb_ = nullptr;
+        emb_row_ = 0;
+        blocks_.resize((size_t) spec_.n_layer);
+        int64_t n_gdn = 0, n_attn = 0;
+        for (int64_t l = 0; l < spec_.n_layer; ++l) {
+            Block& b = blocks_[(size_t) l];
+            b.recurrent = spec_.recurrent[(size_t) l];
+            if (b.recurrent) b.gdn = n_gdn++;
+            else b.attn = n_attn++;
+            if (!load_exl3_block(l, b, err)) return false;
+        }
+        has_mtp_ = false;
+        return true;
+    } catch (const std::exception& e) {
+        err = std::string("plain model: EXL3 load: ") + e.what();
+        return false;
+    }
+}
+
 bool PlainModel::load_block(const GgufModel& m, int64_t l, Block& b, std::string& err) {
     const ModelSpec& s = spec_;
     const bool q35 = s.arch == ModelArch::Qwen35Moe;
@@ -221,8 +479,104 @@ bool PlainModel::load_block(const GgufModel& m, int64_t l, Block& b, std::string
     return true;
 }
 
+bool PlainModel::load_exl3_block(int64_t l, Block& b, std::string& err) {
+    using PK = strata::artifact::exl3::ProjectionKind;
+    auto dense = [&](PK kind, W& out, int64_t expert = -1) {
+        const auto* mapping = exl3_projection(kind, l, expert);
+        if (mapping == nullptr) { err = "plain model: EXL3 projection mapping is missing for layer " + std::to_string(l); return false; }
+        auto owner = std::make_unique<Exl3Dense>();
+        if (mapping->transform == strata::artifact::exl3::MappingTransform::raw_rows) {
+            const auto* tensor = exl3_archive_->find_tensor(mapping->source_name);
+            if (tensor == nullptr) { err = "plain model: EXL3 raw projection is missing: " + mapping->source_name; return false; }
+            strata::artifact::exl3::RawTensor raw;
+            std::vector<std::vector<int64_t>> axes;
+            for (const auto& axis : mapping->raw_axes) {
+                std::vector<int64_t> map;
+                if (!exl3_axis_map(axis, map, err)) return false;
+                axes.push_back(std::move(map));
+            }
+            if (!strata::artifact::exl3::materialize_raw(*exl3_archive_, *tensor, axes, mapping->value_transform, raw, err)) return false;
+            strata::artifact::exl3::RawTensor bias;
+            const std::string suffix = ".weight";
+            const std::string base = mapping->source_name.size() > suffix.size() &&
+                                             mapping->source_name.compare(mapping->source_name.size() - suffix.size(), suffix.size(), suffix) == 0
+                                         ? mapping->source_name.substr(0, mapping->source_name.size() - suffix.size())
+                                         : mapping->source_name;
+            const auto* bias_tensor = exl3_archive_->find_tensor(base + ".bias");
+            const auto* bias_ptr = static_cast<const strata::artifact::exl3::RawTensor*>(nullptr);
+            if (bias_tensor != nullptr) {
+                if (!strata::artifact::exl3::materialize_raw(*exl3_archive_, *bias_tensor, {},
+                                                             strata::artifact::exl3::ValueTransform::identity, bias, err))
+                    return false;
+                bias_ptr = &bias;
+            }
+            if (!owner->load_raw_detached(raw, bias_ptr, err, opt_.max_t)) return false;
+        } else if (!owner->load_detached(*exl3_archive_, mapping->source_name, mapping->target_k, mapping->target_n,
+                                         exl3_block_map(mapping->input_axis), exl3_block_map(mapping->output_axis), err,
+                                         opt_.max_t)) return false;
+        if (!owner->prepare_stream(cs_, err)) return false;
+        out.n_in = (int) mapping->target_k;
+        out.n_out = (int) mapping->target_n;
+        out.exl3 = owner.get();
+        exl3_dense_.push_back(std::move(owner));
+        return true;
+    };
+    const bool q35 = spec_.arch == ModelArch::Qwen35Moe;
+    // The map records canonical names for auxiliary tensors; find by canonical name because several auxiliaries share a kind.
+    auto aux_name = [&](const std::string& canonical, const float*& out, uint64_t expected_count) {
+        for (const auto& mapping : exl3_map_.projections)
+            if (mapping.layer == l && mapping.canonical_name == canonical) return raw_aux_f32(mapping, out, expected_count, err);
+        err = std::string("plain model: EXL3 auxiliary mapping is missing: ") + canonical;
+        return false;
+    };
+    if (!aux_name("blk." + std::to_string(l) + ".attn_norm.weight", b.attn_norm, static_cast<uint64_t>(spec_.n_embd)) ||
+        !aux_name("blk." + std::to_string(l) + "." + (q35 ? "post_attention_norm.weight" : "ffn_norm.weight"), b.post_norm, static_cast<uint64_t>(spec_.n_embd)))
+        return false;
+    if (b.recurrent) {
+        const int64_t C = 2 * spec_.ssm_n_group * spec_.ssm_d_state + spec_.ssm_d_inner;
+        if (!dense(PK::gdn_qkv, b.qkv) || !dense(PK::gdn_z, b.z) || !dense(PK::gdn_out, b.ssm_out) ||
+            !dense(PK::gdn_alpha, b.alpha) || !dense(PK::gdn_beta, b.beta) ||
+            !aux_name("blk." + std::to_string(l) + ".ssm_norm.weight", b.ssm_norm, static_cast<uint64_t>(spec_.ssm_d_state)) ||
+            !aux_name("blk." + std::to_string(l) + ".ssm_conv1d.weight", b.conv, static_cast<uint64_t>(C * spec_.ssm_d_conv)) ||
+            !aux_name("blk." + std::to_string(l) + ".ssm_dt.bias", b.dt, static_cast<uint64_t>(spec_.ssm_dt_rank)) ||
+            !aux_name("blk." + std::to_string(l) + ".ssm_a", b.a, static_cast<uint64_t>(spec_.ssm_dt_rank))) return false;
+    } else {
+        const int64_t nkv = spec_.n_head_kv[(size_t) l];
+        if (nkv <= 0 || spec_.n_head % nkv != 0 || (nkv_ != 0 && nkv_ != nkv)) {
+            err = "plain model: EXL3 attention K/V head geometry is inconsistent";
+            return false;
+        }
+        nkv_ = nkv;
+        if (!dense(PK::qsa_q, b.q) || !dense(PK::qsa_k, b.k) || !dense(PK::qsa_v, b.v) || !dense(PK::qsa_out, b.o) ||
+            !aux_name("blk." + std::to_string(l) + ".attn_q_norm.weight", b.q_norm, static_cast<uint64_t>(spec_.key_length)) ||
+            !aux_name("blk." + std::to_string(l) + ".attn_k_norm.weight", b.k_norm, static_cast<uint64_t>(spec_.key_length))) return false;
+        if (b.q.n_out != (has_gate_ ? 2 : 1) * spec_.n_head * spec_.key_length ||
+            b.k.n_out != nkv * spec_.key_length || b.v.n_out != nkv * spec_.value_length ||
+            b.o.n_in != spec_.n_head * spec_.key_length) {
+            err = "plain model: EXL3 attention projection shapes disagree with bootstrap geometry";
+            return false;
+        }
+    }
+    if (!aux_name("blk." + std::to_string(l) + ".ffn_gate_inp.weight", b.router, static_cast<uint64_t>(spec_.n_embd * spec_.n_expert))) return false;
+    if (has_shared_) {
+        if (!aux_name("blk." + std::to_string(l) + ".ffn_gate_inp_shexp.weight", b.sh_gate_inp, static_cast<uint64_t>(spec_.n_embd)) ||
+            !dense(PK::shared_gate, b.sh_gate) || !dense(PK::shared_up, b.sh_up) || !dense(PK::shared_down, b.sh_down))
+            return false;
+    }
+    return true;
+}
+
 bool PlainModel::load(const PlainOptions& opt, std::string& err) {
     opt_ = opt;
+    exl3_mode_ = !opt_.exl3_dir.empty();
+    if (exl3_mode_ && opt_.prompt_chunk > 0) {
+        err = "plain model: EXL3 decode-only mode does not support prefill; use --prompt-chunk 0";
+        return false;
+    }
+    if (exl3_mode_ && opt_.spec > 0) {
+        err = "plain model: EXL3 decode-only mode does not support MTP; use --spec 0";
+        return false;
+    }
     if (opt_.max_t < 1 || opt_.max_t > k::cpu::MAXT || opt_.max_cells < 16) {
         err = "plain model: the window or the context is out of range";
         return false;
@@ -234,8 +588,13 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
         err = "plain model: this model does not run on the processor's own graphics yet; choose another GPU (--gpu)";
         return false;
     }
+    const std::string metadata_path = exl3_mode_ && !opt_.metadata_gguf.empty() ? opt_.metadata_gguf : opt_.gguf;
+    if (metadata_path.empty()) {
+        err = "plain model: EXL3 requires a metadata bootstrap GGUF";
+        return false;
+    }
     try {
-        model_ = std::make_unique<GgufModel>(GgufModel::open(opt_.gguf));
+        model_ = std::make_unique<GgufModel>(GgufModel::open(metadata_path));
     } catch (const std::exception& e) {
         err = std::string("plain model: ") + e.what();
         return false;
@@ -284,8 +643,10 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
     k::gdn_set_silu_gate(q35);
 
     const GgufModel& m = *model_;
-    // the embedding stays in the mapping: a token's row is dequantized on the host
-    {
+    if (exl3_mode_ && !load_exl3(err)) return false;
+
+    // The legacy embedding stays in the mapping. EXL3 uses NativeEmbed and gathers rows in the graph.
+    if (!exl3_mode_) {
         size_t at = 0;
         const TensorInfo* t = m.find("token_embd.weight", &at);
         if (t == nullptr || t->shape.size() != 2 || t->shape[0] != (uint64_t) s.n_embd || !m.in_bounds(*t, at)) {
@@ -298,25 +659,39 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
         if (emb_row_ == 0) { err = "plain model: token_embd.weight's type has no host dequantizer"; return false; }
         emb_ = m.shard(at).tensor_data(*t);
     }
-    if (!upload(m, "output.weight", head_, err) ||
-        !upload_f32(m, "output_norm.weight", (uint64_t) s.n_embd, out_norm_, err))
-        return false;
-    if (head_.n_in != s.n_embd || head_.n_out != n_vocab_) { err = "plain model: output.weight's shape"; return false; }
+    if (!exl3_mode_) {
+        if (!upload(m, "output.weight", head_, err) ||
+            !upload_f32(m, "output_norm.weight", (uint64_t) s.n_embd, out_norm_, err))
+            return false;
+        if (head_.n_in != s.n_embd || head_.n_out != n_vocab_) { err = "plain model: output.weight's shape"; return false; }
+    }
 
     const uint64_t N = (uint64_t) s.n_embd, E = (uint64_t) s.n_expert;
-    blocks_.resize((size_t) s.n_layer);
     int64_t n_gdn = 0, n_attn = 0;
-    for (int64_t l = 0; l < s.n_layer; ++l) {
-        Block& b = blocks_[(size_t) l];
-        b.recurrent = s.recurrent[(size_t) l];
-        if (b.recurrent) b.gdn = n_gdn++;
-        else b.attn = n_attn++;
-        if (!load_block(m, l, b, err)) return false;
+    if (!exl3_mode_) {
+        blocks_.resize((size_t) s.n_layer);
+        for (int64_t l = 0; l < s.n_layer; ++l) {
+            Block& b = blocks_[(size_t) l];
+            b.recurrent = s.recurrent[(size_t) l];
+            if (b.recurrent) b.gdn = n_gdn++;
+            else b.attn = n_attn++;
+            if (!load_block(m, l, b, err)) return false;
+        }
+    } else {
+        for (int64_t l = 0; l < s.n_layer; ++l)
+            if (!s.recurrent[(size_t) l]) {
+                ++n_attn;
+                if (nkv_ == 0) nkv_ = s.n_head_kv[(size_t) l];
+            }
     }
     // the MTP layer, when the window checks drafts and the file has it (its K/V the last attention block's)
     {
+        if (exl3_mode_) {
+            has_mtp_ = false;
+        } else {
         const std::string p = "blk." + std::to_string(s.n_layer) + ".nextn.";
         has_mtp_ = opt_.spec >= 2 && q35 && s.n_nextn == 1 && m.find(p + "eh_proj.weight") != nullptr;
+        }
     }
     if (has_mtp_) {
         const std::string p = "blk." + std::to_string(s.n_layer) + ".nextn.";
@@ -460,8 +835,9 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
     const uint64_t T = (uint64_t) opt_.max_t, NH = (uint64_t) s.n_head, HD = (uint64_t) s.key_length;
     const uint64_t NKV = (uint64_t) qs.n_head_kv, HV = (uint64_t) s.ssm_dt_rank, ZV = (uint64_t) s.ssm_d_inner;
     const uint64_t K = (uint64_t) s.n_expert_used, FS = (uint64_t) s.n_ff_shexp;
-    if (!mapped(T * N * 4, (void**) &h_emb_, (void**) &m_emb_) ||
-        !mapped(T * k::kStepCount * 4, (void**) &h_step_, (void**) &m_step_) ||
+    const bool mapped_tokens = exl3_mode_ ? mapped(T * 4, (void**) &h_tokens_, (void**) &m_tokens_)
+                                          : mapped(T * N * 4, (void**) &h_emb_, (void**) &m_emb_);
+    if (!mapped_tokens || !mapped(T * k::kStepCount * 4, (void**) &h_step_, (void**) &m_step_) ||
         !mapped(T * (NH + NKV) * 4, (void**) &h_pos_, (void**) &m_pos_) ||
         !mapped(T * 4 + 16, (void**) &h_out_, (void**) &m_out_)) {
         err = "plain model: mapped staging allocation failed";
@@ -606,6 +982,72 @@ bool PlainModel::open_experts(std::string& err) {
     const ModelSpec& s = spec_;
     n_moe_ = s.n_moe_layers() + (has_mtp_ ? 1 : 0);
     const int64_t L = n_moe_, E = s.n_expert;
+    if (exl3_mode_) {
+        Exl3ExpertSource::Names names((size_t) L * (size_t) E);
+        for (const auto& mapping : exl3_map_.projections) {
+            if (mapping.layer < 0 || mapping.layer >= L || mapping.expert < 0 || mapping.expert >= E) continue;
+            auto& name = names[(size_t) mapping.layer * (size_t) E + (size_t) mapping.expert];
+            if (mapping.kind == strata::artifact::exl3::ProjectionKind::expert_gate) name.gate = mapping.source_name;
+            if (mapping.kind == strata::artifact::exl3::ProjectionKind::expert_up) name.up = mapping.source_name;
+            if (mapping.kind == strata::artifact::exl3::ProjectionKind::expert_down) name.down = mapping.source_name;
+        }
+        exl3_source_ = std::make_unique<Exl3ExpertSource>();
+        if (!exl3_source_->open(exl3_archive_, L, E, std::move(names), err)) return false;
+        pool_ = std::make_unique<k::cpu::ExpertPool>(opt_.pool_workers);
+        std::vector<uint64_t> bytes((size_t) L * (size_t) E);
+        for (int64_t l = 0; l < L; ++l)
+            for (int64_t e = 0; e < E; ++e) {
+                const auto* layout = exl3_source_->exl3_layout(l, e);
+                if (layout == nullptr) { err = "plain model: EXL3 expert layout is missing"; return false; }
+                bytes[(size_t) l * (size_t) E + (size_t) e] = layout->total_bytes;
+            }
+        size_t free_b = 0, total_b = 0;
+        if (!strata::gpu::mem_info(&free_b, &total_b)) { err = "plain model: device memory is unknown"; return false; }
+        const uint64_t reserve = opt_.reserve_mib >= 0 ? (uint64_t) opt_.reserve_mib << 20
+                                                       : std::clamp<uint64_t>(total_b / 32, 192ull << 20, 768ull << 20);
+        const uint64_t entries = (uint64_t) opt_.max_t * (uint64_t) s.n_expert_used;
+        const auto align256 = [](uint64_t bytes) { return (bytes + 255u) & ~uint64_t(255u); };
+        const uint64_t plan_cap = 4u + (entries + 1u) + 2u * entries;
+        const uint64_t plan_i32 = ((plan_cap + 1u) & ~uint64_t(1u)) + 4u * entries + (entries + 1u) + 1u;
+        const uint64_t window_device =
+            align256(2u * (plan_i32 + 16u) * sizeof(int32_t)) +
+            align256(2u * entries * (uint64_t) s.n_embd * sizeof(float)) +
+            align256(entries * (sizeof(uint64_t) + 5u * sizeof(int32_t)) +
+                    (entries + 1u) * sizeof(int32_t) +
+                    (uint64_t) L * (uint64_t) E * sizeof(Exl3ExpertFormatDesc)) +
+            align256(entries * (uint64_t) std::max(s.n_embd, s.n_ff_exp) * 6u * sizeof(float));
+        uint64_t room = free_b > reserve + window_device ? free_b - reserve - window_device : 0;
+        std::vector<Exl3ExpertRuntime::ResidentPair> resident;
+        // Fill one resident pair per routed layer first, then round-robin by expert. The actual bytes of every pair
+        // are charged; EXL3 formats may differ by layer and are not rounded to max_blob.
+        for (int pass = 0; pass < 2; ++pass)
+            for (int64_t l = 0; l < L; ++l)
+                for (int64_t e = 0; e < E; ++e) {
+                    if (pass == 0 && e != 0) continue;
+                    if (pass == 1 && e == 0) continue;
+                    const size_t at = (size_t) l * (size_t) E + (size_t) e;
+                    const uint64_t aligned = (bytes[at] + 255u) & ~uint64_t(255u);
+                    if (aligned > room) continue;
+                    resident.emplace_back((int32_t) l, (int32_t) e);
+                    room -= aligned;
+                }
+        exl3_runtime_ = std::make_unique<Exl3ExpertRuntime>();
+        if (!exl3_runtime_->open(*exl3_source_, *pool_, opt_.max_t, s.n_expert_used, resident, err)) return false;
+        res_.clear();
+        free_.clear();
+        n_slots_ = (int64_t) resident.size();
+        opt_.adapt_every = 0;
+        MoeWindowShape ws{ s.n_embd, E, s.n_expert_used, opt_.max_t, 1 };
+        MoeWindowTier tier;
+        tier.exl3_runtime = exl3_runtime_.get();
+        if (!win_.init(ws, tier, err)) return false;
+        disp_.pool = pool_.get();
+        disp_.src = exl3_source_.get();
+        disp_.exl3_runtime = exl3_runtime_.get();
+        disp_.n_expert = E;
+        disp_.plan = win_.sink();
+        return true;
+    }
     std::vector<int64_t> blocks;
     for (int64_t l = 0; l < s.n_layer; ++l)
         if (s.layer_routes(l)) blocks.push_back(l);
@@ -825,6 +1267,7 @@ bool PlainModel::open_experts(std::string& err) {
 }
 
 int64_t PlainModel::resident() const {
+    if (exl3_mode_) return n_slots_;
     int64_t n = 0;
     for (int32_t r : res_) n += r >= 0;
     return n;
@@ -852,7 +1295,7 @@ void PlainModel::pool_fn(void* user, const float* x_f, const int32_t* ids, int64
     PlainModel* m = (PlainModel*) user;
     const int64_t E = m->spec_.n_expert;
     for (int64_t i = 0; i < n_tok * k; ++i)
-        if (ids[i] >= 0 && ids[i] < E) m->heat_[(size_t) (layer * E + ids[i])] += 1.0;
+        if (!m->heat_.empty() && ids[i] >= 0 && ids[i] < E) m->heat_[(size_t) (layer * E + ids[i])] += 1.0;
     m->disp_.layers = layer;
     expert_pool_dispatch_multi(m->disp_, x_f, ids, n_tok, k, out);
 }
@@ -871,6 +1314,10 @@ bool PlainModel::record_block(const Block& b, int64_t ml, int T, uint32_t& ring,
     const int32_t* pos_q = pos_;
     const int32_t* pos_k = pos_ + (size_t) opt_.max_t * NH;
     auto proj = [&](const W& w, const float* x, float* y, int ncols, bool quantize) {
+        if (exl3_mode_) {
+            if (!run_projection(w, x, y, ncols, quantize, cs, err)) throw std::runtime_error(err);
+            return;
+        }
         if (w.type == kBF16) {   // from the FP32 rows x (row stride n_in), as llama.cpp's float products
             k::bf16_gemv_fp32_mmvf_multi(x, w.n_in, static_cast<const uint16_t*>(w.data), y, w.n_out, w.n_in, w.n_out,
                                          ncols, cs);
@@ -893,7 +1340,7 @@ bool PlainModel::record_block(const Block& b, int64_t ml, int T, uint32_t& ring,
         proj(b.z, hn_, z_, T, false);
         // alpha and beta, one shape and type: one launch where the pair kernel takes the type (nextsycl's
         // Qwen3.5 decode fuses the two products)
-        if (b.alpha.type == kBF16 || b.alpha.type == kF32 || b.alpha.type != b.beta.type ||
+        if (exl3_mode_ || b.alpha.type == kBF16 || b.alpha.type == kF32 || b.alpha.type != b.beta.type ||
             b.alpha.n_in != b.beta.n_in || b.alpha.n_out != b.beta.n_out ||
             !k::native_mmvq_pair(b.alpha.type, b.alpha.data, b.beta.data, xq_, alpha_, beta_, b.alpha.n_in,
                                  b.alpha.n_out, T, cs)) {
@@ -947,7 +1394,7 @@ bool PlainModel::record_block(const Block& b, int64_t ml, int T, uint32_t& ring,
     k::add_inplace(x_, mix_, (int64_t) T * N, cs);
 
     // the MoE: route, publish, the shared expert while the host serves, then the experts and the combine
-    const bool sh_q8 = has_shared_ && b.sh_gate.type != kBF16 && b.sh_down.type != kBF16;
+    const bool sh_q8 = !exl3_mode_ && has_shared_ && b.sh_gate.type != kBF16 && b.sh_down.type != kBF16;
     if (sh_q8) k::native_qsa_rms_norm_weighted_q8_1(x_, b.post_norm, hn_, xq_, (int) N, T, eps, cs);
     else k::native_qsa_rms_norm_weighted(x_, b.post_norm, hn_, (int) N, T, eps, cs);
     k::f32_gemv_fp32_mmvf_multi(hn_, N, b.router, rlog_, E, N, E, T, cs);
@@ -961,7 +1408,13 @@ bool PlainModel::record_block(const Block& b, int64_t ml, int T, uint32_t& ring,
         proj(b.sh_down, sh_gate_, shared_, T, true);
         k::f32_gemv_fp32_mmvf_multi(hn_, N, b.sh_gate_inp, sh_g_, 1, N, 1, T, cs);
     } else if (has_shared_) {
-        if (!k::native_mmvq_pair(b.sh_gate.type, b.sh_gate.data, b.sh_up.data, xq_, sh_gate_, sh_up_, (int) N,
+        if (exl3_mode_) {
+            proj(b.sh_gate, hn_, sh_gate_, T, true);
+            proj(b.sh_up, hn_, sh_up_, T, false);
+            k::native_swiglu_f32(sh_gate_, sh_up_, sh_gate_, (int) FS, T, cs);
+            proj(b.sh_down, sh_gate_, shared_, T, true);
+            k::f32_gemv_fp32_mmvf_multi(hn_, N, b.sh_gate_inp, sh_g_, 1, N, 1, T, cs);
+        } else if (!k::native_mmvq_pair(b.sh_gate.type, b.sh_gate.data, b.sh_up.data, xq_, sh_gate_, sh_up_, (int) N,
                                  (int) FS, T, cs)) {
             k::native_mmvq(b.sh_gate.type, b.sh_gate.data, xq_, sh_gate_, (int) N, (int) FS, T, cs);
             k::native_mmvq(b.sh_up.type, b.sh_up.data, xq_, sh_up_, (int) N, (int) FS, T, cs);
@@ -991,7 +1444,10 @@ bool PlainModel::record_window(int T, strata::gpu::Stream cs, std::string& err) 
     const int64_t N = s.n_embd, NH = s.n_head;
     const float eps = (float) s.rms_eps;
     const int64_t NKV = attn_shapes(s, nkv_).n_head_kv;
-    k::copy_from_mapped(x_, m_emb_, (int64_t) T * N, cs);
+    if (exl3_mode_) {
+        k::copy_i32_from_mapped(m_tokens_, h_tokens_, T, cs);
+        exl3_embed_.gather_dev(m_tokens_, T, x_, cs);
+    } else k::copy_from_mapped(x_, m_emb_, (int64_t) T * N, cs);
     k::copy_i32_from_mapped(step_, m_step_, (int64_t) T * k::kStepCount, cs);
     k::copy_i32_from_mapped(pos_, m_pos_, (int64_t) opt_.max_t * (NH + NKV), cs);
     uint32_t ring = 0;
@@ -1003,6 +1459,11 @@ bool PlainModel::record_window(int T, strata::gpu::Stream cs, std::string& err) 
 }
 
 void PlainModel::head_logits(const float* x, int T, strata::gpu::Stream cs) {
+    if (exl3_mode_) {
+        std::string err;
+        if (!run_projection(head_, x, logits_, T, true, cs, err)) throw std::runtime_error(err);
+        return;
+    }
     if (head_.type == kBF16) {
         k::bf16_gemv_fp32_mmvf_multi(x, head_.n_in, static_cast<const uint16_t*>(head_.data), logits_, head_.n_out,
                                      head_.n_in, head_.n_out, T, cs);
@@ -1087,7 +1548,8 @@ bool PlainModel::stage(const int32_t* tokens, int T, int64_t pos, std::string& e
     const k::QsaShapes qs = attn_shapes(s, nkv_);
     for (int t = 0; t < T; ++t) {
         if (tokens[t] < 0 || tokens[t] >= n_vocab_) { err = "plain model: a token is out of the vocabulary"; return false; }
-        if (!k::cpu::native_row_to_float(emb_type_, emb_ + (size_t) tokens[t] * emb_row_, h_emb_ + (size_t) t * N, N)) {
+        if (exl3_mode_) h_tokens_[t] = tokens[t];
+        else if (!k::cpu::native_row_to_float(emb_type_, emb_ + (size_t) tokens[t] * emb_row_, h_emb_ + (size_t) t * N, N)) {
             err = "plain model: the embedding row could not be dequantized";
             return false;
         }
