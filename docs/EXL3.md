@@ -95,6 +95,7 @@ not GPU kernel execution. Correlate it with a GPU profiler timeline to verify ex
 task counts and waiting times for the four CPU phases on each calling host thread. At thread exit it emits an
 `exl3_prepare_summary` JSON record on standard error. RAM guard time is nested within source begin and excludes
 startup prewarm. CPU phases cover accepted row-parallel batches only; fallback counts are not measured.
+See [compressed tile preload](EXL3_WORD_TILE.md) for the optional path sharing Dense projection words.
 `ExpertDispatch::exl3_runtime` and `MoeWindowTier::exl3_runtime` connect it to the existing
 CPU-row/GPU-hit merge. The current path uses one group and rejects two groups. Segmented graphs are the default.
 In the segmented path, a `publish_window_plan` callback enqueues the hit-only grouped kernel on the

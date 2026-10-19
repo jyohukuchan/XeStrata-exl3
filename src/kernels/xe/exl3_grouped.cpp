@@ -9,6 +9,7 @@
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "cuda_intrinsics.hpp"
+#include "exl3_funnel.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_exl3_grouped
 #include "strata/kernels/device_arch_tag.hpp"
 
@@ -84,9 +85,9 @@ inline uint16_t extract_state(const uint16_t* packed, int bits, int state) {
     const int i0 = b0 / 32;
     const int i1 = (b1 - 1) / 32;
     const int shift = (i1 + 1) * 32 - b1;
-    const uint64_t merged = ((uint64_t) load_word32(packed, i0, word_count) << 32) |
-                            (uint64_t) load_word32(packed, i1, word_count);
-    return (uint16_t) ((merged >> shift) & 0xFFFFu);
+    const uint32_t hi = load_word32(packed, i0, word_count);
+    const uint32_t lo = load_word32(packed, i1, word_count);
+    return static_cast<uint16_t>(strata::kernels::xe::funnel_right_u32(hi, lo, static_cast<unsigned>(shift)));
 }
 
 inline uint32_t lop3_6a(uint32_t value) {

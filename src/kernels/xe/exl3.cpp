@@ -10,10 +10,12 @@
 
 #include "strata/kernels/f16_bits.hpp"
 #include "cuda_intrinsics.hpp"
+#include "exl3_word_tile.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_exl3
 #include "strata/kernels/device_arch_tag.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -93,9 +95,9 @@ inline uint16_t extract_state(const uint16_t* packed, int bits, int state) {
     const int i0 = b0 / 32;
     const int i1 = (b1 - 1) / 32;
     const int shift = (i1 + 1) * 32 - b1;
-    const uint64_t merged = ((uint64_t) load_word32(packed, i0, word_count) << 32) |
-                            (uint64_t) load_word32(packed, i1, word_count);
-    return (uint16_t) ((merged >> shift) & 0xFFFFu);
+    const uint32_t hi = load_word32(packed, i0, word_count);
+    const uint32_t lo = load_word32(packed, i1, word_count);
+    return static_cast<uint16_t>(strata::kernels::xe::funnel_right_u32(hi, lo, static_cast<unsigned>(shift)));
 }
 
 inline uint32_t lop3_6a(uint32_t value) {
@@ -161,9 +163,9 @@ inline uint16_t packed_extract_state(const uint16_t* tile, int state) {
     const int i0 = b0 / 32;
     const int i1 = (b1 - 1) / 32;
     const int shift = (i1 + 1) * 32 - b1;
-    const uint64_t merged = ((uint64_t) load_word32(tile, i0, word_count) << 32) |
-                            (uint64_t) load_word32(tile, i1, word_count);
-    return static_cast<uint16_t>((merged >> shift) & 0xFFFFu);
+    const uint32_t hi = load_word32(tile, i0, word_count);
+    const uint32_t lo = load_word32(tile, i1, word_count);
+    return static_cast<uint16_t>(strata::kernels::xe::funnel_right_u32(hi, lo, static_cast<unsigned>(shift)));
 }
 
 // Scalar fallback specialization: it keeps one output column per work item and avoids the subgroup requirement.
@@ -201,9 +203,10 @@ inline float scalar_decoded_weight(const MatrixView& view, int64_t row, int64_t 
     const int i0 = b0 / 32;
     const int i1 = (b1 - 1) / 32;
     const int shift = (i1 + 1) * 32 - b1;
-    const uint64_t merged = (static_cast<uint64_t>(load_word32(tile, i0, word_count)) << 32) |
-                            load_word32(tile, i1, word_count);
-    const uint16_t packed_state = static_cast<uint16_t>((merged >> shift) & 0xffffu);
+    const uint32_t hi = load_word32(tile, i0, word_count);
+    const uint32_t lo = load_word32(tile, i1, word_count);
+    const uint16_t packed_state =
+        static_cast<uint16_t>(strata::kernels::xe::funnel_right_u32(hi, lo, static_cast<unsigned>(shift)));
     return scalar_decode_codebook_f32<Codebook>(packed_state);
 }
 
@@ -326,6 +329,76 @@ sycl::event submit_packed_dot(sycl::queue& queue, const MatrixView& view, const 
     });
 }
 
+
+bool word_tile_preload_enabled() {
+    const char* text = std::getenv("STRATA_EXL3_WORD_TILE_PRELOAD");
+    return text != nullptr && text[0] == '1' && text[1] == '\0';
+}
+
+// RR is compile-time so bank masks remain constants, not an additional runtime mask table lookup.
+// Recursion retains exactly the baseline rr0..rr7 FP32 addition order under strict FP.
+template <int Bits, int RR = 0>
+inline void accumulate_word_tile(const word_cache::DistributedTile<Bits>& words, const sycl::sub_group& subgroup,
+                                  int lane, const float* input, int64_t k_tile, float& sum) {
+    static_assert(RR >= 0 && RR < 8);
+    const int r = 2 * RR + (lane >> 4);
+    const uint16_t packed_state = words.template state<RR>(subgroup, lane);
+    sum += input[k_tile * 16 + r] * scalar_decode_codebook_f32<2>(packed_state);
+    if constexpr (RR + 1 < 8)
+        accumulate_word_tile<Bits, RR + 1>(words, subgroup, lane, input, k_tile, sum);
+}
+
+template <int Bits>
+sycl::event submit_packed_dot_word_cache(sycl::queue& queue, const MatrixView& view, const float* x, int64_t ldx,
+                                         float* y, int64_t ldy, int64_t rows,
+                                         const std::vector<sycl::event>& deps, bool add_bias,
+                                         int split_k, int subgroup_size, int waves_per_group) {
+    const int64_t n_tiles = view.n / 16, k_tiles = view.k / 16;
+    const size_t groups = static_cast<size_t>(rows) * static_cast<size_t>(n_tiles);
+    const size_t local_size = static_cast<size_t>(waves_per_group * subgroup_size);
+    const size_t local_reduce_words = static_cast<size_t>(waves_per_group) * 16;
+    return queue.submit([&](sycl::handler& h) {
+        if (!deps.empty()) h.depends_on(deps);
+        sycl::local_accessor<float, 1> partial(sycl::range<1>(local_reduce_words), h);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>(groups * local_size), sycl::range<1>(local_size)),
+                       [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+            const auto subgroup = item.get_sub_group();
+            // reqd_sub_group_size(32) makes this mask exact and exposes the index domain to the compiler.
+            const int lane = static_cast<int>(subgroup.get_local_id()[0]) & 31;
+            const int wave = static_cast<int>(subgroup.get_group_id()[0]);
+            const size_t group = static_cast<size_t>(item.get_group_linear_id());
+            const int64_t row = static_cast<int64_t>(group / static_cast<size_t>(n_tiles));
+            const int64_t tile_n = static_cast<int64_t>(group % static_cast<size_t>(n_tiles));
+            const int64_t kb_begin = (k_tiles * wave) / split_k, kb_end = (k_tiles * (wave + 1)) / split_k;
+            const float* input = x + row * ldx;
+            float accum = 0.0f;
+            for (int64_t k_tile = kb_begin; k_tile < kb_end; ++k_tile) {
+                const uint16_t* source = view.trellis +
+                    (static_cast<size_t>(k_tile) * static_cast<size_t>(n_tiles) + static_cast<size_t>(tile_n)) *
+                    static_cast<size_t>(16 * Bits);
+                // Assemble logical words with the existing uint16 loads: no uint32 pointer cast or halo.
+                word_cache::DistributedTile<Bits> words{0, 0};
+                if (lane < Bits * 8) words.bank0 = load_word32(source, lane, Bits * 8);
+                if constexpr (Bits > 4)
+                    if (lane + 32 < Bits * 8) words.bank1 = load_word32(source, lane + 32, Bits * 8);
+                float sum = 0.0f;
+                accumulate_word_tile<Bits>(words, subgroup, lane, input, k_tile, sum);
+                accum += sum + sycl::select_from_group(subgroup, sum, lane ^ 16);
+            }
+            if (lane < 16) partial[static_cast<size_t>(wave) * 16 + static_cast<size_t>(lane)] = accum;
+            item.barrier();
+            if (wave == 0 && lane < 16) {
+                float sum = 0.0f;
+                for (int w = 0; w < split_k; ++w)
+                    sum += partial[static_cast<size_t>(w) * 16 + static_cast<size_t>(lane)];
+                const int64_t col = tile_n * 16 + lane;
+                if (add_bias && view.bias != nullptr) sum += f32_from_f16(view.bias[col]);
+                y[row * ldy + col] = sum;
+            }
+        });
+    });
+}
+
 bool packed_dot_capability(const sycl::queue& queue, const MatrixView& view, int64_t rows,
                            int& subgroup_size, int& split_k, int& waves_per_group) {
     if (view.k % 16 != 0 || view.n % 16 != 0 || rows <= 0) return false;
@@ -365,7 +438,13 @@ bool submit_packed_dot_dispatch(sycl::queue& queue, const MatrixView& view, cons
     if (!packed_dot_capability(queue, view, rows, subgroup_size, split_k, waves_per_group)) return false;
     #define EXL3_PACKED_DOT(B, C) \
         do { \
-            result = submit_packed_dot<B, C>(queue, view, x, ldx, y, ldy, rows, deps, add_bias, split_k, subgroup_size, waves_per_group); \
+            if constexpr (C == 2) { \
+                if (word_tile_preload_enabled()) \
+                    result = submit_packed_dot_word_cache<B>(queue, view, x, ldx, y, ldy, rows, deps, add_bias, split_k, subgroup_size, waves_per_group); \
+                else \
+                    result = submit_packed_dot<B, C>(queue, view, x, ldx, y, ldy, rows, deps, add_bias, split_k, subgroup_size, waves_per_group); \
+            } else \
+                result = submit_packed_dot<B, C>(queue, view, x, ldx, y, ldy, rows, deps, add_bias, split_k, subgroup_size, waves_per_group); \
             return true; \
         } while (false)
     switch (view.bits) {

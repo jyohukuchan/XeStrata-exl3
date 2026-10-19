@@ -88,6 +88,7 @@ GPU kernel の実行時間ではない。GPU profiler の timeline と照合し�
 borrow、host plan と CPU の4 phase の task 数・待機時間を集計し、thread 終了時に
 `exl3_prepare_summary` JSON を標準エラーへ出す。RAM guard は source begin 内の部分時間で、
 起動時の prewarm は含めない。CPU phase は row-parallel を使えた batch のみを集計し、fallback 回数は測らない。
+Dense projection の圧縮 word を共有する任意の経路は、[tile の先読み](EXL3_WORD_TILE.ja.md)を参照。
 `ExpertDispatch::exl3_runtime` と `MoeWindowTier::exl3_runtime` は、この runtime を既存の CPU-row/GPU-hit
 merge に接続する。現在は1 group 構成を使い、2 group は拒否する。既定は segmented graph を使う。
 segmented 経路では `publish_window_plan` の直前 callback が同じ in-order queue に hit-only grouped kernel を投入し、
