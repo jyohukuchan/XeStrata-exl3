@@ -236,7 +236,6 @@ int main(int argc, char** argv) {
         float* d_x = device.upload(c.x);
         uint16_t* d_w = device.alloc<uint16_t>(c.wgold.size());
         float* d_y = device.alloc<float>(c.ygold.size());
-        float* d_scratch = device.alloc<float>((size_t) c.k + (size_t) c.n);
 
         MatrixView view;
         view.trellis = d_trellis;
@@ -247,6 +246,8 @@ int main(int argc, char** argv) {
         view.n = c.n;
         view.bits = (int) c.bits;
         view.codebook = (int) c.codebook;
+        const size_t scratch_elements = strata::kernels::exl3::exl3_gemv_scratch_elements(view);
+        float* d_scratch = device.alloc<float>(scratch_elements);
 
         // Use an explicit barrier as a dependency so this fixture exercises the same queue graph contract as the
         // eventual loader (the parity_device uploads have already completed before this point).
@@ -259,7 +260,6 @@ int main(int argc, char** argv) {
         for (size_t i = 0; i < got_w.size(); ++i)
             if (got_w[i] != c.wgold[i]) ++bad_w;
 
-        const size_t scratch_elements = strata::kernels::exl3::exl3_gemv_scratch_elements(view);
         const sycl::event gemv_ready = queue.ext_oneapi_submit_barrier();
         sycl::event gemv_event = strata::kernels::exl3::exl3_gemv_fp32(
             queue, view, d_x, d_y, d_scratch, scratch_elements, {}, {gemv_ready});
