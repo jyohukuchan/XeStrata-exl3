@@ -143,6 +143,14 @@ if(STRATA_BUILD_TESTS)
         COMMENT "Generating EXL3 reconstruction and linear reference fixtures")
       add_custom_target(strata_exl3_fixture DEPENDS ${_strata_exl3_fixture}
                         COMMENT "Preparing EXL3 numerical fixtures")
+      set(_strata_exl3_ngram_fixture ${CMAKE_CURRENT_BINARY_DIR}/exl3-ngram-fixtures.bin)
+      add_custom_command(OUTPUT ${_strata_exl3_ngram_fixture}
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/exl3_ngram_fixture.py
+                ${_strata_exl3_ngram_fixture}
+        DEPENDS tools/exl3_ngram_fixture.py
+        COMMENT "Generating EXL3 specialized n-gram row fixtures")
+      add_custom_target(strata_exl3_ngram_fixture DEPENDS ${_strata_exl3_ngram_fixture}
+                        COMMENT "Preparing EXL3 n-gram numerical fixtures")
     endif()
   endif()
 endif()
@@ -389,7 +397,7 @@ if(STRATA_ENABLE_XE)
   target_link_libraries(strata-load PRIVATE strata_core)
 
   add_library(strata_kernels STATIC src/kernels/xe/elementwise.cpp src/kernels/xe/iq_kernels.cpp
-                                    src/kernels/xe/exl3.cpp src/kernels/xe/exl3_expert.cpp
+                                    src/kernels/xe/exl3.cpp src/kernels/xe/exl3_expert.cpp src/kernels/xe/exl3_ngram.cpp
                                     src/kernels/xe/native_mmvq.cpp src/kernels/xe/rope.cpp
                                     src/kernels/xe/router.cpp src/kernels/xe/bf16_gemv.cpp
                                     src/kernels/xe/quantize_act.cpp src/kernels/xe/qsa.cpp
@@ -656,6 +664,14 @@ if(STRATA_ENABLE_XE)
   target_link_libraries(strata-image PRIVATE strata_image)
 
   if(STRATA_BUILD_TESTS)
+    add_executable(exl3_ngram_parity src/kernels/exl3_ngram_parity.cpp)
+    target_link_libraries(exl3_ngram_parity PRIVATE strata_kernels strata_kernels_cpu)
+    target_compile_options(exl3_ngram_parity PRIVATE -fno-fast-math -ffp-contract=off)
+    if(TARGET strata_exl3_ngram_fixture)
+      add_dependencies(exl3_ngram_parity strata_exl3_ngram_fixture)
+      add_test(NAME exl3_ngram_parity COMMAND exl3_ngram_parity ${_strata_exl3_ngram_fixture})
+      set_tests_properties(exl3_ngram_parity PROPERTIES TIMEOUT 120)
+    endif()
     add_executable(exl3_expert_parity src/kernels/exl3_expert_parity.cpp)
     target_link_libraries(exl3_expert_parity PRIVATE strata_kernels)
     target_compile_options(exl3_expert_parity PRIVATE -fno-fast-math -ffp-contract=off)
@@ -848,11 +864,16 @@ endif()
 
 add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
             src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp src/kernels/cpu/exl3.cpp
-            src/kernels/cpu/exl3_expert.cpp)
+            src/kernels/cpu/exl3_expert.cpp src/kernels/cpu/exl3_ngram.cpp)
 target_include_directories(strata_kernels_cpu PUBLIC include)
-set_source_files_properties(src/kernels/xe/exl3.cpp src/kernels/cpu/exl3.cpp src/kernels/cpu/exl3_expert.cpp
+set_source_files_properties(src/kernels/xe/exl3.cpp src/kernels/cpu/exl3.cpp
+                           src/kernels/cpu/exl3_expert.cpp src/kernels/cpu/exl3_ngram.cpp
                            PROPERTIES COMPILE_OPTIONS "-fno-fast-math;-ffp-contract=off;-Wall;-Wextra")
 if(STRATA_BUILD_TESTS)
+  add_executable(exl3_cpu_ngram_parity src/kernels/cpu/exl3_ngram_parity.cpp)
+  target_link_libraries(exl3_cpu_ngram_parity PRIVATE strata_kernels_cpu strata_warnings)
+  target_compile_options(exl3_cpu_ngram_parity PRIVATE -fno-fast-math -ffp-contract=off)
+  add_test(NAME exl3_cpu_ngram_parity COMMAND exl3_cpu_ngram_parity)
   add_executable(exl3_cpu_expert_parity src/kernels/cpu/exl3_expert_parity.cpp)
   target_link_libraries(exl3_cpu_expert_parity PRIVATE strata_kernels_cpu strata_warnings)
   target_compile_options(exl3_cpu_expert_parity PRIVATE -fno-fast-math -ffp-contract=off)

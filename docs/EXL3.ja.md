@@ -39,11 +39,16 @@ event 依存を受け取り、scratch は呼び出し側が確保する。CPU �
 `down(silu(gate(x)) * up(x))` を計算し、router weight は適用しない。expert cache や pool への接続は
 この演算部品とは別の処理になる。
 
+専用 n-gram decoder は、先頭の F16 row scale と160値の ringを通常の linear と区別して復号する。
+CPU は要求した row ID を選べ、SYCL は取得済みの packed rowを処理する。head bias は明示した head IDで
+選ぶ。FP32 出力と padding を扱い、呼び出し側はモデルの演算に必要な最後の F16 丸めを別に行う。
+これは row codec の部品であり、model runtime の sidecar I/O と cache への接続は別に行う。
+
 NumPy のある環境で tests を有効にしてビルドすると、独立した fixture を使った CTest を実行できる。
 
 ```sh
 cmake --build build/free --target exl3_artifact_test exl3_cpu_parity exl3_parity \
-    exl3_cpu_expert_parity exl3_expert_parity
+    exl3_cpu_expert_parity exl3_expert_parity exl3_cpu_ngram_parity exl3_ngram_parity
 ctest --test-dir build/free -R '^exl3_' --output-on-failure
 ```
 

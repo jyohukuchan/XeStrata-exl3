@@ -41,11 +41,16 @@ dependencies, with caller-owned scratch. CPU linear operations also avoid expand
 `down(silu(gate(x)) * up(x))` without applying a router weight. Connecting the expert cache and pool is
 separate from these operations.
 
+The dedicated n-gram decoder treats its leading F16 row scale and 160-value ring separately from ordinary
+linears. CPU can select requested row IDs; SYCL processes packed rows already fetched by the caller.
+Head bias uses explicit head IDs. Outputs are FP32 with padded strides; callers separately choose any final
+F16 rounding required by model arithmetic. This row codec is separate from model-runtime sidecar I/O and caches.
+
 With NumPy available and tests enabled, build and run the CTests backed by independent fixtures.
 
 ```sh
 cmake --build build/free --target exl3_artifact_test exl3_cpu_parity exl3_parity \
-    exl3_cpu_expert_parity exl3_expert_parity
+    exl3_cpu_expert_parity exl3_expert_parity exl3_cpu_ngram_parity exl3_ngram_parity
 ctest --test-dir build/free -R '^exl3_' --output-on-failure
 ```
 

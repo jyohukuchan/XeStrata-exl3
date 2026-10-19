@@ -46,6 +46,13 @@ Every copyright holder whose work is in this repository, its license and where t
   MIT or public domain (the Unlicense), at your option - third_party/main/stb/stb_image.h (stb_image v2.30, an
   unmodified copy), which the image engine (strata-image) is compiled with - third_party/main/stb/LICENSE,
   LICENSES/MIT.txt, LICENSES/Unlicense.txt
+- Copyright (c) 2025 Turboderp; Copyright (c) 2026 jyohukuchan
+  MIT - EXL3 trellis, codebook, Hadamard and specialized n-gram storage rules transcribed from exllamav3
+  and rocm_exl3 in the EXL3 components under include/, src/ and tools/. The original code stays under MIT;
+  the changed files as a whole are under LGPL-3.0-or-later AND MIT - text below and LICENSES/MIT.txt
+- Copyright (c) 2013-2025 Niels Lohmann
+  MIT - third_party/main/nlohmann-json/nlohmann/json.hpp, the unchanged JSON for Modern C++ 3.12.0
+  single header used by the EXL3 archive reader - third_party/main/nlohmann-json/LICENSE
 - Copyright 2021 The Outfit Project Authors (https://github.com/Outfitio/Outfit-Fonts)
   SIL Open Font License 1.1 - third_party/main/outfit/, the web app's font - third_party/main/outfit/OFL.txt
 - Copyright Codeplay Software Limited; changes Copyright 2026 MistVVK and the XeStrata contributors
