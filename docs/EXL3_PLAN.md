@@ -48,7 +48,10 @@ and similar results as supplementary comparisons, not substitutes for IQuant.
 
 ### 1. Check precision feasibility first
 
-Create primary 2, 3, 4 and 5 bpw EXL3 packs from the same source model, covering `mul1`, `mcg`, `legacy/default (cb0)` and representative mixed precision recipes. Preserve valid checkpoint head bit widths as associated exceptions. Compare BF16, the existing XeStrata format and EXL3 on identical inputs. Keep perplexity or token log-likelihood, greedy token agreement and fixed Japanese, code, long-document and conversation evaluations.
+Create primary 2, 3, 4 and 5 bpw EXL3 packs from the same source model, covering `mul1`, `mcg`, `legacy/default (cb0)` and representative mixed precision recipes. Preserve valid checkpoint head bit widths as associated exceptions. Compare the BF16 teacher, existing XeStrata formats and EXL3 on identical holdout token sequences.
+KL divergence from the BF16 teacher is the sole precision criterion; record token-level mean, median,
+p90 and per-case distributions. Perplexity and greedy-token agreement, if retained, do not determine
+precision acceptance. Short Japanese, code and similar generation checks establish functionality.
 
 The precision gate is evidence of an improvement direction for a representative configuration at every target bpw, or a bit allocation that can produce it. If there is no improvement, distinguish a kernel limitation from a quantization recipe limitation and revisit the recipe. Do not proceed to large-scale performance work while the precision gate is missing; record evidence if the prerequisite is false.
 

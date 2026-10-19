@@ -44,7 +44,10 @@ Q4_K_M などの結果は補助比較として残し、IQuant 比較の代わり
 
 ### 1. 精度の成立性を先に確認
 
-同じ元モデルから主対象の 2、3、4、5 bpw の EXL3 pack を作り、`mul1`、`mcg`、`legacy/default (cb0)` と代表的な混合精度 recipe を用意する。checkpoint に実在する head の bit 幅は付随する例外として保持する。BF16、既存 XeStrata 形式、EXL3 を同じ入力で比較し、perplexity または token log-likelihood、greedy token 一致率、固定した日本語・コード・長文・会話の評価を残す。
+同じ元モデルから主対象の 2、3、4、5 bpw の EXL3 pack を作り、`mul1`、`mcg`、`legacy/default (cb0)` と代表的な混合精度 recipe を用意する。checkpoint に実在する head の bit 幅は付随する例外として保持する。BF16 教師、既存 XeStrata 形式、EXL3 を同じ holdout token 列で比較する。精度の判定指標は
+BF16 教師に対する KL のみとし、token ごとの値から mean・median・p90 と case ごとの分布を記録する。
+perplexity や greedy token 一致率を保存した場合も、精度の達成条件には使わない。
+日本語・コードなどの短い生成は動作確認として扱う。
 
 この段階で、少なくとも対象 bpw ごとに代表構成の改善方向、または改善できる bit 配分が確認できることを精度ゲートとする。改善がないときは kernel の実装不足と量子化 recipe の不足を分け、recipe を見直す。精度ゲート未達のまま大規模な高速化へ進めず、前提条件が不成立ならその証拠を記録する。
 
