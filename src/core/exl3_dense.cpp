@@ -3,6 +3,7 @@
 #include "strata/core/exl3_dense.hpp"
 
 #include "strata/artifact/exl3.hpp"
+#include "strata/artifact/exl3_remap.hpp"
 #include "strata/core/gpu.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/runtime.hpp"
@@ -16,6 +17,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace strata::core {
@@ -129,6 +131,7 @@ void Exl3Dense::reset() {
     runtime_ = nullptr;
     raw_ = false;
     attached_ = nullptr;
+    detached_table_.reset();
 }
 
 bool Exl3Dense::pointers_owned_by(const Runtime* runtime) const {
@@ -168,6 +171,13 @@ bool Exl3Dense::load(const strata::artifact::exl3::Archive& archive, const std::
 
 bool Exl3Dense::load(const strata::artifact::exl3::Archive& archive, const std::string& hf_name,
                      const std::string& canonical_name, WeightTable& table, std::string& err, int64_t max_rows) {
+    return load_remapped(archive, hf_name, canonical_name, {}, {}, table, err, max_rows);
+}
+
+bool Exl3Dense::load_remapped(const strata::artifact::exl3::Archive& archive, const std::string& hf_name,
+                              const std::string& canonical_name, const std::vector<int64_t>& input_blocks,
+                              const std::vector<int64_t>& output_blocks, WeightTable& table, std::string& err,
+                              int64_t max_rows) {
     err.clear();
     if (runtime_ != nullptr || attached_ != nullptr) {
         err = "exl3 dense: the owner is already loaded";
@@ -186,6 +196,8 @@ bool Exl3Dense::load(const strata::artifact::exl3::Archive& archive, const std::
         if (ref.native_data != nullptr) throw std::runtime_error(canonical_name + " already has a native projection");
         const strata::artifact::exl3::LinearDescriptor* descriptor = archive.find_linear(hf_name);
         if (descriptor == nullptr) {
+            if (!input_blocks.empty() || !output_blocks.empty())
+                throw std::runtime_error("raw projections require explicit raw-axis mapping");
             const strata::artifact::exl3::TensorDescriptor* weight = archive.find_tensor(hf_name + ".weight");
             if (weight == nullptr) {
                 throw std::runtime_error("head weight is missing from both EXL3 and raw archive forms: " + hf_name);
@@ -223,13 +235,22 @@ bool Exl3Dense::load(const strata::artifact::exl3::Archive& archive, const std::
             if (!prepare_stream(nullptr, err)) throw std::runtime_error(err);
             return true;
         }
-        if (descriptor->k != ref.ne0 || descriptor->n != ref.ne1 || descriptor->k <= 0 || descriptor->n <= 0)
+        if (descriptor->k != ref.ne0 || (output_blocks.empty() && descriptor->n != ref.ne1) ||
+            descriptor->k <= 0 || descriptor->n <= 0)
             throw std::runtime_error(canonical_name + " shape does not match the EXL3 descriptor");
         if (descriptor->k % 128 != 0 || descriptor->n % 128 != 0)
             throw std::runtime_error(canonical_name + " is not 128-aligned for the EXL3 Hadamard path");
 
         strata::artifact::exl3::MaterializedMatrix materialized;
         archive.materialize(*descriptor, materialized);
+        if (!input_blocks.empty() || !output_blocks.empty()) {
+            strata::artifact::exl3::MaterializedMatrix remapped;
+            if (!strata::artifact::exl3::remap_matrix_blocks(materialized, input_blocks, output_blocks, remapped, err))
+                throw std::runtime_error(err);
+            materialized = std::move(remapped);
+        }
+        if (materialized.k != ref.ne0 || materialized.n != ref.ne1)
+            throw std::runtime_error(canonical_name + " shape does not match the remapped EXL3 matrix");
         const auto host_view = materialized.view();
         runtime_ = &Runtime::get();
         max_rows_ = max_rows;
@@ -260,6 +281,30 @@ bool Exl3Dense::load(const strata::artifact::exl3::Archive& archive, const std::
         reset();
         return false;
     }
+}
+
+bool Exl3Dense::load_detached(const strata::artifact::exl3::Archive& archive, const std::string& hf_name,
+                              int64_t input_width, int64_t output_width, const std::vector<int64_t>& input_blocks,
+                              const std::vector<int64_t>& output_blocks, std::string& err, int64_t max_rows) {
+    if (runtime_ != nullptr || attached_ != nullptr) {
+        err = "exl3 dense: the owner is already loaded";
+        return false;
+    }
+    if (input_width <= 0 || output_width <= 0 ||
+        input_width > std::numeric_limits<int64_t>::max() / output_width) {
+        err = "exl3 dense: invalid detached projection dimensions";
+        return false;
+    }
+    auto table = std::make_unique<WeightTable>();
+    WeightRef ref;
+    ref.ne0 = input_width;
+    ref.ne1 = output_width;
+    ref.elements = input_width * output_width;
+    table->table_.emplace("exl3.detached", ref);
+    if (!load_remapped(archive, hf_name, "exl3.detached", input_blocks, output_blocks, *table, err, max_rows))
+        return false;
+    detached_table_ = std::move(table);
+    return true;
 }
 
 bool Exl3Dense::prepare_stream(void* stream, std::string& err) {

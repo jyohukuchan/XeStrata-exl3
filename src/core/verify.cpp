@@ -4,6 +4,7 @@
 // src/core/verify.cpp - see include/strata/core/verify.hpp.
 #include "strata/core/verify.hpp"
 
+#include "strata/core/exl3_dense.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/kernels/iq_kernels.hpp"
@@ -19,6 +20,7 @@
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/native_gdn_preprocess.hpp"
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/native_qsa_indexer.hpp"
 #include "strata/kernels/native_rope.hpp"
@@ -189,8 +191,72 @@ const WeightRef* need(const LayerView& v, const char* suffix, std::string& err) 
 
 bool native_of(const WeightRef* w, const std::string& name, std::string& err) {
     if (w == nullptr) return false;
+    if (w->exl3 != nullptr) return true;
     if (w->native_data == nullptr) {
         err = "verify: " + name + " is not served natively (run with --native)";
+        return false;
+    }
+    return true;
+}
+
+// Native verify projections normally consume one shared Q8_1 image.  An EXL3
+// owner must receive the original FP32 rows instead; feeding it the native
+// image would silently quantize an already quantized activation.  Run owner
+// rows individually so the helper remains valid for owners loaded with the
+// head-compatible max_rows=1 contract and does not allocate in capture.
+bool verify_native_projection(const WeightRef& weight, const float* x_f32, int64_t ldx, const uint8_t* x_q8,
+                              float* y, int64_t ldy, int64_t n_in, int64_t n_out, int64_t rows, void* stream,
+                              const std::string& name, std::string& err) {
+    if (weight.exl3 != nullptr) {
+        if (x_f32 == nullptr || y == nullptr || rows <= 0 || ldx < n_in || ldy < n_out) {
+            err = "verify: " + name + " EXL3 projection has invalid FP32 spans";
+            return false;
+        }
+        for (int64_t row = 0; row < rows; ++row) {
+            if (!weight.exl3->run(x_f32 + row * ldx, ldx, y + row * ldy, ldy, 1, stream, err)) {
+                if (err.empty()) err = "verify: " + name + " EXL3 projection failed";
+                return false;
+            }
+        }
+        return true;
+    }
+    if (!native_of(&weight, name, err) || x_q8 == nullptr || y == nullptr || rows <= 0) return false;
+    try {
+        strata::kernels::native_mmvq(weight.native_type, weight.native_data, x_q8, y, (int) n_in, (int) n_out,
+                                     (int) rows, stream);
+    } catch (const std::exception& error) {
+        err = "verify: " + name + ": " + error.what();
+        return false;
+    }
+    return true;
+}
+
+bool verify_bf16_projection(const WeightRef& weight, const float* x_f32, int64_t ldx, float* y, int64_t ldy,
+                            int64_t n_in, int64_t n_out, int64_t rows, void* stream, const std::string& name,
+                            std::string& err) {
+    if (x_f32 == nullptr || y == nullptr || rows <= 0 || ldx < n_in || ldy < n_out) {
+        err = "verify: " + name + " projection has invalid FP32 spans";
+        return false;
+    }
+    if (weight.exl3 != nullptr) {
+        for (int64_t row = 0; row < rows; ++row)
+            if (!weight.exl3->run(x_f32 + row * ldx, ldx, y + row * ldy, ldy, 1, stream, err)) return false;
+        return true;
+    }
+    if (weight.kind != WeightKind::Bf16InF32) {
+        err = "verify: " + name + " source is not BF16; attach an EXL3 FP32 owner instead of downcasting it";
+        return false;
+    }
+    if (weight.data == nullptr) { err = "verify: " + name + " has no BF16 weight data"; return false; }
+    try {
+        const auto* weights = static_cast<const uint16_t*>(weight.data);
+        if (rows == 1) {
+            strata::kernels::bf16_gemv_fp32_mmvf(x_f32, weights, y, (int) n_in, (int) n_out, stream);
+        } else {
+            strata::kernels::bf16_gemv_fp32_mmvf_multi(x_f32, ldx, weights, y, ldy, n_in, n_out, rows, stream);
+        }
+    } catch (const std::exception& error) {
+        err = "verify: " + name + ": " + error.what();
         return false;
     }
     return true;
@@ -723,6 +789,19 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
             pending = false;
         }
         auto gr_read_group = [&](int half, bool apply, float* inj_prev, float* inj_out) {
+            const bool owner_read = wn[half]->exl3 || wd[half]->exl3 || wu[half]->exl3 || wi[half]->exl3;
+            if (owner_read) {
+                if (wn[half]->exl3 || !wd[half]->exl3 || !wu[half]->exl3 || !wi[half]->exl3) {
+                    err = v.name(pfx[half]) + ": mixed EXL3 and legacy hyper-connection projections are unsupported";
+                    return;
+                }
+                for (int t = tb; t < te; ++t) {
+                    if (apply) gr_write(Rt(t), bo_ + t * N, inj_prev + t * HC, gs, Rt(t), cs);
+                    if (!gr_read_exl3(*wn[half], *wd[half], *wu[half], wi[half], Rt(t), gs, ss.block.gr,
+                                      mixed_ + t * N, inj_out + t * HC, cs, err)) return;
+                }
+                return;
+            }
             FusedGrArgs fa[kFusedGrMaxT];
             for (int t = tb; t < te; ++t) {
                 FusedGrArgs& a = fa[t - tb];
@@ -742,6 +821,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                                 (int) (l * kProfPer + (half == 0 ? 27 : 30)));
         };
         gr_read_group(0, pending, inj2_, inj_);
+        if (!err.empty()) return false;
         // the read wrote mixed's q8_1 into xq_ itself (STRATA_HC_Q8's 32-column up)
         const bool mixed_q8 = wd[0]->hc_q8 != nullptr && wu[0]->hc_q8 != nullptr && fused_gr_q8_fuse();
         stamp(l, 1, grp);
@@ -755,6 +835,11 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                                 *wnm = need(v, "ssm_norm.weight", err), *wdt = need(v, "ssm_dt.bias", err),
                                 *wsa = need(v, "ssm_a", err);
                 if (!wqkv || !wg || !wout || !wa || !wb || !wc || !wnm || !wdt || !wsa) return false;
+                if ((!wa->exl3 && wa->kind != WeightKind::Bf16InF32) ||
+                    (!wb->exl3 && wb->kind != WeightKind::Bf16InF32)) {
+                    err = v.name("ssm_alpha/beta") + ": source is not BF16; attach EXL3 FP32 owners for these projections";
+                    return false;
+                }
                 if (!native_of(wqkv, v.name("attn_qkv.weight"), err) || !native_of(wg, v.name("attn_gate.weight"), err) ||
                     !native_of(wout, v.name("ssm_out.weight"), err))
                     return false;
@@ -765,17 +850,43 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                 float* hb = h_L_ + (size_t) gi * MT * C;
                 float* gate = gate_L_ + (size_t) gi * MT * HV;
                 float* beta = beta_L_ + (size_t) gi * MT * HV;
-                if (!mixed_q8) native_quantize_q8_1(xm, xq_, (int) N, n, cs);
+                auto run_gdn_ab = [&](void* on) -> bool {
+                    if (!wa->exl3 && !wb->exl3) {
+                        gdn_ab_multi(xm, (const uint16_t*) wa->data, (const uint16_t*) wb->data,
+                                     (const float*) wdt->data, (const float*) wsa->data,
+                                     gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N, (int) HV, n, on);
+                        return true;
+                    }
+                    // z_ is also the concurrent gate projection on the other
+                    // branch; keep alpha in the verify-only scratch region so
+                    // branch capture cannot alias its asynchronous reads.
+                    float* alpha = y_dummy_ + (size_t) tb * ZV;
+                    if (!verify_bf16_projection(*wa, xm, N, alpha, ZV, N, HV, n, on,
+                                                v.name("ssm_alpha.weight"), err) ||
+                        !verify_bf16_projection(*wb, xm, N, beta + (size_t) tb * HV, HV, N, HV, n, on,
+                                                v.name("ssm_beta.weight"), err)) return false;
+                    try {
+                        for (int t = 0; t < n; ++t) {
+                            native_gdn_beta_gate(beta + (size_t) (tb + t) * HV, HV, on);
+                            native_gdn_gate(alpha + (size_t) t * ZV, (const float*) wdt->data,
+                                            (const float*) wsa->data, gate + (size_t) (tb + t) * HV, HV, on);
+                        }
+                    } catch (const std::exception& error) {
+                        err = v.name("gdn_alpha_beta") + ": " + error.what();
+                        return false;
+                    }
+                    return true;
+                };
+                if (!mixed_q8 && (!wqkv->exl3 || !wg->exl3)) native_quantize_q8_1(xm, xq_, (int) N, n, cs);
                 if (br) {   // a/b and z beside q/k/v and the conv: they read only this layer's input (xm, xq_)
                     if (!fork(0)) { err = std::string("verify branch: ") + strata::gpu::last_error(); return false; }
-                    gdn_ab_multi(xm, (const uint16_t*) wa->data, (const uint16_t*) wb->data, (const float*) wdt->data,
-                                 (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N,
-                                 (int) HV, n, df_side_[0]);
+                    if (!run_gdn_ab(df_side_[0])) return false;
                     if (!fork(1)) { err = std::string("verify branch: ") + strata::gpu::last_error(); return false; }
-                    native_mmvq(wg->native_type, wg->native_data, xq_, z_ + (size_t) tb * ZV, (int) N, (int) ZV, n,
-                                df_side_[1]);
+                    if (!verify_native_projection(*wg, xm, N, xq_, z_ + (size_t) tb * ZV, ZV, N, ZV, n,
+                                                  df_side_[1], v.name("attn_gate.weight"), err)) return false;
                 }
-                native_mmvq(wqkv->native_type, wqkv->native_data, xq_, qkv + (size_t) tb * C, (int) N, (int) C, n, cs);
+                if (!verify_native_projection(*wqkv, xm, N, xq_, qkv + (size_t) tb * C, C, N, C, n, cs,
+                                              v.name("attn_qkv.weight"), err)) return false;
                 stamp(l, 2, grp);
                 if (batch_rec_) {   // each slot's rows from its own conv history (--batch-mtp: a slot's rows are contiguous)
                     for (int t = tb; t < te;) {
@@ -795,19 +906,18 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                 if (br) {   // gate, beta and z, before the recurrence reads them
                     if (!join(0) || !join(1)) { err = std::string("verify branch: ") + strata::gpu::last_error(); return false; }
                 } else {
-                    gdn_ab_multi(xm, (const uint16_t*) wa->data, (const uint16_t*) wb->data, (const float*) wdt->data,
-                                 (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N,
-                                 (int) HV, n, cs);
+                    if (!run_gdn_ab(cs)) return false;
                     stamp(l, 4, grp);
-                    native_mmvq(wg->native_type, wg->native_data, xq_, z_ + (size_t) tb * ZV, (int) N, (int) ZV, n, cs);
+                    if (!verify_native_projection(*wg, xm, N, xq_, z_ + (size_t) tb * ZV, ZV, N, ZV, n, cs,
+                                                  v.name("attn_gate.weight"), err)) return false;
                     stamp(l, 5, grp);
                 }
                 // the output norm also writes ssm_out's q8_1 input (the same bytes, a launch fewer; upstream
                 // 22abb92d, 0a22c467 for the batch's rows).  STRATA_QFUSE=0: a quantize launch of its own.
-                static const bool qfuse = [] {
+                const bool qfuse = [] {
                     const char* e = std::getenv("STRATA_QFUSE");
                     return e == nullptr || std::strtol(e, nullptr, 10) != 0;
-                }();
+                }() && !wout->exl3;
                 // the recurrence from the untouched state over tokens [0, te); outputs only for this group's
                 if (batch_rec_) {   // each slot's recurrence over its own rows, from its own state
                     for (int t = tb; t < te;) {
@@ -825,8 +935,9 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                 gdn_step_norm_multi(state, hb, (int) C, gate, beta, z_, (const float*) wnm->data, EPS, y_, (int) HK,
                                     (int) HV, te, self_commit ? one_ : nullptr, cs, tb, qfuse ? (void*) xq_ : nullptr);
                 stamp(l, 6, grp);
-                if (!qfuse) native_quantize_q8_1(y_ + (size_t) tb * ZV, xq_, (int) ZV, n, cs);
-                native_mmvq(wout->native_type, wout->native_data, xq_, bo_ + tb * N, (int) ZV, (int) N, n, cs);
+                if (!qfuse && !wout->exl3) native_quantize_q8_1(y_ + (size_t) tb * ZV, xq_, (int) ZV, n, cs);
+                if (!verify_native_projection(*wout, y_ + (size_t) tb * ZV, ZV, xq_, bo_ + tb * N, N,
+                                              ZV, N, n, cs, v.name("ssm_out.weight"), err)) return false;
             } else {
                 // ======================= QSA =======================
                 const int64_t qi = qsa_idx[(size_t) l];
@@ -837,6 +948,11 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                                 *wqn = need(v, "attn_q_norm.weight", err), *wkn = need(v, "attn_k_norm.weight", err),
                                 *wiqn = need(v, "indexer.q_norm.weight", err), *wikn = need(v, "indexer.k_norm.weight", err);
                 if (!wik || !wq || !wk || !wv || !wo || !wiq || !wqn || !wkn || !wiqn || !wikn) return false;
+                if ((!wik->exl3 && wik->kind != WeightKind::Bf16InF32) ||
+                    (!wiq->exl3 && wiq->kind != WeightKind::Bf16InF32)) {
+                    err = v.name("indexer.*_proj.weight") + ": source is not BF16; attach EXL3 FP32 owners";
+                    return false;
+                }
                 if (!native_of(wq, v.name("attn_q.weight"), err) || !native_of(wk, v.name("attn_k.weight"), err) ||
                     !native_of(wv, v.name("attn_v.weight"), err) || !native_of(wo, v.name("attn_output.weight"), err))
                     return false;
@@ -865,7 +981,8 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                     return e == nullptr || std::strtol(e, nullptr, 10) != 0;
                 }();
                 const bool qb = dec_batch && n > 1 && native_qsa_enabled() && native_rope_enabled() && (!st.kv_q4 || qb_q4);
-                if (!mixed_q8) native_quantize_q8_1(xm, xq_, (int) N, n, cs);
+                if (!mixed_q8 && (!wq->exl3 || !wk->exl3 || !wv->exl3 || !wo->exl3))
+                    native_quantize_q8_1(xm, xq_, (int) N, n, cs);
                 // the query side on branches (upstream 2e4ddf6e): q with its split, norm, RoPE and rotation on side 0, the
                 // indexer query on side 1, beside the K/V side; side 1 joins before the block scores, side 0 before
                 // attention (xq_ and mixed_ are not rewritten before then)
@@ -889,21 +1006,29 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                 };
                 if (qbr) {
                     if (!fork(0)) { err = std::string("verify branch: ") + strata::gpu::last_error(); return false; }
-                    native_mmvq(wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int) N,
-                                (int) (NH * 2 * HD), n, df_side_[0]);
+                    if (!verify_native_projection(*wq, xm, N, xq_, qfull_ + tb * NH * 2 * HD, NH * 2 * HD,
+                                                  N, NH * 2 * HD, n, df_side_[0], v.name("attn_q.weight"), err)) return false;
                     if (!q_split_norm_rope(df_side_[0])) return false;
                     if (st.kv_rot) fwht256_inplace_cuda(qcur_ + tb * NH * HD, (int64_t) n * NH, df_side_[0]);
                     if (!fork(1)) { err = std::string("verify branch: ") + strata::gpu::last_error(); return false; }
-                    bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wiq->data, qidx_ + tb * IQ * ID, IQ * ID,
-                                              N, IQ * ID, n, df_side_[1]);
+                    if (!verify_bf16_projection(*wiq, xm, N, qidx_ + tb * IQ * ID, IQ * ID, N, IQ * ID, n,
+                                                df_side_[1], v.name("indexer.q_proj.weight"), err)) return false;
                     norm_rope_on(qidx_ + tb * IQ * ID, wiqn, (int) (n * IQ), (int) ID, pos_i + tb * IQ, df_side_[1]);
                 }
-                if (qb) bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wik->data, idx_raw + tb * ID, ID, N, ID, n, cs);
-                else for (int t = tb; t < te; ++t)
-                    bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*) wik->data, idx_raw + t * ID, (int) N, (int) ID, cs);
+                if (wik->exl3) {
+                    if (!verify_bf16_projection(*wik, xm, N, idx_raw + tb * ID, ID, N, ID, n, cs,
+                                                v.name("indexer.k_proj.weight"), err)) return false;
+                } else if (qb) {
+                    bf16_gemv_fp32_mmvf_multi(xm, N, (const uint16_t*) wik->data, idx_raw + tb * ID, ID, N, ID, n, cs);
+                } else for (int t = tb; t < te; ++t) {
+                    bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*) wik->data, idx_raw + t * ID,
+                                        (int) N, (int) ID, cs);
+                }
                 stamp(l, 7, grp);
-                native_mmvq(wk->native_type, wk->native_data, xq_, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD), n, cs);
-                native_mmvq(wv->native_type, wv->native_data, xq_, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD), n, cs);
+                if (!verify_native_projection(*wk, xm, N, xq_, kcur_ + tb * NKV * HD, NKV * HD, N, NKV * HD, n,
+                                              cs, v.name("attn_k.weight"), err) ||
+                    !verify_native_projection(*wv, xm, N, xq_, vcur_ + tb * NKV * HD, NKV * HD, N, NKV * HD, n,
+                                              cs, v.name("attn_v.weight"), err)) return false;
                 if (qb) norm_rope(kcur_ + tb * NKV * HD, wkn, (int) (n * NKV), (int) HD, pos_k + tb * NKV);
                 else for (int t = tb; t < te; ++t) norm_rope(kcur_ + t * NKV * HD, wkn, (int) NKV, (int) HD, pos_ + t * NH);
                 if (st.kv_rot) {   // K and V rotated before they are stored (kv_q4.hpp)
@@ -979,16 +1104,15 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                                               rope_scaling(), cs);
                 }
                 stamp(l, 9, grp);
-                if (!qbr)
-                native_mmvq(wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD),
-                            n, cs);
+                if (!qbr && !verify_native_projection(*wq, xm, N, xq_, qfull_ + tb * NH * 2 * HD, NH * 2 * HD,
+                                                      N, NH * 2 * HD, n, cs, v.name("attn_q.weight"), err)) return false;
                 if (qbr) {
                     // the query side runs on the branches
                 } else if (qb) {
                     if (!q_split_norm_rope(cs)) return false;
                     if (st.kv_rot) fwht256_inplace_cuda(qcur_ + tb * NH * HD, (int64_t) n * NH, cs);   // <Hq, Hk> = <q, k>
-                    bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wiq->data, qidx_ + tb * IQ * ID, IQ * ID,
-                                              N, IQ * ID, n, cs);
+                    if (!verify_bf16_projection(*wiq, xm, N, qidx_ + tb * IQ * ID, IQ * ID, N, IQ * ID, n, cs,
+                                                v.name("indexer.q_proj.weight"), err)) return false;
                     norm_rope(qidx_ + tb * IQ * ID, wiqn, (int) (n * IQ), (int) ID, pos_i + tb * IQ);
                 } else {
                 for (int t = tb; t < te; ++t) {
@@ -1000,9 +1124,16 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                     norm_rope(qc, wqn, (int) NH, (int) HD, pos_ + t * NH);
                     if (st.kv_rot) fwht256_inplace_cuda(qc, NH, cs);   // <Hq, Hk> = <q, k>
                 }
+                if (wiq->exl3) {
+                    if (!verify_bf16_projection(*wiq, xm, N, qidx_ + tb * IQ * ID, IQ * ID, N, IQ * ID, n, cs,
+                                                v.name("indexer.q_proj.weight"), err)) return false;
+                } else for (int t = tb; t < te; ++t) {
+                    float* qx = qidx_ + t * IQ * ID;
+                    bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*) wiq->data, qx,
+                                        (int) N, (int) (IQ * ID), cs);
+                }
                 for (int t = tb; t < te; ++t) {
                     float* qx = qidx_ + t * IQ * ID;
-                    bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*) wiq->data, qx, (int) N, (int) (IQ * ID), cs);
                     norm_rope(qx, wiqn, (int) IQ, (int) ID, pos_ + t * NH);
                 }
                 }
@@ -1060,8 +1191,9 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                         qsa_gate_apply_f32(attn_ + t * NH * HD, qfull_ + t * NH * 2 * HD, s, attn32_ + t * NH * HD, cs);
                 }
                 stamp(l, 14, grp);
-                native_quantize_q8_1(attn32_ + tb * NH * HD, xq_, (int) (NH * HD), n, cs);
-                native_mmvq(wo->native_type, wo->native_data, xq_, bo_ + tb * N, (int) (NH * HD), (int) N, n, cs);
+                if (!wo->exl3) native_quantize_q8_1(attn32_ + tb * NH * HD, xq_, (int) (NH * HD), n, cs);
+                if (!verify_native_projection(*wo, attn32_ + tb * NH * HD, NH * HD, xq_, bo_ + tb * N, N,
+                                              NH * HD, N, n, cs, v.name("attn_output.weight"), err)) return false;
             }
         } catch (const std::exception& e) {
             err = "verify layer " + std::to_string(l) + ": " + e.what();
@@ -1069,6 +1201,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
         }
         stamp(l, 16, grp);
         gr_read_group(1, true, inj_, inj2_);
+        if (!err.empty()) return false;
         // the window's rows routed in 2 launches (one router GEMV reading the weight once, one
         // top-10) instead of 2 per token; every row's arithmetic is the single-token call's (STRATA_DEC_BATCH=0: old)
         const WeightRef* w_router = v.get("ffn_gate_inp.weight");
@@ -1079,7 +1212,8 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
         }();
         bool g_ready = false;   // the shared expert's raw gates came with the router's launch
         bool qdedup = false;    // the experts' q8_1 image of the input was made before the shared expert
-        if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10) {
+        if (dec_batch && n > 1 && w_router != nullptr && !w_router->exl3 &&
+            w_router->kind == WeightKind::Bf16InF32 && native_router_enabled() && NE == 512 && K == 10) {
             try {
                 // the shared expert's scalar gate as one more work-group of the router's launch (upstream b08cf3e1)
                 const WeightRef* w_sg = v.get("ffn_gate_inp_shexp.weight");
@@ -1130,9 +1264,28 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
             const WeightRef *wgi = need(v, "ffn_gate_inp_shexp.weight", err), *wsg = need(v, "ffn_gate_shexp.weight", err),
                             *wsu = need(v, "ffn_up_shexp.weight", err), *wsd = need(v, "ffn_down_shexp.weight", err);
             if (!wgi || !wsg || !wsu || !wsd) return false;
-            if (!native_of(wsg, v.name("ffn_gate_shexp.weight"), err) || !native_of(wsu, v.name("ffn_up_shexp.weight"), err) ||
+            const bool any_shared_owner = wgi->exl3 || wsg->exl3 || wsu->exl3 || wsd->exl3;
+            const bool all_shared_owner = wgi->exl3 && wsg->exl3 && wsu->exl3 && wsd->exl3;
+            if (any_shared_owner && !all_shared_owner) {
+                err = v.name("shared_expert") + ": mixed EXL3 and legacy shared projections are unsupported in verify";
+                return false;
+            }
+            if (all_shared_owner) {
+                for (int t = tb; t < te; ++t) {
+                    const float* row = mixed_ + (size_t) t * N;
+                    if (!wsg->exl3->run(row, N, sh_gate_ + (size_t) t * g.n_ff, g.n_ff, 1, cs, err) ||
+                        !wsu->exl3->run(row, N, sh_up_ + (size_t) t * g.n_ff, g.n_ff, 1, cs, err)) return false;
+                    shared_expert_swiglu_fp32(sh_gate_ + (size_t) t * g.n_ff,
+                                              sh_up_ + (size_t) t * g.n_ff, g.n_ff, cs);
+                    if (!wsd->exl3->run(sh_gate_ + (size_t) t * g.n_ff, g.n_ff, shared_ + (size_t) t * N, N, 1, cs, err) ||
+                        !wgi->exl3->run(row, N, sh_g_ + t, 1, 1, cs, err)) return false;
+                    shared_expert_sigmoid_scale_fp32(shared_ + (size_t) t * N, sh_g_ + t, N, cs);
+                }
+                gate_later_[grp] = false;
+            } else if (!native_of(wsg, v.name("ffn_gate_shexp.weight"), err) || !native_of(wsu, v.name("ffn_up_shexp.weight"), err) ||
                 !native_of(wsd, v.name("ffn_down_shexp.weight"), err))
                 return false;
+            if (!all_shared_owner) {
             NativeSharedWeights nsw;
             nsw.gate_type = wsg->native_type; nsw.gate_data = wsg->native_data;
             nsw.up_type = wsu->native_type; nsw.up_data = wsu->native_data;
@@ -1162,6 +1315,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
             } catch (const std::exception& e) {
                 err = std::string("verify shared expert: ") + e.what();
                 return false;
+            }
             }
         }
         if (strata::kernels::cpu::expert_layout().native) {

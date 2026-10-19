@@ -457,6 +457,7 @@ if(STRATA_ENABLE_XE)
                                    src/core/remote_experts.cpp src/core/expert_cache.cpp src/core/native_head.cpp
                                    src/core/native_dense.cpp src/core/exl3_dense.cpp src/core/verify.cpp
                                    src/core/exl3_expert_source.cpp src/core/exl3_expert_formats.cpp
+                                   src/core/exl3_expert_runtime.cpp
                                    src/core/moe_window.cpp
                                    src/core/plain_model.cpp src/core/pcie_split.cpp src/core/mtp.cpp
                                    src/core/conversation_snapshot.cpp src/core/conversation_state.cpp
@@ -702,6 +703,18 @@ if(STRATA_ENABLE_XE)
       add_test(NAME exl3_grouped_parity COMMAND exl3_grouped_parity --fixture ${_strata_exl3_fixture})
       set_tests_properties(exl3_grouped_parity PROPERTIES TIMEOUT 120)
     endif()
+    add_executable(exl3_projection_parity src/core/exl3_projection_parity.cpp)
+    target_link_libraries(exl3_projection_parity PRIVATE strata_engine)
+    target_include_directories(exl3_projection_parity SYSTEM PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/third_party/main/nlohmann-json)
+    target_compile_options(exl3_projection_parity PRIVATE -fno-fast-math -ffp-contract=off)
+    add_test(NAME exl3_projection_parity COMMAND exl3_projection_parity)
+    add_executable(exl3_embedding_parity src/core/exl3_embedding_parity.cpp)
+    target_link_libraries(exl3_embedding_parity PRIVATE strata_engine)
+    target_include_directories(exl3_embedding_parity SYSTEM PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/third_party/main/nlohmann-json)
+    target_compile_options(exl3_embedding_parity PRIVATE -fno-fast-math -ffp-contract=off)
+    add_test(NAME exl3_embedding_parity COMMAND exl3_embedding_parity)
     add_executable(exl3_expert_formats_test src/core/exl3_expert_formats_test.cpp)
     target_link_libraries(exl3_expert_formats_test PRIVATE strata_engine)
     add_test(NAME exl3_expert_formats_test COMMAND exl3_expert_formats_test)
@@ -709,6 +722,20 @@ if(STRATA_ENABLE_XE)
     target_link_libraries(expert_cache_buckets_test PRIVATE strata_engine)
     add_test(NAME expert_cache_buckets_test COMMAND expert_cache_buckets_test)
     set_tests_properties(expert_cache_buckets_test PROPERTIES SKIP_RETURN_CODE 77)
+    add_executable(exl3_expert_dispatch_test src/core/exl3_expert_dispatch_test.cpp)
+    target_link_libraries(exl3_expert_dispatch_test PRIVATE strata_engine)
+    target_include_directories(exl3_expert_dispatch_test SYSTEM PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/third_party/main/nlohmann-json)
+    target_compile_options(exl3_expert_dispatch_test PRIVATE -fno-fast-math -ffp-contract=off)
+    add_test(NAME exl3_expert_dispatch_test COMMAND exl3_expert_dispatch_test)
+    set_tests_properties(exl3_expert_dispatch_test PROPERTIES TIMEOUT 120)
+    add_executable(exl3_expert_runtime_test src/core/exl3_expert_runtime_test.cpp)
+    target_link_libraries(exl3_expert_runtime_test PRIVATE strata_engine)
+    target_include_directories(exl3_expert_runtime_test SYSTEM PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/third_party/main/nlohmann-json)
+    target_compile_options(exl3_expert_runtime_test PRIVATE -fno-fast-math -ffp-contract=off)
+    add_test(NAME exl3_expert_runtime_test COMMAND exl3_expert_runtime_test)
+    set_tests_properties(exl3_expert_runtime_test PROPERTIES TIMEOUT 120)
     add_executable(exl3_expert_source_test src/core/exl3_expert_source_test.cpp)
     target_link_libraries(exl3_expert_source_test PRIVATE strata_engine)
     target_include_directories(exl3_expert_source_test SYSTEM PRIVATE

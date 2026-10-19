@@ -86,6 +86,12 @@ bool shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
 /// Whether the shared expert's scalar gate is the native BF16 GEMV (shared_expert_set_native_bf16).
 bool shared_expert_native_bf16();
 
+/// FP32 postprocessing shared by the EXL3 owner path.  These wrappers keep
+/// the existing SwiGLU and scalar sigmoid arithmetic and are allocation-free,
+/// stream-ordered, and graph-capture safe.
+void shared_expert_swiglu_fp32(float* gate, const float* up, int64_t n_ff, void* stream);
+void shared_expert_sigmoid_scale_fp32(float* out, const float* scalar, int64_t n_embd, void* stream);
+
 /// The MoE block's final combination, `ref/moe.py::moe` L156:
 ///
 ///     y = sum over the k routed experts of  w[k] * parts[k]  +  shared

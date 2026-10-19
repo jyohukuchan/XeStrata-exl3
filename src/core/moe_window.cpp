@@ -5,6 +5,8 @@
 // The steps, their order and their kernels are Verifier::record_window's pre/post and Verifier::run's (verify.cpp),
 // so a model that uses this window computes its experts exactly as Qwen3.8's verify window does.
 #include "strata/core/moe_window.hpp"
+#include "strata/core/exl3_expert_runtime.hpp"
+#include "strata/core/runtime.hpp"
 
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/elementwise.hpp"
@@ -58,28 +60,40 @@ MoeWindow::~MoeWindow() {
 
 bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std::string& err) {
     const auto& lay = strata::kernels::cpu::expert_layout();
-    if (shape.n_embd <= 0 || shape.n_embd % 256 || shape.n_expert <= 0 || shape.k < 1 || shape.k > 64 ||
+    const bool exl3 = tier.exl3_runtime != nullptr;
+    if (shape.n_embd <= 0 || (exl3 ? shape.n_embd % 128 : shape.n_embd % 256) || shape.n_expert <= 0 ||
+        shape.k < 1 || shape.k > 64 ||
         shape.max_t < 1 || shape.max_t > strata::kernels::kVerifyMaxT || shape.max_t > strata::kernels::cpu::MAXT ||
         (shape.groups != 1 && shape.groups != 2)) {
         err = "moe window: the shape is out of range";
         return false;
     }
-    if (lay.n_expert != shape.n_expert || lay.n_layers <= 0) {
+    if (exl3 && shape.groups != 1) {
+        err = "moe window: EXL3 runtime currently supports one persistent plan group";
+        return false;
+    }
+    if ((!exl3 && (lay.n_expert != shape.n_expert || lay.n_layers <= 0)) ||
+        (exl3 && (tier.exl3_runtime->hidden() != shape.n_embd || tier.exl3_runtime->n_expert() != shape.n_expert ||
+                  tier.exl3_runtime->routed_k() != shape.k || tier.exl3_runtime->max_entries() <
+                      static_cast<int64_t>(shape.max_t) * shape.k))) {
         err = "moe window: the expert layout is not this model's";
         return false;
     }
-    if (tier.cache_base == nullptr || tier.blob <= 0) {
+    if (!exl3 && (tier.cache_base == nullptr || tier.blob <= 0)) {
         err = "moe window: needs the VRAM expert tier";
         return false;
     }
     sh_ = shape;
     tier_ = tier;
+    exl3_runtime_ = tier.exl3_runtime;
     int64_t max_ff = 0;
     bf16_ = false;
-    for (int64_t l = 0; l < lay.n_layers; ++l) {
-        max_ff = std::max<int64_t>(max_ff, lay.native ? lay.fmt[(size_t) l].n_ff : strata::kernels::cpu::FF);
-        bf16_ = bf16_ || (lay.native && lay.fmt[(size_t) l].gu_type == 30);
-    }
+    if (exl3) max_ff = tier.exl3_runtime->max_ff();
+    else
+        for (int64_t l = 0; l < lay.n_layers; ++l) {
+            max_ff = std::max<int64_t>(max_ff, lay.native ? lay.fmt[(size_t) l].n_ff : strata::kernels::cpu::FF);
+            bf16_ = bf16_ || (lay.native && lay.fmt[(size_t) l].gu_type == 30);
+        }
 
     const uint64_t T = (uint64_t) shape.max_t, N = (uint64_t) shape.n_embd, K = (uint64_t) shape.k;
     bool ok = mapped(T * N * 4, (void**) &h_x_, (void**) &m_x_) &&
@@ -107,12 +121,12 @@ bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std
         plan_ = b.take<int32_t>(2 * ((uint64_t) plan_i32_ + 16));
         parts_ = b.take<float>(T * K * N);
         hit_out_ = b.take<float>(T * K * N);
-        staging_ = b.take<uint8_t>((uint64_t) kStagingBlobs * lay.max_blob);
-        nat_xq_ = b.take<uint8_t>(T * (N / 32) * 36);
+        staging_ = b.take<uint8_t>(exl3 ? 0 : (uint64_t) kStagingBlobs * lay.max_blob);
+        nat_xq_ = b.take<uint8_t>(exl3 ? 0 : T * (N / 32) * 36);
         nat_xf_ = b.take<float>(bf16_ ? T * N : 0);
-        hit_xq_ = b.take<uint8_t>(T * (N / 32) * 34);
-        hit_xs_ = b.take<float>(T * (N / 32));
-        hit_scratch_ = b.take<uint8_t>(std::max<uint64_t>(
+        hit_xq_ = b.take<uint8_t>(exl3 ? 0 : T * (N / 32) * 34);
+        hit_xs_ = b.take<float>(exl3 ? 0 : T * (N / 32));
+        hit_scratch_ = b.take<uint8_t>(exl3 ? 0 : std::max<uint64_t>(
             strata::kernels::moe_hit_grouped_scratch_bytes((int64_t) (T * K), shape.n_embd, max_ff),
             strata::kernels::native_expert_scratch_bytes((int64_t) (T * K), max_ff)));
     };
@@ -134,6 +148,13 @@ bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std
     const char* v = std::getenv("STRATA_VERIFY_SEGMENTED");
     segmented_ = v != nullptr ? std::strtol(v, nullptr, 10) != 0 : !strata::kernels::doorbell_visible(probe);
     strata::gpu::stream_destroy(probe);
+    if (exl3_runtime_ != nullptr) {
+        if (v != nullptr && std::strtol(v, nullptr, 10) == 0) {
+            err = "moe window: EXL3 runtime requires segmented graph execution";
+            return false;
+        }
+        segmented_ = true;
+    }
     return true;
 }
 
@@ -148,9 +169,14 @@ void MoeWindow::set_plan_slot(int grp) {
     sink_.ptr = reinterpret_cast<unsigned long long*>(base + ptr_off);
     sink_.ptr2 = sink_.ptr + cap;
     sink_.start2 = base + ptr_off + 4 * cap;
-    const int64_t per = sh_.groups == 2 ? kStagingBlobs / 2 : kStagingBlobs;
-    sink_.staging = (unsigned long long) (staging_ + (size_t) (grp * per) * strata::kernels::cpu::expert_layout().max_blob);
-    sink_.staging_cap = per;
+    if (exl3_runtime_ != nullptr) {
+        sink_.staging = 0;
+        sink_.staging_cap = 0;
+    } else {
+        const int64_t per = sh_.groups == 2 ? kStagingBlobs / 2 : kStagingBlobs;
+        sink_.staging = (unsigned long long) (staging_ + (size_t) (grp * per) * strata::kernels::cpu::expert_layout().max_blob);
+        sink_.staging_cap = per;
+    }
 }
 
 // Flag B only rises: a host function of an earlier ring may run after a later ring already raised it directly.
@@ -188,6 +214,7 @@ void MoeWindow::publish(uint32_t ring, int grp, int tb, int n, const float* x, c
     const int64_t N = sh_.n_embd, K = sh_.k;
     doorbell_publish(x, ids, w, (int64_t) n * N, (int64_t) n * K, m_x_ + (size_t) tb * N, m_ids_ + (size_t) tb * K,
                      m_w_ + (size_t) tb * K, m_seq_, cs);
+    if (exl3_runtime_ != nullptr) return;
     if (cpu::expert_layout().native) quantize_q8_1_rows(x, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
     else quantize_q8_0_scaled(x, hit_xq_ + (size_t) tb * (N / 32) * 34, hit_xs_ + (size_t) tb * (N / 32), (int64_t) n * N, cs);
     if (bf16_) copy_from_mapped(nat_xf_ + (size_t) tb * N, x, (int64_t) n * N, cs);   // the BF16 experts' FP32 rows
@@ -195,6 +222,36 @@ void MoeWindow::publish(uint32_t ring, int grp, int tb, int n, const float* x, c
 
 bool MoeWindow::experts(int64_t layer, uint32_t ring, int grp, int tb, int n, strata::gpu::Stream cs, std::string& err) {
     using namespace strata::kernels;
+    if (exl3_runtime_ != nullptr) {
+        const int64_t N = sh_.n_embd, K = sh_.k;
+        if (layer < 0 || layer >= exl3_runtime_->n_layers() || grp != 0 || tb < 0 || n <= 0 ||
+            tb > sh_.max_t - n) {
+            err = "moe window: EXL3 ring geometry is invalid";
+            return false;
+        }
+        const int64_t cap = (int64_t) n * K;
+        int32_t* pl = plan_ + (size_t) grp * (size_t) (plan_i32_ + 16);
+        if (!segmented_) wait_flag_ge(m_flagA_, ring, cs);
+        copy_i32_from_mapped(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, cs);
+        const int32_t* p_counts = pl;
+        const int32_t* p_start = pl + 4;
+        const int32_t* p_dst = p_start + sink_.cap + 1;
+        try {
+            sycl::queue& queue = Runtime::get().stream(cs);
+            if (!exl3_runtime_->record_enqueue(queue, m_x_ + (size_t) tb * N, N,
+                                                hit_out_ + (size_t) tb * K * N, N, err))
+                return false;
+            if (!segmented_) wait_flag_ge(m_flag_, ring, cs);
+            copy_rows_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N,
+                                  cap, N, p_dst, p_counts + 1, cs);
+            moe_hit_add(parts_ + (size_t) tb * K * N, hit_out_ + (size_t) tb * K * N, p_dst,
+                        p_counts + 1, cap, N, cs);
+        } catch (const std::exception& e) {
+            err = "moe window, EXL3 layer " + std::to_string(layer) + ": " + e.what();
+            return false;
+        }
+        return true;
+    }
     const auto& lay = cpu::expert_layout();
     if (layer < 0 || layer >= lay.n_layers) { err = "moe window: the MoE layer is out of range"; return false; }
     const int64_t N = sh_.n_embd, K = sh_.k;
@@ -277,6 +334,7 @@ bool MoeWindow::serve(int64_t rings, const int64_t* layers, const int* grps, con
             err = std::string("moe window: segment ") + std::to_string(r) + ": " + strata::gpu::last_error();
             return false;
         }
+        if (exl3_runtime_ != nullptr && r > 0) exl3_runtime_->mark_gpu_consumed();
         while (*seq < want) {
             _mm_pause();
             if ((++spins & 1023u) != 0) continue;
@@ -339,6 +397,15 @@ bool MoeWindow::serve(int64_t rings, const int64_t* layers, const int* grps, con
     if (!strata::gpu::stream_sync(copy_)) {   // no host function of this window may raise flag B in the next one
         err = std::string("moe window: the expert copies: ") + strata::gpu::last_error();
         return false;
+    }
+    if (exl3_runtime_ != nullptr) {
+        // The last segment still reads the persistent host plan. Do not let
+        // another window overwrite it until that graph has consumed it.
+        if (!strata::gpu::stream_sync(cs)) {
+            err = std::string("moe window: final EXL3 segment: ") + strata::gpu::last_error();
+            return false;
+        }
+        exl3_runtime_->mark_gpu_consumed();
     }
     if (times) {
         t_tail += std::chrono::duration<double, std::milli>(Clock::now() - last_answer).count();

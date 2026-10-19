@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/core/expert_source.cpp - the adapter.  See the header for the three clauses of the contract.
 #include "strata/core/expert_source.hpp"
+#include "strata/core/exl3_expert_runtime.hpp"
 #include "strata/core/remote_experts.hpp"
 
 #include "strata/kernels/cpu/expert_layout.hpp"
@@ -2217,6 +2218,45 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         d.failed = true;
         d.fail = "a verify window routes more entries than the expert pool's window tables hold";
         d.fail_layer = d.layers;
+        return;
+    }
+    if (d.exl3_runtime != nullptr) {
+        auto fail_runtime = [&](const std::string& message) {
+            d.fail_storage = message;
+            d.failed = true;
+            d.fail = d.fail_storage.c_str();
+            d.fail_layer = d.layers;
+        };
+        const int64_t entries = n_tok * k;
+        if (d.plan == nullptr) {
+            fail_runtime("EXL3 runtime dispatch requires a MoeWindow plan sink");
+            return;
+        }
+        if (d.src == nullptr || d.src != d.exl3_runtime->source()) {
+            fail_runtime("EXL3 runtime dispatch source does not match ExpertDispatch");
+            return;
+        }
+        if (k != d.exl3_runtime->routed_k() || n_tok > d.exl3_runtime->max_entries() / k) {
+            fail_runtime("EXL3 runtime dispatch window geometry does not match ExpertDispatch");
+            return;
+        }
+        std::string runtime_error;
+        if (!d.exl3_runtime->prepare_window(d.layers, x_f, d.exl3_runtime->hidden(), ids, n_tok, out,
+                                            d.exl3_runtime->hidden(), runtime_error) ||
+            !d.exl3_runtime->publish_window_plan(*d.plan, runtime_error) || !d.exl3_runtime->run_cpu(runtime_error)) {
+            fail_runtime(runtime_error.empty() ? "EXL3 runtime window preparation failed" : runtime_error);
+            return;
+        }
+        if (!d.usage.empty() && !d.usage_by_window)
+            for (int64_t i = 0; i < entries; ++i)
+                if (ids[i] >= 0 && ids[i] < d.n_expert)
+                    d.usage[(size_t) d.layers * (size_t) d.n_expert + (size_t) ids[i]] += 1.0f;
+        d.multi_entries += entries;
+        d.multi_misses += d.exl3_runtime->miss_experts();
+        d.cache_hits += d.exl3_runtime->hit_entries();
+        d.cache_refused += d.exl3_runtime->miss_entries();
+        d.layers++;
+        d.experts += entries;
         return;
     }
     if (d.src != nullptr && d.src->exl3_layout(0, 0) != nullptr) {

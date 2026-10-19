@@ -25,6 +25,8 @@
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/native_gdn.hpp"
 #include "strata/kernels/native_gdn_preprocess.hpp"
+#include "strata/kernels/native_gr_norm.hpp"
+#include "strata/kernels/native_gr_postops.hpp"
 #include "strata/kernels/native_router.hpp"
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/native_qsa_indexer.hpp"
@@ -57,7 +59,7 @@ uint64_t q8k_bytes(int64_t n) { return (uint64_t) (n / Q8K_ELEMS_PER_BLOCK) * Q8
 /// `s_gemv_q8k` takes the canonical-form attributes; a `WeightRef` carries them, and a tensor that is NOT
 /// quantized has none.  Returns false and names the tensor rather than building a form out of zeroes - which
 /// would decode every code as `0 + bias` and produce a perfectly finite wrong answer.
-bool sform_of(const WeightRef& r, strata::kernels::SForm& f, const std::string& name, std::string& err) {    if (!r.quantized()) {        err = name + " is not a quantized tensor, so it has no S-form";        return false;    }    f.code_bits = r.code_bits;    f.code_bias = r.code_bias;    f.group_elems = r.group_elems;    f.codebook = r.codebook_iq4nl ? strata::kernels::Codebook::Iq4Nl : strata::kernels::Codebook::Affine;    f.has_offset = r.has_offset;    f.act_kind = r.act_kind;
+bool sform_of(const WeightRef& r, strata::kernels::SForm& f, const std::string& name, std::string& err) {    if (r.exl3 != nullptr) { f = {}; return true; }    if (!r.quantized()) {        err = name + " is not a quantized tensor, so it has no S-form";        return false;    }    f.code_bits = r.code_bits;    f.code_bias = r.code_bias;    f.group_elems = r.group_elems;    f.codebook = r.codebook_iq4nl ? strata::kernels::Codebook::Iq4Nl : strata::kernels::Codebook::Affine;    f.has_offset = r.has_offset;    f.act_kind = r.act_kind;
 // carried, not derived - see the note on `SForm::act_kind`
 return true;}
 /// The three canonical planes of a quantized tensor, located INSIDE the loaded region.
@@ -87,23 +89,32 @@ struct Planes {    const uint8_t* codes = nullptr;    const float* scales = null
 ///< null when the form has none
 };
 bool plane_ptrs(const WeightRef& r, const std::string& name, Planes& out, std::string& err) {
+if (r.exl3 != nullptr) { out = {}; return true; }
 // S2, S4 AND S8 ALL SPLIT THE SAME WAY.  The plane LOCATION does not depend on the code width - the three
 // sizes come from the index and are checked against the tensor below - so the guard is here to catch a
 // tensor that is not quantized at all, not to pick a decoder.  WHICH KERNEL reads the planes is the
 // caller's choice and the two differ: an S2 tensor's activation contract is Q8_0 (`s2_gemv_q8`) while a
 // K-quant's is Q8_K (`s_gemv_q8k`).  This used to accept only 4 and 8, which refused `attn_q` - a Q2_0
 // tensor and the reason the QSA layer could not be composed at all.
-if (r.code_bits != 2 && r.code_bits != 4 && r.code_bits != 8) {        err = name + ": code_bits " + std::to_string(r.code_bits) + " is not an S2/S4/S8 form";        return false;    }    const uint64_t end = r.codes_bytes + r.scales_bytes + r.offset_bytes;    if (r.codes_bytes == 0 || r.scales_bytes == 0 || end != r.bytes) {        char buf[320];        std::snprintf(buf, sizeof buf,                      "%s: the planes add up to %llu B but the tensor is %llu B (codes %llu, scales %llu, "                      "offsets %llu) - what the loader recorded is not the layout that was loaded",                      name.c_str(), (unsigned long long) end, (unsigned long long) r.bytes,                      (unsigned long long) r.codes_bytes, (unsigned long long) r.scales_bytes,                      (unsigned long long) r.offset_bytes);        err = buf;        return false;    }    if (r.has_offset != (r.offset_bytes != 0)) {        err = name + ": has_offset is " + std::to_string(r.has_offset ? 1 : 0) + " but the offset plane is " +              std::to_string(r.offset_bytes) + " B";        return false;    }    const uint8_t* base = (const uint8_t*) r.data;    out.codes = base;    out.scales = (const float*) (base + r.codes_bytes);    out.offset = r.offset_bytes ? (const float*) (base + r.codes_bytes + r.scales_bytes) : nullptr;    return true;}
+if (r.code_bits != 2 && r.code_bits != 4 && r.code_bits != 8) {        err = name + ": code_bits " + std::to_string(r.code_bits) + " is not an S2/S4/S8 form";        return false;    }    const uint64_t end = r.codes_bytes + r.scales_bytes + r.offset_bytes;    if (r.codes_bytes == 0 || r.scales_bytes == 0 || end != r.bytes) {        char buf[320];        std::snprintf(buf, sizeof buf,                      "%s: the planes add up to %llu B but the tensor is %llu B (codes %llu, scales %llu, "                      "offsets %llu) - what the loader recorded is not the layout that was loaded",                      name.c_str(), (unsigned long long) end, (unsigned long long) r.bytes,                      (unsigned long long) r.codes_bytes, (unsigned long long) r.scales_bytes,                      (unsigned long long) r.offset_bytes);        err = buf;        return false;    }    if (r.has_offset != (r.offset_bytes != 0)) {        err = name + ": has_offset is " + std::to_string(r.has_offset ? 1 : 0) + " but the offset plane is " +              std::to_string(r.offset_bytes) + " B";        return false;    }    if (r.data == nullptr) { err = name + ": canonical weight data is missing"; return false; }    const uint8_t* base = (const uint8_t*) r.data;    out.codes = base;    out.scales = (const float*) (base + r.codes_bytes);    out.offset = r.offset_bytes ? (const float*) (base + r.codes_bytes + r.scales_bytes) : nullptr;    return true;}
 constexpr int TPR = 32;
 bool native_bf16_projections = false;
 bool native_flash_attn_short = false;
 
-void project_bf16(const float* x, const uint16_t* x_bf16, const uint16_t* weights, float* out,
-                  int64_t n_in, int64_t n_out, bool split, void* stream) {
+bool project_bf16(const WeightRef& weight, const float* x, const uint16_t* x_bf16, float* out,
+                  int64_t n_in, int64_t n_out, bool split, void* stream, std::string& err) {
+    if (weight.exl3 != nullptr) return weight.exl3->run(x, n_in, out, n_out, 1, stream, err);
+    if (weight.kind != WeightKind::Bf16InF32) {
+        err = "BF16 projection source is not BF16; attach an EXL3 FP32 owner instead of downcasting it";
+        return false;
+    }
     using namespace strata::kernels;
+    const auto* weights = static_cast<const uint16_t*>(weight.data);
+    if (weights == nullptr) { err = "BF16 projection has no loaded weight data"; return false; }
     if (native_bf16_projections) bf16_gemv_fp32_mmvf(x, weights, out, n_in, n_out, stream);
     else if (split) bf16_gemv_split(x_bf16, weights, out, n_in, n_out, TPR, stream);
     else bf16_gemv(x_bf16, weights, out, n_in, n_out, stream);
+    return true;
 }
 ///< threads per row for the row-split GEMVs.
 /// **MEASURED, NOT ASSUMED, AND 64 IS NOT BETTER.**  `dense_pass` drives the same split kernels at
@@ -146,6 +157,13 @@ void project_bf16(const float* x, const uint16_t* x_bf16, const uint16_t* weight
 /// picks.  Producing only the one it thinks it needs is how the assumption gets baked in again.
 bool gemv_quantized(const WeightRef& w, const Planes& p, const strata::kernels::SForm& f, const uint8_t* x80, const uint8_t* xq8k,                    float* y, int64_t n_in, int64_t n_out, const std::string& name, void* stream,                    std::string& err, const float* x_f32 = nullptr, bool x_q8_1_ready = false) {
     using namespace strata::kernels;
+    if (w.exl3 != nullptr) {
+        if (x_f32 == nullptr || n_in != w.ne0 || n_out != w.ne1) {
+            err = name + ": EXL3 projection requires matching FP32 input dimensions";
+            return false;
+        }
+        return w.exl3->run(x_f32, n_in, y, n_out, 1, stream, err);
+    }
     if (w.native_data) {
         if (!x_f32 || !w.native_q8_1 || !stream || n_in != w.ne0 || n_out != w.ne1) {
             err = name + ": native projection requires matching FP32 input and session scratch";
@@ -239,7 +257,7 @@ const float* conv_kernel = (const float*) w_conv->data;    const float* ssm_norm
 //         layer - producing only the "right" one is how the per-role assumption gets baked back in.
 st_begin(layer, 8, stream);
     // Plan v0.3 P3: the canonical activation images only when a canonical projection reads them.
-    if (!w_qkv->native_data || !w_gate->native_data) {
+    if ((!w_qkv->native_data && !w_qkv->exl3) || (!w_gate->native_data && !w_gate->exl3)) {
         quantize_q8_K(mixed, b.x_q8k, g.n_embd, stream);
         quantize_q8_0(mixed, b.x_q8_0, g.n_embd, stream);
     }
@@ -251,7 +269,8 @@ st_begin(layer, 9, stream);    if (!gemv_quantized(*w_qkv, p_qkv, f_qkv, b.x_q8_
 st_begin(layer, 10, stream);
 // Plan v0.3 P3: under the native contract, conv + SiLU + both L2 norms are one kernel, and alpha/beta with their
 // epilogues another (`fused_gdn.hpp`).
-const bool fused_pre = g_fused_gdn && native_gdn_enabled() && native_bf16_projections && g.ssm_d_conv == 4 &&
+const bool fused_pre = g_fused_gdn && native_gdn_enabled() && native_bf16_projections && !w_alpha->exl3 && !w_beta->exl3 &&
+                       w_alpha->kind == WeightKind::Bf16InF32 && w_beta->kind == WeightKind::Bf16InF32 && g.ssm_d_conv == 4 &&
                        g.ssm_state_size == 128;
 if (fused_pre) {
     fused_gdn_conv_l2(b.conv_state, b.qkv, conv_kernel, b.h, (int) C, (int) (2 * g.ssm_k_heads), RMS_EPS, stream);
@@ -295,8 +314,8 @@ st_begin(layer, 12, stream);
                      (int) g.n_embd, (int) g.ssm_v_heads, stream);
     } else {
     if (!native_bf16_projections) f32_to_bf16_bulk(mixed, b.x_bf16, g.n_embd, stream);
-    project_bf16(mixed, b.x_bf16, (const uint16_t*) w_alpha->data, b.alpha, g.n_embd, g.ssm_v_heads, true, stream);
-    project_bf16(mixed, b.x_bf16, (const uint16_t*) w_beta->data, b.beta, g.n_embd, g.ssm_v_heads, true, stream);
+    if (!project_bf16(*w_alpha, mixed, b.x_bf16, b.alpha, g.n_embd, g.ssm_v_heads, true, stream, err) ||
+        !project_bf16(*w_beta, mixed, b.x_bf16, b.beta, g.n_embd, g.ssm_v_heads, true, stream, err)) return false;
     }
     if (!fused_pre) try {
         if (native_gdn_enabled()) {
@@ -334,7 +353,7 @@ try {
 st_end(layer, 14, stream);
 // ---- 8. out = ssm_out @ y, whose activation is whatever THIS layer's `ssm_out` asks for
 st_begin(layer, 15, stream);
-    if (!w_out->native_data) {
+    if (!w_out->native_data && !w_out->exl3) {
         quantize_q8_K(b.y, b.y_q8k, g.ssm_value_dim, stream);
         quantize_q8_0(b.y, b.y_q8_0, g.ssm_value_dim, stream);
     }    if (!gemv_quantized(*w_out, p_out, f_out, b.y_q8_0, b.y_q8k, out, g.ssm_value_dim, g.n_embd,                        v.name("ssm_out.weight"), stream, err, b.y)) return false;    st_end(layer, 15, stream);    return true;}
@@ -371,7 +390,7 @@ if (!native_bf16_projections) f32_to_bf16_bulk(x, b.x_bf16, g.n_embd, stream);
 //      memory-bound floor and the largest single item left inside the MoE after the top-10 was fixed.
 //      `bf16_gemv_split` exists for precisely this case; its own header says so.  Measured here:
 //      LEDGER L41 -> L42.
-project_bf16(x, b.x_bf16, (const uint16_t*) w_router->data, b.logits, g.n_embd, g.n_expert, true, stream);
+if (!project_bf16(*w_router, x, b.x_bf16, b.logits, g.n_embd, g.n_expert, true, stream, err)) return false;
 // ---- routing: softmax over ALL experts, stable descending argsort with ties by index, gather, renormalise
 // the native fused router is canonical-512x10 only; anything else takes the generic top-k kernel
 if (native_router_enabled() && g.n_expert == 512 && k == 10) {
@@ -395,6 +414,31 @@ if (db != nullptr && g_publish_kernel) {
 // forever and the host would never see a change.
 strata::kernels::doorbell_ring(db->d_seq, stream);    }    return true;}
 bool moe_shared(const WeightTable& tables, const ModelGeometry& g, int64_t layer, const MoEBuffers& b,                const float* x, void* stream, std::string& err) {    using namespace strata::kernels;    const LayerView v(tables, layer);    const WeightRef* w_ginp = v.get("ffn_gate_inp_shexp.weight");    const WeightRef* w_sgate = v.get("ffn_gate_shexp.weight");    const WeightRef* w_sup = v.get("ffn_up_shexp.weight");    const WeightRef* w_sdown = v.get("ffn_down_shexp.weight");    const char* missing = !w_ginp ? "ffn_gate_inp_shexp.weight" : !w_sgate ? "ffn_gate_shexp.weight"                          : !w_sup ? "ffn_up_shexp.weight" : !w_sdown ? "ffn_down_shexp.weight" : nullptr;    if (missing) { err = v.name(missing) + " is missing"; return false; }
+    const bool any_owner = w_ginp->exl3 || w_sgate->exl3 || w_sup->exl3 || w_sdown->exl3;
+    const bool all_owner = w_ginp->exl3 && w_sgate->exl3 && w_sup->exl3 && w_sdown->exl3;
+    if (any_owner && !all_owner) {
+        err = v.name("shared_expert") + ": mixed EXL3 and legacy shared projections are unsupported";
+        return false;
+    }
+    if (all_owner) {
+        if (x == nullptr || b.shared == nullptr || b.sh_scratch == nullptr) {
+            err = v.name("shared_expert") + ": EXL3 owner path has invalid activation or scratch";
+            return false;
+        }
+        const uint64_t a = ((uint64_t) g.n_ff * sizeof(float) + 15) & ~uint64_t(15);
+        const uint64_t q0 = (((uint64_t) (g.n_ff / 32) * 34) + 15) & ~uint64_t(15);
+        const uint64_t qk = (((uint64_t) (g.n_ff / 256) * 292) + 15) & ~uint64_t(15);
+        float* gate = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(b.sh_scratch));
+        float* up = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(b.sh_scratch) + a);
+        float* scalar = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(b.sh_scratch) + a * 2 + q0 + qk);
+        if (!w_sgate->exl3->run(x, g.n_embd, gate, g.n_ff, 1, stream, err) ||
+            !w_sup->exl3->run(x, g.n_embd, up, g.n_ff, 1, stream, err)) return false;
+        shared_expert_swiglu_fp32(gate, up, g.n_ff, stream);
+        if (!w_sdown->exl3->run(gate, g.n_ff, b.shared, g.n_embd, 1, stream, err) ||
+            !w_ginp->exl3->run(x, g.n_embd, scalar, 1, 1, stream, err)) return false;
+        shared_expert_sigmoid_scale_fp32(b.shared, scalar, g.n_embd, stream);
+        return true;
+    }
 // ---- the shared expert.  Its three weights are quantized, so they need their planes.
 SForm f_gate, f_up, f_down;    if (!sform_of(*w_sgate, f_gate, v.name("ffn_gate_shexp.weight"), err)) return false;    if (!sform_of(*w_sup, f_up, v.name("ffn_up_shexp.weight"), err)) return false;    if (!sform_of(*w_sdown, f_down, v.name("ffn_down_shexp.weight"), err)) return false;    Planes p_gate, p_up, p_down;    if (!plane_ptrs(*w_sgate, v.name("ffn_gate_shexp.weight"), p_gate, err)) return false;    if (!plane_ptrs(*w_sup, v.name("ffn_up_shexp.weight"), p_up, err)) return false;    if (!plane_ptrs(*w_sdown, v.name("ffn_down_shexp.weight"), p_down, err)) return false;
 // `ffn_gate_inp_shexp` is a 1-D BF16 vector, so THE ARENA HOLDS 2 BYTES PER ELEMENT, not 4 - the loader
@@ -1027,9 +1071,11 @@ const auto normalize_rotate = [&](float* data, const WeightRef* norm, int rows, 
 struct Req { const char* suf; };    const WeightRef* w_idxk = v.get("indexer.k_proj.weight");    const WeightRef* w_attnq = v.get("attn_q.weight");    const WeightRef* w_attnk = v.get("attn_k.weight");    const WeightRef* w_attnv = v.get("attn_v.weight");    const WeightRef* w_attno = v.get("attn_output.weight");    const WeightRef* w_idxq = v.get("indexer.q_proj.weight");    const WeightRef* w_qn = v.get("attn_q_norm.weight");    const WeightRef* w_kn = v.get("attn_k_norm.weight");    const WeightRef* w_iqn = v.get("indexer.q_norm.weight");    const WeightRef* w_ikn = v.get("indexer.k_norm.weight");    const char* missing = !w_idxk ? "indexer.k_proj.weight" : !w_attnq ? "attn_q.weight"                          : !w_attnk ? "attn_k.weight" : !w_attnv ? "attn_v.weight"                          : !w_attno ? "attn_output.weight" : !w_idxq ? "indexer.q_proj.weight"                          : !w_qn ? "attn_q_norm.weight" : !w_kn ? "attn_k_norm.weight"                          : !w_iqn ? "indexer.q_norm.weight" : !w_ikn ? "indexer.k_norm.weight" : nullptr;    if (missing) { err = v.name(missing) + " is missing"; return false; }    if (pos < 0 || pos >= st.max_cells) {        err = "qsa_layer: pos " + std::to_string(pos) + " is outside the state's 0.." +              std::to_string(st.max_cells - 1);        return false;    }
 // THE TWO BF16 PROJECTIONS: the arena holds them re-rounded to 2 B/elem, which is what `bf16_gemv` wants.
 // Reading one as f32 would walk 2x its length inside the arena without faulting.
-if (w_idxk->kind != WeightKind::Bf16InF32 || w_idxq->kind != WeightKind::Bf16InF32) {        err = v.name("indexer.*_proj.weight") + " must be engine form 1 (bf16); they are " +              std::to_string((int) w_idxk->kind) + " and " + std::to_string((int) w_idxq->kind);        return false;    }
+if ((!w_idxk->exl3 && w_idxk->kind != WeightKind::Bf16InF32) ||
+    (!w_idxq->exl3 && w_idxq->kind != WeightKind::Bf16InF32)) {        err = v.name("indexer.*_proj.weight") + " must be engine form 1 (bf16); they are " +              std::to_string((int) w_idxk->kind) + " and " + std::to_string((int) w_idxq->kind);        return false;    }
 // ---- 1. the three activation formats, once each
-if (!w_attnk->native_data || !w_attnv->native_data || !w_attnq->native_data) {
+if ((!w_attnk->native_data && !w_attnk->exl3) || (!w_attnv->native_data && !w_attnv->exl3) ||
+    (!w_attnq->native_data && !w_attnq->exl3)) {
         quantize_q8_K(x, b.x_q8k, g.n_embd, stream);
         quantize_q8_0(x, b.x_q8_0, g.n_embd, stream);
     }
@@ -1051,7 +1097,7 @@ if (!w_attnk->native_data || !w_attnv->native_data || !w_attnq->native_data) {
         } else
         if (!strata::gpu::copy_async(st.step, st.host_step, qsa_step_bytes(), stream) ||            !strata::gpu::copy_async(st.pos_dev, st.host_pos, (size_t) g.n_head * 4, stream)) {            err = "qsa_layer: the step-state upload failed";            return false;        }    }
 // ---- 3. the indexer's RAW key: appended before any norm, pooled later once per block
-project_bf16(x, b.x_bf16, (const uint16_t*) w_idxk->data, b.idx_raw, g.n_embd, g.idx_key_dim, false, stream);
+if (!project_bf16(*w_idxk, x, b.x_bf16, b.idx_raw, g.n_embd, g.idx_key_dim, false, stream, err)) return false;
 // ---- 4. K and V, in Q8_K, then norm and rotate K only
 SForm f_k, f_v, f_o, f_q;    if (!sform_of(*w_attnk, f_k, v.name("attn_k.weight"), err)) return false;    if (!sform_of(*w_attnv, f_v, v.name("attn_v.weight"), err)) return false;    if (!sform_of(*w_attno, f_o, v.name("attn_output.weight"), err)) return false;    if (!sform_of(*w_attnq, f_q, v.name("attn_q.weight"), err)) return false;    Planes p_k, p_v, p_o, p_q;    if (!plane_ptrs(*w_attnk, v.name("attn_k.weight"), p_k, err)) return false;    if (!plane_ptrs(*w_attnv, v.name("attn_v.weight"), p_v, err)) return false;    if (!plane_ptrs(*w_attno, v.name("attn_output.weight"), p_o, err)) return false;    if (!plane_ptrs(*w_attnq, v.name("attn_q.weight"), p_q, err)) return false;
 // k and v, with the activation THIS layer's tensors ask for.  Both are K-quants in every QSA layer of this
@@ -1104,7 +1150,7 @@ if (!gemv_quantized(*w_attnq, p_q, f_q, b.x_q8_0, b.x_q8k, b.q_full, g.n_embd, g
 // case A) and needs no kernel.
 if (!strata::gpu::copy2d_async(b.qcur, (size_t) g.head_dim * 4, b.q_full, (size_t) g.head_dim * 2 * 4, (size_t) g.head_dim * 4, (size_t) g.n_head, stream)) {        err = "qsa_layer: the q/gate split failed";        return false;    }    if (!normalize_rotate(b.qcur, w_qn, (int) g.n_head, (int) g.head_dim)) return false;
 // ---- 7. the indexer's query: BF16, then norm and rotate
-project_bf16(x, b.x_bf16, (const uint16_t*) w_idxq->data, b.q_idx, g.n_embd, g.idx_q_heads * g.idx_key_dim, false, stream);
+if (!project_bf16(*w_idxq, x, b.x_bf16, b.q_idx, g.n_embd, g.idx_q_heads * g.idx_key_dim, false, stream, err)) return false;
 if (!normalize_rotate(b.q_idx, w_iqn, (int) g.idx_q_heads, (int) g.idx_key_dim)) return false;
 // ---- 8. score, select, gather, attend.  `max_blocks` and `cap` are CAPACITIES from the state, not this
 // token's counts: a grid or a shared-memory size that follows the sequence length is baked into a captured
@@ -1153,7 +1199,7 @@ try {
     if (native_qsa_enabled()) native_qsa_gate_apply(b.attn, b.q_full, b.attn32, (int) g.n_head, (int) g.head_dim, stream);
     else qsa_gate_apply_f32(b.attn, b.q_full, s, b.attn32, stream);
 } catch (const std::exception& error) { err = v.name("qsa_gate") + ": " + error.what(); return false; }
-    if (!w_attno->native_data) quantize_q8_K(b.attn32, b.attn_q8k, g.n_head * g.head_dim, stream);    if (w_attno->native_data) {
+    if (!w_attno->native_data && !w_attno->exl3) quantize_q8_K(b.attn32, b.attn_q8k, g.n_head * g.head_dim, stream);    if (w_attno->native_data || w_attno->exl3) {
     if (!gemv_quantized(*w_attno, p_o, f_o, nullptr, b.attn_q8k, out,
         g.n_head * g.head_dim, g.n_embd, v.name("attn_output.weight"), stream, err, b.attn32)) return false;
 } else {
@@ -1176,12 +1222,24 @@ void doorbell_reset(const Doorbell& db) {
 bool embed_row(const WeightTable& tables, const ModelGeometry& g, int64_t token, float* out_dev,
                void* stream, std::string& err) {
     if (const NativeEmbed* ne = native_embed()) {   // plan v0.3 P6: the GGUF-form table (IQ model files)
-        if (token < 0 || out_dev == nullptr) { err = "embed_row: invalid token or output"; return false; }
-        ne->gather_one(token, out_dev, stream);
-        return true;
+        const WeightRef* embedding = tables.find(EMBEDDING_NAME);
+        if (token < 0 || embedding == nullptr || token >= embedding->ne1 || out_dev == nullptr) {
+            err = "embed_row: invalid token or output"; return false;
+        }
+        try {
+            ne->gather_one(token, out_dev, stream);
+            return true;
+        } catch (const std::exception& error) {
+            err = std::string("embed_row: ") + error.what();
+            return false;
+        }
     }
     const WeightRef* w = tables.find(EMBEDDING_NAME);
     if (w == nullptr) { err = "token_embd.weight is missing"; return false; }
+    if (w->exl3 != nullptr) {
+        err = "embed_row: EXL3 token embedding row gather is unsupported";
+        return false;
+    }
     if (w->code_bits != 2 && w->code_bits != 4 && w->code_bits != 8) {
         err = "embed_row: token_embd.weight is not an S2/S4/S8 tensor";
         return false;
@@ -1228,6 +1286,49 @@ bool embed_row(const WeightTable& tables, const ModelGeometry& g, int64_t token,
                                        w->code_bits, w->code_bias, w->group_elems, out_dev, stream);
     return true;
 }
+bool gr_read_exl3(const WeightRef& norm, const WeightRef& down, const WeightRef& up, const WeightRef* inject,
+                  const float* R, const strata::kernels::GrShapes& shapes,
+                  const strata::kernels::GrWorkspace& ws, float* mixed, float* inject_out, void* stream,
+                  std::string& err) {
+    if (R == nullptr || mixed == nullptr || ws.xn == nullptr || ws.lo == nullptr || ws.gated == nullptr ||
+        norm.exl3 != nullptr || !down.exl3 || !up.exl3 || (inject != nullptr && !inject->exl3) ||
+        (inject != nullptr && inject_out == nullptr)) {
+        err = "EXL3 hyper-connection read requires F32 norm, EXL3 down/up owners, and a matching injection owner";
+        return false;
+    }
+    if (norm.kind != WeightKind::F32 || norm.data == nullptr) {
+        err = "EXL3 hyper-connection read requires a loaded F32 norm vector";
+        return false;
+    }
+    const int64_t n = shapes.n_embd, hc = shapes.hc, lr = shapes.hc_lr;
+    if (n <= 0 || hc <= 0 || lr <= 0 || n > std::numeric_limits<int>::max() / hc ||
+        lr > std::numeric_limits<int>::max()) {
+        err = "EXL3 hyper-connection read has invalid geometry";
+        return false;
+    }
+    const int64_t dim = n * hc;
+    if (norm.elements != dim || norm.bytes < static_cast<uint64_t>(dim) * sizeof(float) ||
+        down.ne0 != dim || down.ne1 != lr || up.ne0 != lr || up.ne1 != dim ||
+        (inject != nullptr && (inject->ne0 != dim || inject->ne1 != hc))) {
+        err = "EXL3 hyper-connection weights do not match the read geometry";
+        return false;
+    }
+    try {
+        strata::kernels::native_gr_rms_norm_weighted(R, static_cast<const float*>(norm.data), ws.xn,
+                                                      (int) n, (int) hc, RMS_EPS, stream);
+        if (!down.exl3->run(ws.xn, n * hc, ws.lo, lr, 1, stream, err)) return false;
+        strata::kernels::native_gr_down_silu(ws.lo, (int) lr, (int) hc, stream);
+        if (!up.exl3->run(ws.lo, lr, ws.gated, n * hc, 1, stream, err)) return false;
+        strata::kernels::native_gr_pre_gated(ws.xn, ws.gated, mixed, (int) n, (int) hc,
+                                             inject != nullptr, stream);
+        if (inject != nullptr && !inject->exl3->run(ws.xn, n * hc, inject_out, hc, 1, stream, err)) return false;
+    } catch (const std::exception& error) {
+        err = std::string("EXL3 hyper-connection read: ") + error.what();
+        return false;
+    }
+    return true;
+}
+
 bool lm_head_mix(const WeightTable& tables, const ModelGeometry& g, const BlockBuffers& bb,
                  void* stream, std::string& err) {
     const WeightRef* wn = tables.find("output_hc_norm.weight");
@@ -1236,6 +1337,14 @@ bool lm_head_mix(const WeightTable& tables, const ModelGeometry& g, const BlockB
     if (!wn || !wd || !wu) {
         err = "lm_head: an output_hc_* weight is missing";
         return false;
+    }
+    if (wn->exl3 || wd->exl3 || wu->exl3) {
+        if (wn->exl3 || !wd->exl3 || !wu->exl3) {
+            err = "lm_head: mixed EXL3 and legacy output hyper-connection projections are unsupported";
+            return false;
+        }
+        const strata::kernels::GrShapes shapes{g.n_embd, g.hc, g.hc_lr};
+        return gr_read_exl3(*wn, *wd, *wu, nullptr, bb.R, shapes, bb.gr, bb.mixed, nullptr, stream, err);
     }
     if (wn->kind != WeightKind::F32 || wd->kind != WeightKind::Bf16InF32 ||
         wu->kind != WeightKind::Bf16InF32) {
@@ -1369,10 +1478,15 @@ bool block_layer_pre(const WeightTable& tables, const ModelGeometry& g, int64_t 
     const bool qsa = is_qsa_layer(g, layer);    const LayerView v(tables, layer);    const strata::kernels::GrShapes gs{g.n_embd, g.hc, g.hc_lr};
 // ---- the two halves' GR tensors.  Both halves have the same four names with a different prefix, and the
 // prefix is the ONLY thing that distinguishes them - so it is built rather than written twice.
-const char* pre[2] = {"hc_attn_", "hc_ffn_"};    const WeightRef* w_norm[2];    const WeightRef* w_down[2];    const WeightRef* w_up[2];    const WeightRef* w_inject[2];    for (int h = 0; h < 2; ++h) {        const std::string a = std::string(pre[h]) + "norm.weight";        const std::string d = std::string(pre[h]) + "down.weight";        const std::string u = std::string(pre[h]) + "up.weight";        const std::string i = std::string(pre[h]) + "inject.weight";        w_norm[h] = v.get(a.c_str());        w_down[h] = v.get(d.c_str());        w_up[h] = v.get(u.c_str());        w_inject[h] = v.get(i.c_str());        if (!w_norm[h] || !w_down[h] || !w_up[h] || !w_inject[h]) {            err = v.name((std::string(pre[h]) + "{norm,down,up,inject}.weight").c_str()) + " is missing";            return false;        }
+const char* pre[2] = {"hc_attn_", "hc_ffn_"};    const WeightRef* w_norm[2];    const WeightRef* w_down[2];    const WeightRef* w_up[2];    const WeightRef* w_inject[2];    bool hc_owner[2] = {};    for (int h = 0; h < 2; ++h) {        const std::string a = std::string(pre[h]) + "norm.weight";        const std::string d = std::string(pre[h]) + "down.weight";        const std::string u = std::string(pre[h]) + "up.weight";        const std::string i = std::string(pre[h]) + "inject.weight";        w_norm[h] = v.get(a.c_str());        w_down[h] = v.get(d.c_str());        w_up[h] = v.get(u.c_str());        w_inject[h] = v.get(i.c_str());        if (!w_norm[h] || !w_down[h] || !w_up[h] || !w_inject[h]) {            err = v.name((std::string(pre[h]) + "{norm,down,up,inject}.weight").c_str()) + " is missing";            return false;        }
+hc_owner[h] = w_down[h]->exl3 || w_up[h]->exl3 || w_inject[h]->exl3 || w_norm[h]->exl3;
+        if (hc_owner[h] && (w_norm[h]->exl3 || !w_down[h]->exl3 || !w_up[h]->exl3 || !w_inject[h]->exl3)) {
+            err = v.name(pre[h]) + ": mixed EXL3 and legacy hyper-connection projections are unsupported";
+            return false;
+        }
 // The GR weights are BF16 and the arena holds them re-rounded to 2 B/elem.  `gr_read` wants exactly
 // that; handing it f32 bytes would walk 2x the tensor inside the arena without faulting.
-if (w_down[h]->kind != WeightKind::Bf16InF32 || w_up[h]->kind != WeightKind::Bf16InF32 ||            w_inject[h]->kind != WeightKind::Bf16InF32 || w_norm[h]->kind != WeightKind::F32) {            err = v.name(pre[h]) + "has the wrong engine forms (norm must be F32, the other three bf16)";            return false;        }    }
+if (!hc_owner[h] && (w_down[h]->kind != WeightKind::Bf16InF32 || w_up[h]->kind != WeightKind::Bf16InF32 ||            w_inject[h]->kind != WeightKind::Bf16InF32 || w_norm[h]->kind != WeightKind::F32)) {            err = v.name(pre[h]) + "has the wrong engine forms (norm must be F32, the other three bf16)";            return false;        }    }
 // ---- half 1: the mixer
 float* R = bb.R;
     // R0.11: WHICH STAGES TO RUN.  `stage_prefix == 0` means "as `half` says", so every caller that predates
@@ -1385,7 +1499,14 @@ float* R = bb.R;
     // and 0 is what every caller before this used.
     if (run0) {
 st_begin(layer, 0, stream);
-    if (fused) {
+    if (hc_owner[0]) {
+        if (pending_ffn) {
+            gr_write(R, bb.block_out, bb.inject2, gs, R, stream);
+            pending_ffn = false;
+        }
+        if (!gr_read_exl3(*w_norm[0], *w_down[0], *w_up[0], w_inject[0], R, gs, bb.gr, bb.mixed, bb.inject, stream, err))
+            return false;
+    } else if (fused) {
         strata::kernels::FusedGrArgs fa;
         fa.R = R; fa.R_out = R; fa.apply = pending_ffn; fa.bo_prev = bb.block_out; fa.inj_prev = bb.inject2;
         fa.w_norm = (const float*) w_norm[0]->data; fa.w_down = hc_bf16_view(w_down[0], 2, stream);
@@ -1399,7 +1520,7 @@ st_begin(layer, 0, stream);
     if (run1) {
     st_begin(layer, 1, stream);    if (qsa) {        if (!qsa_layer(tables, g, layer, pos, pos_base, qst, qb, bb.mixed, bb.block_out, stream, err,                            bb.dump))            return false;    } else {        if (!gdn_layer(tables, g, layer, gb, bb.mixed, bb.block_out, stream, err)) return false;    }    st_end(layer, 1, stream);    dump_half(bb, g, layer, bb.block_out, 0, g.n_embd, stream);        }
     if (run2) {
-    st_begin(layer, 2, stream);    if (!fused) gr_write(R, bb.block_out, bb.inject, gs, R, stream);    st_end(layer, 2, stream);
+    st_begin(layer, 2, stream);    if (!fused || hc_owner[0]) gr_write(R, bb.block_out, bb.inject, gs, R, stream);    st_end(layer, 2, stream);
 // ---- half 2, UP TO AND INCLUDING THE ROUTER.  `gr_read` leaves the normed activation in `bb.mixed` and
 // the per-stream injection in `bb.inject`, and BOTH must survive until `block_layer_post` runs - which is
 // the contract the two functions have with each other and with the host loop's ordering.
@@ -1408,7 +1529,11 @@ st_begin(layer, 0, stream);
     // the same contract `block_layer_post` has, and the reason the two are only meaningful in order.
     if (run3) {
 st_begin(layer, 3, stream);
-    if (fused) {
+    if (hc_owner[1]) {
+        gr_write(R, bb.block_out, bb.inject, gs, R, stream);
+        if (!gr_read_exl3(*w_norm[1], *w_down[1], *w_up[1], w_inject[1], R, gs, bb.gr, bb.mixed, bb.inject2, stream, err))
+            return false;
+    } else if (fused) {
         strata::kernels::FusedGrArgs fa;
         fa.R = R; fa.R_out = R; fa.apply = true; fa.bo_prev = bb.block_out; fa.inj_prev = bb.inject;
         fa.w_norm = (const float*) w_norm[1]->data; fa.w_down = hc_bf16_view(w_down[1], 2, stream);

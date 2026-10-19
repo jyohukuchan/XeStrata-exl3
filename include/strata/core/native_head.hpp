@@ -9,6 +9,10 @@
 #include <vector>
 #include <mutex>
 
+namespace strata::artifact::exl3 {
+class Archive;
+}
+
 namespace strata::core {
 
 /// Opt-in native output projection. Uploads unchanged GGUF blocks once at startup and owns its
@@ -50,6 +54,8 @@ public:
     NativeEmbed(const NativeEmbed&) = delete;
     NativeEmbed& operator=(const NativeEmbed&) = delete;
     bool load(const std::string& gguf, int64_t n_embd, int64_t n_vocab, std::string& err);
+    bool load_exl3(const strata::artifact::exl3::Archive& archive, const std::string& hf_name, int64_t n_embd,
+                   int64_t n_vocab, std::string& err);
     /// Rows for device token ids.
     void gather_dev(const int32_t* tokens, int64_t n_tok, float* out, void* stream) const;
     /// One row for a host token id.
@@ -58,6 +64,7 @@ public:
     int type() const { return type_; }
 
 private:
+    void reset();
     /// The table as the GPU that runs `stream` reads it.
     const void* table_for(void* stream) const;
     void* host_ = nullptr;
@@ -68,6 +75,8 @@ private:
     size_t row_ = 0;
     int64_t n_embd_ = 0, n_vocab_ = 0;
     int type_ = -1;
+    bool raw_ = false;
+    int raw_dtype_ = -1;
 };
 void set_native_embed(const NativeEmbed* e);
 const NativeEmbed* native_embed();

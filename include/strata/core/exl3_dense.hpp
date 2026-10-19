@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -48,6 +49,21 @@ public:
     /// Reuses an already validated archive and attaches to `canonical_name`.
     bool load(const strata::artifact::exl3::Archive& archive, const std::string& hf_name,
               const std::string& canonical_name, WeightTable& table, std::string& err, int64_t max_rows = 1);
+    /// Reorder whole H128 blocks and optionally select output blocks before
+    /// uploading packed weights. This preserves their exact quantization and
+    /// supports explicit projection splits. Empty maps are identity; raw
+    /// matrices require a separate raw-axis mapping and reject nonempty maps.
+    bool load_remapped(const strata::artifact::exl3::Archive& archive, const std::string& hf_name,
+                       const std::string& canonical_name, const std::vector<int64_t>& input_blocks,
+                       const std::vector<int64_t>& output_blocks, WeightTable& table, std::string& err,
+                       int64_t max_rows = 1);
+
+    /// Own a projection without attaching to an external canonical WeightTable.
+    /// The explicit target dimensions and block maps are validated identically
+    /// to load_remapped(); no synthetic pack or GGUF weight is required.
+    bool load_detached(const strata::artifact::exl3::Archive& archive, const std::string& hf_name,
+                       int64_t input_width, int64_t output_width, const std::vector<int64_t>& input_blocks,
+                       const std::vector<int64_t>& output_blocks, std::string& err, int64_t max_rows = 1);
 
     /// Prepare one runtime queue's persistent scratch before graph capture.
     /// The default compute queue is prepared by `load`; callers must prepare
@@ -85,6 +101,7 @@ private:
     bool raw_ = false;
     std::vector<StreamScratch> streams_;
     WeightRef* attached_ = nullptr;
+    std::unique_ptr<WeightTable> detached_table_;
 };
 
 }  // namespace strata::core

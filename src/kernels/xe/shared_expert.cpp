@@ -127,6 +127,19 @@ void sigmoid_scale_rows(sycl::queue& q, float* out, const float* g, int n, int n
 void shared_expert_set_native_bf16(bool enabled) { native_bf16 = enabled; }
 bool shared_expert_native_bf16() { return native_bf16; }
 
+void shared_expert_swiglu_fp32(float* gate, const float* up, int64_t n_ff, void* stream) {
+    if (gate == nullptr || up == nullptr || n_ff <= 0) throw std::invalid_argument("shared_expert_swiglu_fp32: invalid spans");
+    auto& q = queue_for(stream);
+    if (xe::has_fp64(q)) swiglu_t<double>(q, gate, up, gate, (int) n_ff);
+    else swiglu_t<float>(q, gate, up, gate, (int) n_ff);
+}
+
+void shared_expert_sigmoid_scale_fp32(float* out, const float* scalar, int64_t n_embd, void* stream) {
+    if (out == nullptr || scalar == nullptr || n_embd <= 0)
+        throw std::invalid_argument("shared_expert_sigmoid_scale_fp32: invalid spans");
+    sigmoid_scale_rows(queue_for(stream), out, scalar, (int) n_embd, 1);
+}
+
 bool shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, const NativeSharedWeights& nw,
                          const uint16_t* gate_inp_bf16, float* gate, float* up, float* g, float* out, int64_t n_embd,
                          int64_t n_ff, void* stream, bool gate_later, bool g_ready, const void* x_q8_1) {

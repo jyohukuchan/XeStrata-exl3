@@ -27,6 +27,8 @@
 
 namespace strata::core {
 
+class Exl3ExpertRuntime;
+
 /// The CPU pool for one ring: x_f (n_tok, n_embd), ids (n_tok, k) -> out (n_tok * k, n_embd), the GPU's rows zeroed;
 /// `layer` is the MoE layer (the expert layout's index).  Fills the plan through the window's sink (`sink()`).
 using MoePoolFn = void (*)(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
@@ -36,7 +38,7 @@ struct MoeWindowShape {
     int64_t n_embd = 0;
     int64_t n_expert = 0;
     int64_t k = 0;
-    int max_t = 1;          ///< tokens a window holds, 1..kVerifyMaxT
+    int max_t = 1;          ///< window length, 1..kVerifyMaxT
     int groups = 1;         ///< token groups a window is cut into (1 or 2), each with its own plan and staging
 };
 
@@ -44,6 +46,7 @@ struct MoeWindowShape {
 struct MoeWindowTier {
     const uint8_t* cache_base = nullptr;   ///< slot 0 of the VRAM expert arena
     int64_t blob = 0;                      ///< bytes per slot (the largest layer's blob)
+    Exl3ExpertRuntime* exl3_runtime = nullptr; ///< optional EXL3 graph/runtime seam
 };
 
 class MoeWindow {
@@ -79,6 +82,7 @@ public:
                void* user, strata::gpu::Stream cs, std::string& err);
     /// The plan the pool fills (ExpertDispatch::plan).
     GpuPlanSink* sink() { return &sink_; }
+    Exl3ExpertRuntime* exl3_runtime() const { return exl3_runtime_; }
 
 private:
     static void publish_plan(void* ctx);
@@ -91,6 +95,7 @@ private:
 
     MoeWindowShape sh_;
     MoeWindowTier tier_;
+    Exl3ExpertRuntime* exl3_runtime_ = nullptr;
     bool segmented_ = false;
     const std::vector<strata::gpu::Graph*>* segs_ = nullptr;
     strata::gpu::Stream copy_ = nullptr;

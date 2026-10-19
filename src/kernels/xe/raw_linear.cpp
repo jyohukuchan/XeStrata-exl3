@@ -5,6 +5,7 @@
 
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_bits.hpp"
+#include "strata/core/runtime.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_raw_linear
 #include "strata/kernels/device_arch_tag.hpp"
 
@@ -15,6 +16,12 @@
 
 namespace strata::kernels::raw {
 namespace {
+
+sycl::queue& queue_for(void* stream) { return strata::core::Runtime::get().stream(stream); }
+
+void sync_if_needed(void* stream, const sycl::event& event, const char* what) {
+    if (!stream) strata::core::Runtime::get().wait(event, what);
+}
 
 void validate(const LinearView& view, const float* x, float* y, int64_t ldx, int64_t ldy, int64_t rows) {
     if (view.data == nullptr || x == nullptr || y == nullptr)
@@ -61,6 +68,81 @@ sycl::event linear_fp32(sycl::queue& queue, const LinearView& view, const float*
             y[row * ldy + out] = value;
         });
     });
+}
+
+void validate_embedding(const void* table, DType dtype, size_t row_bytes, const int32_t* tokens, int64_t n_tok,
+                        int64_t n_vocab, int64_t n_embd, float* out, int64_t out_stride) {
+    if (table == nullptr || tokens == nullptr || out == nullptr)
+        throw std::invalid_argument("raw::embedding_gather: table, tokens and output are required");
+    if (n_tok <= 0 || n_vocab <= 0 || n_embd <= 0 || out_stride < n_embd)
+        throw std::invalid_argument("raw::embedding_gather: invalid dimensions");
+    const int bytes = dtype_bytes(dtype);
+    if (bytes == 0 || (uint64_t) n_embd > (uint64_t) std::numeric_limits<size_t>::max() / (size_t) bytes ||
+        row_bytes < (size_t) n_embd * (size_t) bytes || row_bytes % (size_t) bytes != 0 ||
+        reinterpret_cast<uintptr_t>(table) % (size_t) bytes != 0 ||
+        reinterpret_cast<uintptr_t>(tokens) % alignof(int32_t) != 0 ||
+        reinterpret_cast<uintptr_t>(out) % alignof(float) != 0)
+        throw std::invalid_argument("raw::embedding_gather: invalid dtype or row stride");
+    const uint64_t max_bytes = (uint64_t) std::numeric_limits<ptrdiff_t>::max();
+    if ((uint64_t) n_vocab > max_bytes / row_bytes || (uint64_t) n_tok > max_bytes / sizeof(int32_t) ||
+        (uint64_t) n_tok > max_bytes / sizeof(float) / (uint64_t) out_stride)
+        throw std::invalid_argument("raw::embedding_gather: span exceeds host address range");
+}
+
+void validate_embedding_one(const void* table, DType dtype, size_t row_bytes, int64_t token, int64_t n_vocab,
+                            int64_t n_embd, float* out) {
+    if (table == nullptr || out == nullptr || token < 0 || token >= n_vocab || n_vocab <= 0 || n_embd <= 0)
+        throw std::invalid_argument("raw::embedding_gather_one: invalid token or buffers");
+    const int bytes = dtype_bytes(dtype);
+    if (bytes == 0 || (uint64_t) n_embd > (uint64_t) std::numeric_limits<size_t>::max() / (size_t) bytes ||
+        (uint64_t) n_embd > (uint64_t) std::numeric_limits<ptrdiff_t>::max() / sizeof(float) ||
+        row_bytes < (size_t) n_embd * (size_t) bytes || row_bytes % (size_t) bytes != 0 ||
+        reinterpret_cast<uintptr_t>(table) % (size_t) bytes != 0 ||
+        reinterpret_cast<uintptr_t>(out) % alignof(float) != 0)
+        throw std::invalid_argument("raw::embedding_gather_one: invalid dtype or row stride");
+    if ((uint64_t) n_vocab > (uint64_t) std::numeric_limits<ptrdiff_t>::max() / row_bytes)
+        throw std::invalid_argument("raw::embedding_gather_one: table span exceeds host address range");
+}
+
+void embedding_gather(const void* table, DType dtype, size_t row_bytes, const int32_t* tokens, int64_t n_tok,
+                      int64_t n_vocab, int64_t n_embd, float* out, int64_t out_stride, void* stream) {
+    validate_embedding(table, dtype, row_bytes, tokens, n_tok, n_vocab, n_embd, out, out_stride);
+    sycl::queue& queue = queue_for(stream);
+    const auto event = queue.parallel_for(sycl::range<1>((size_t) n_tok * (size_t) n_embd), [=](sycl::id<1> id) {
+        const size_t flat = (size_t) id[0];
+        const int64_t row = (int64_t) (flat / (size_t) n_embd);
+        const int64_t col = (int64_t) (flat % (size_t) n_embd);
+        const int64_t token = (int64_t) tokens[row];
+        float value = 0.0f;
+        if (token >= 0 && token < n_vocab) {
+            const uint8_t* source = static_cast<const uint8_t*>(table) + (size_t) token * row_bytes;
+            if (dtype == DType::F16)
+                value = f32_from_f16(static_cast<const uint16_t*>(static_cast<const void*>(source))[col]);
+            else if (dtype == DType::BF16)
+                value = f32_from_bf16(static_cast<const uint16_t*>(static_cast<const void*>(source))[col]);
+            else
+                value = static_cast<const float*>(static_cast<const void*>(source))[col];
+        }
+        out[(size_t) row * (size_t) out_stride + (size_t) col] = value;
+    });
+    sync_if_needed(stream, event, "raw::embedding_gather");
+}
+
+void embedding_gather_one(const void* table, DType dtype, size_t row_bytes, int64_t token, int64_t n_vocab,
+                          int64_t n_embd, float* out, void* stream) {
+    validate_embedding_one(table, dtype, row_bytes, token, n_vocab, n_embd, out);
+    sycl::queue& queue = queue_for(stream);
+    const auto event = queue.parallel_for(sycl::range<1>((size_t) n_embd), [=](sycl::id<1> id) {
+        const size_t col = (size_t) id[0];
+        const uint8_t* source = static_cast<const uint8_t*>(table) + (size_t) token * row_bytes;
+        if (dtype == DType::F16)
+            out[col] = f32_from_f16(static_cast<const uint16_t*>(static_cast<const void*>(source))[col]);
+        else if (dtype == DType::BF16)
+            out[col] = f32_from_bf16(static_cast<const uint16_t*>(static_cast<const void*>(source))[col]);
+        else
+            out[col] = static_cast<const float*>(static_cast<const void*>(source))[col];
+    });
+    sync_if_needed(stream, event, "raw::embedding_gather_one");
 }
 
 }  // namespace strata::kernels::raw

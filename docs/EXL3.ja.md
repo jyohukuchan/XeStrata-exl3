@@ -48,12 +48,18 @@ CPU dispatch は router の出力行を保ち、既存形式の GPU plan・resid
 
 format registry は実際の blob layout の全成分を比較し、process 内で使う ID を返す。`ExpertCache::open_buckets()`
 は形式ごとの容量を保ち、別形式の slot への admission と容量を超えるコピーを拒否する。既存の
-`open()` / `open_sized()` は format 0 のまま扱う。GPU plan と prefill への形式情報の接続は別に行う。
+`open()` / `open_sized()` は format 0 のまま扱う。`exl3_grouped_fp32()` は device 上の形式表と動的な group/token/destination 計画を読み、各 expert の
+独立した gate/up/down 形式を保持したまま FP32 出力を計算する。scratch は事前に確保する。
+`Exl3ExpertRuntime` は明示した resident expert を形式別 cache に読み込み、hit を source I/O より前に判定し、
+CPU miss と GPU hit の出力を router 順の行へ配置する。永続的な計画を graph に記録できる。
+`ExpertDispatch::exl3_runtime` と `MoeWindowTier::exl3_runtime` は、この runtime を既存の CPU-row/GPU-hit
+merge に接続する。現在は segmented graph の1 group 構成を使い、2 group と monolithic graph は拒否する。
+各 ring と最後の segment を同期してから永続計画を再利用する。モデル起動時の binding と prefill は別に行う。
 
 専用 n-gram decoder は、先頭の F16 row scale と160値の ringを通常の linear と区別して復号する。
 CPU は要求した row ID を選べ、SYCL は取得済みの packed rowを処理する。head bias は明示した head IDで
 選ぶ。FP32 出力と padding を扱い、呼び出し側はモデルの演算に必要な最後の F16 丸めを別に行う。
-これは row codec の部品であり、model runtime の sidecar I/O と cache への接続は別に行う。
+この row codec を非同期 I/O と cache へ接続する経路は次の reader と table が提供する。
 専用の blocking `exl3_ngram::Reader` は sidecar の shard と head 範囲を検証し、要求された行だけを読む。
 sidecar の multiplier、signed-int64 overflow、EOS 境界を使う row ID 計算も提供する。
 `row_spans()` は検証済みの論理行とファイル内 offset の対応を公開する。既存の
@@ -94,6 +100,16 @@ F16/BF16/F32 の元 dtype を保って転送し、専用の raw linear で計算
 選び、head mixer の FP32 出力をそのまま渡す。
 開発用の `Exl3Dense::load()` overload は任意の canonical 行名を明示でき、複数の owner を独立に保持する。
 CLI の `--exl3-head` が選ぶ対象は引き続き `output.weight` である。
+`load_remapped()` は H128 単位の入力並べ替えと出力の選択・並べ替えを行い、trellis と scale を
+再量子化せずに移す。raw tensor の非空の block map は拒否する。
+`load_detached()` は外部の canonical table を使わず、明示した shape と同じ検証で projection を所有する。
+
+開発用の layer/verify 経路では、この owner を router、attention/GDN projection、shared expert と
+hyper-connection read に明示的に接続できる。raw F16/BF16/F32 projection は元の dtype を保ち、
+FP32 activation を受け取る。HC norm は別の F32 vector を使う。モデル全体の名前・軸順・norm の変換は
+読み込み側が検証する必要があり、これらの部品だけでモデル全体を起動できるわけではない。
+`NativeEmbed::load_exl3()` は raw F16/BF16/F32 embedding の元の dtype を保ち、host token と device token ID
+の両方から行を取得する。owner と embedding の stream は capture 前に準備する。
 
 この経路の数値・機能確認と、同じ元重み・実効保存量での品質比較は別に行う。最適化前の部品や初期接続の
 速度は診断値として扱い、decode 速度を維持できるかの判定には使わない。

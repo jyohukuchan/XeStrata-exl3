@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // Bounded real-checkpoint probe: archive -> packed CPU/GPU linear operations.
 #include "strata/artifact/exl3.hpp"
+#include "strata/artifact/exl3_remap.hpp"
 #include "strata/core/exl3_dense.hpp"
 #include "strata/core/gpu.hpp"
 #include "strata/core/weights.hpp"
@@ -19,6 +20,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace artifact = strata::artifact::exl3;
@@ -56,8 +58,8 @@ struct CapturedStream {
 }
 
 int main(int argc, char** argv) {
-    if (argc != 3) {
-        std::fprintf(stderr, "usage: exl3_archive_parity MODEL_DIR LINEAR_NAME\n");
+    if (argc != 3 && (argc != 4 || std::string(argv[3]) != "--remap")) {
+        std::fprintf(stderr, "usage: exl3_archive_parity MODEL_DIR LINEAR_NAME [--remap]\n");
         return 2;
     }
     try {
@@ -65,20 +67,34 @@ int main(int argc, char** argv) {
         const auto it = std::find_if(archive.linears().begin(), archive.linears().end(),
                                      [&](const auto& item) { return item.name == argv[2]; });
         if (it == archive.linears().end()) throw std::runtime_error("requested EXL3 linear does not exist");
+        std::string error;
         artifact::MaterializedMatrix host;
         archive.materialize(*it, host);
+        std::vector<int64_t> input_blocks, output_blocks;
+        if (argc == 4) {
+            if (host.k % 128 != 0 || host.n % 128 != 0) throw std::runtime_error("remap requires H128 blocks");
+            for (int64_t block = host.k / 128; block > 0; --block) input_blocks.push_back(block - 1);
+            output_blocks.push_back(host.n / 128 - 1);
+            artifact::MaterializedMatrix remapped;
+            if (!artifact::remap_matrix_blocks(host, input_blocks, output_blocks, remapped, error))
+                throw std::runtime_error(error);
+            host = std::move(remapped);
+        }
         const auto host_view = host.view();
         if (cpu::validate(host_view) != cpu::Status::ok)
             throw std::runtime_error("materialized EXL3 descriptor failed validation");
         const size_t k = (size_t) host.k, n = (size_t) host.n;
         TemporaryPack pack(host.k, host.n);
         strata::core::WeightTable table;
-        std::string error;
         const std::set<std::string> skip{"output.weight"};
         if (!table.load(pack.path.string(), nullptr, 0, error, &skip)) throw std::runtime_error(error);
         strata::core::Exl3Dense owner;
-        if (!owner.load(archive, it->name, table, error, 4)) throw std::runtime_error(error);
+        if (!owner.load_remapped(archive, it->name, "output.weight", input_blocks, output_blocks, table, error, 4))
+            throw std::runtime_error(error);
         if (table.find("output.weight")->exl3 != &owner) throw std::runtime_error("EXL3 owner was not attached");
+        strata::core::Exl3Dense detached;
+        if (!detached.load_detached(archive, it->name, host.k, host.n, input_blocks, output_blocks, error, 4))
+            throw std::runtime_error(error);
         // This diagnostic deliberately reconstructs only this selected matrix.
         // The runtime linear operations below keep all weights packed.
         std::vector<uint16_t> expected_w(k * n);
@@ -138,6 +154,18 @@ int main(int argc, char** argv) {
             std::printf("rows %lld: max_abs %.9g, %zu value and %zu padding bad\n",
                         (long long) rows, (double) max_abs, bad, padding_bad);
             failures += bad != 0 || padding_bad != 0;
+            float* detached_output = memory.upload(initial);
+            if (!detached.run(input, (int64_t) ldx, detached_output, (int64_t) ldy, rows, nullptr, error))
+                throw std::runtime_error(error);
+            strata::parity::copy_out(got.data(), detached_output, got.size());
+            size_t detached_bad = 0;
+            for (size_t at = 0; at < expected.size(); ++at) {
+                const bool padding = at % ldy >= n;
+                if (!std::isfinite(got[at]) || (padding ? got[at] != 99.0f :
+                    std::fabs(got[at] - expected[at]) > 5e-5f * std::max(1.0f, std::fabs(expected[at])))) ++detached_bad;
+            }
+            std::printf("rows %lld detached owner: %zu bad\n", (long long) rows, detached_bad);
+            failures += detached_bad != 0;
             // The engine owner uploads this same selected archive matrix and
             // supplies persistent, graph-stable scratch through WeightRef.
             float* owned_output = memory.upload(initial);

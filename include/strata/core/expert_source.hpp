@@ -54,6 +54,7 @@ namespace strata::core {
 
 class RemoteExperts;
 struct LoadStats;
+class Exl3ExpertRuntime;
 
 namespace detail {
 
@@ -258,6 +259,8 @@ struct PcieSplitTimes;
 struct ExpertDispatch {
     strata::kernels::cpu::ExpertPool* pool = nullptr;
     ExpertSource* src = nullptr;
+    /// Optional EXL3 window runtime. Null preserves the legacy CPU/GPU plan path.
+    Exl3ExpertRuntime* exl3_runtime = nullptr;
     RemoteExperts* remote[3] = {}; ///< optional CUDA1..3 tiers for otherwise CPU-served rows
     int remote_count = 0;
     int64_t n_expert = strata::kernels::cpu::NE;
@@ -414,6 +417,7 @@ struct ExpertDispatch {
     /// after it is built on a hole - and resuming into a plausible-looking token is the exact outcome this
     /// whole mechanism exists to prevent.  `failed` is what the short-circuit reads.
     bool failed = false;
+    std::string fail_storage;
     const char* fail = nullptr;
     int64_t fail_layer = -1;
     int64_t fail_expert = -1;

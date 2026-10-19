@@ -191,6 +191,15 @@ bool moe_shared(const WeightTable& tables, const ModelGeometry& g, int64_t layer
 bool moe_combine_parts(const ModelGeometry& g, int64_t layer, int64_t k, const MoEBuffers& b, const float* parts,
                        float* out, void* stream, std::string& err);
 
+/// FP32 hyper-connection read for an explicit EXL3 down/up owner pair and an
+/// optional EXL3 injection owner.  The norm weight remains the canonical F32
+/// vector.  The caller owns `ws` and must prepare the owners' stream before
+/// graph capture; this helper performs no allocation.
+bool gr_read_exl3(const WeightRef& norm, const WeightRef& down, const WeightRef& up, const WeightRef* inject,
+                  const float* R, const strata::kernels::GrShapes& shapes,
+                  const strata::kernels::GrWorkspace& ws, float* mixed, float* inject_out, void* stream,
+                  std::string& err);
+
 /// Plan v0.3 P3 (default ON): the shared expert runs at the END OF `pre[l]`, after the doorbell has rung, so
 /// the GPU computes it while the host runs the CPU pool; `post[l]` then only combines.  Same kernels on the
 /// same inputs in the same stream order relative to their consumers, so the result is bitwise unchanged.

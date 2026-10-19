@@ -52,12 +52,19 @@ combinations with legacy GPU plans or residency tables.
 The format registry compares every component of the actual blob layout and returns process-local IDs.
 `ExpertCache::open_buckets()` preserves each format's capacity, rejecting admission to a different format's
 slot and copies exceeding slot capacity. Existing `open()` / `open_sized()` keep using format 0.
-Connecting format information to GPU plans and prefill is separate.
+`exl3_grouped_fp32()` reads a device format table and dynamic group/token/destination plan, computing FP32
+outputs while preserving each expert's independent gate/up/down formats. Scratch is allocated in advance.
+`Exl3ExpertRuntime` preloads explicitly selected resident experts into format-specific cache buckets, classifies
+hits before source I/O, and places CPU-miss and GPU-hit outputs in router order. Its persistent plan can be
+recorded in a graph. `ExpertDispatch::exl3_runtime` and `MoeWindowTier::exl3_runtime` connect it to the existing
+CPU-row/GPU-hit merge. The current path uses one group and segmented graphs; two groups and monolithic graphs
+are rejected. Each ring and the final segment are synchronized before reusing the persistent plan.
+Model-startup binding and prefill remain separate.
 
 The dedicated n-gram decoder treats its leading F16 row scale and 160-value ring separately from ordinary
 linears. CPU can select requested row IDs; SYCL processes packed rows already fetched by the caller.
 Head bias uses explicit head IDs. Outputs are FP32 with padded strides; callers separately choose any final
-F16 rounding required by model arithmetic. This row codec is separate from model-runtime sidecar I/O and caches.
+F16 rounding required by model arithmetic. The following reader and table connect this row codec to asynchronous I/O and caching.
 The dedicated blocking `exl3_ngram::Reader` validates sidecar shards and head ranges and reads only
 requested rows. It also computes row IDs using the sidecar's multipliers, signed-int64 overflow and EOS boundaries.
 `row_spans()` exposes validated mappings from logical rows to file offsets. Passing them to the existing
@@ -98,6 +105,16 @@ prepared before graph capture, and the owner outlives those graphs. `lm_head()` 
 interpreting canonical planes and passes the head mixer's FP32 output directly.
 The development `Exl3Dense::load()` overload accepts an explicit canonical row name, allowing multiple
 independent owners. The CLI's `--exl3-head` continues to select `output.weight`.
+`load_remapped()` permutes input H128 blocks and selects or permutes output blocks, moving trellis words and
+scales without requantization. Raw tensors reject nonempty block maps.
+`load_detached()` owns a projection without an external canonical table, retaining the same explicit shape validation.
+
+Development layer/verify paths can explicitly attach these owners to routers, attention/GDN projections,
+shared experts and hyper-connection reads. Raw F16/BF16/F32 projections preserve their original dtype and accept
+FP32 activations. HC norms use separate F32 vectors. The loader must validate model-wide names, axis order and
+norm transformations; these components alone do not start a complete EXL3 model.
+`NativeEmbed::load_exl3()` preserves raw F16/BF16/F32 embedding dtypes and gathers rows from either host tokens
+or device token IDs. Owner and embedding streams are prepared before capture.
 
 Numerical and functional checks of this path are separate from quality comparisons at the same source
 weights and effective storage. Speeds from components and early integration before optimization are
