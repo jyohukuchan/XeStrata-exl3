@@ -63,6 +63,7 @@
 #include "strata/prefill/share_rules.hpp"
 #include "strata/core/native_dense.hpp"
 #include "strata/program/plain_generate.hpp"
+#include "strata/program/exl3_flash_generate.hpp"
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
 #include "strata/program/draft_kv_plan.hpp"
@@ -2305,6 +2306,7 @@ int main(int argc, char** argv) {
         }
         return a == "--hw-bench" ? hw_bench(pack, native) : kernel_bench(pack);
     }
+    if (const int r = strata::program::exl3_flash_main(argc, argv); r >= 0) return r;
     // a model with one residual stream (Ornith-1.5): plain_generate.cpp runs it
     if (const int r = strata::program::plain_main(argc, argv); r >= 0) return r;
     Options o;

@@ -693,8 +693,10 @@ if(STRATA_ENABLE_XE)
   endif()
 
   # `strata generate` (P2.S6): the program that composes the components into tokens
-  add_executable(strata src/program/generate.cpp src/program/plain_generate.cpp src/program/option_scope.cpp)
+  add_executable(strata src/program/generate.cpp src/program/plain_generate.cpp
+                        src/program/exl3_flash_generate.cpp src/program/option_scope.cpp)
   target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec)
+  target_include_directories(strata SYSTEM PRIVATE third_party/main/nlohmann-json)
 
   # the image engine (Qwen-Image-2.1's DiT, src/image/): its kernels and the DiT; strata-image-probe, one block of the
   # DiT against tools/image/qi21_ref.py's NumPy reference, and strata-image-dit-probe, the whole DiT and its sampler

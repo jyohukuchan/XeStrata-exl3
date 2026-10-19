@@ -135,6 +135,22 @@ FP32 logits と manifest を保存する。`--exl3 DIR --metadata-gguf GGUF` ま
 `--expert-profile FILE` は同じ residency 条件で照合するために使える。精度判定は元の BF16 教師に対する
 `KL(P_BF16 || P_candidate)` だけを使う。速度の判定にはこの診断用 dump の実行時間を使わない。
 
+## Qwen3.8 Flash の AR 接続
+
+Qwen3.8 の `--exl3 DIR` は archive の HF config から直接起動し、metadata GGUF を必要としない。
+`--metadata-gguf` を指定した場合は EOS metadata の取得に使う。`--tokens` または `--tokens-file` で
+入力 ID を渡し、`--stage-devices` で層分割する device ordinal を選べる。
+
+```sh
+strata --exl3 /path/to/qwen38-exl3 --tokens 16,10,16,28 --max-new 2 \
+    --context 8 --stage-devices 0 --spec 0 --max-t 1 --prompt-chunk 0
+```
+
+この接続は greedy の単 token AR を実行する。部分常駐時は CPU expert fallback を使う。
+`--dump-logits FILE` は生成時の FP32 logits を保存し、`--stop-eos` または `--eos ID` で終了条件を指定する。
+MTP、vision、serve、batch と複数 token の prompt chunk はこの初期 CLI では要求時に拒否する。
+Qwen3.5 の CLI/MTP 接続は次の経路を使う。
+
 ## Qwen3.5 MoE の MTP 接続
 
 `--spec 2` 以上は archive の `mtp.fc`、三つの norm、`mtp.layers.0` の attention・router・shared/routed
