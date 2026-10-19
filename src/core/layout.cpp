@@ -7,6 +7,7 @@
 #include "strata/artifact/model_spec.hpp"
 
 #include <cstdio>
+#include <cstring>
 
 namespace strata::core {
 namespace {
@@ -117,6 +118,19 @@ bool check_one(const WeightTable& t, const ModelGeometry& g, int64_t layer, std:
         if (!r) {
             err = "layer " + std::to_string(layer) + ": missing " + v.name(w.suffix);
             return false;
+        }
+        // EXL3 owns only the shared scalar as a matrix-shaped F32-producing
+        // projection. Its registration intentionally has WeightKind::Verbatim,
+        // but its canonical scalar shape remains part of this layout contract.
+        // Check that shape before considering the legacy kind; other EXL3
+        // owners must continue through the ordinary kind check below.
+        const bool exl3_shared_scalar = std::strcmp(w.suffix, "ffn_gate_inp_shexp.weight") == 0 &&
+                                        r->exl3 != nullptr;
+        if (exl3_shared_scalar) {
+            if (r->elements != w.elements) return fail(err, v, w.suffix, "EXL3 owner elements", r->elements, w.elements);
+            if (r->ne0 != w.elements) return fail(err, v, w.suffix, "EXL3 owner ne0", r->ne0, w.elements);
+            if (r->ne1 != 1) return fail(err, v, w.suffix, "EXL3 owner ne1", r->ne1, 1);
+            continue;
         }
         if (r->elements != w.elements) return fail(err, v, w.suffix, "elements", r->elements, w.elements);
         if (r->kind != w.kind) {

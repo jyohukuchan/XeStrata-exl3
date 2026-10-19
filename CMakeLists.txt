@@ -726,6 +726,12 @@ if(STRATA_ENABLE_XE)
       ${CMAKE_CURRENT_SOURCE_DIR}/third_party/main/nlohmann-json)
     add_test(NAME exl3_weight_set_test COMMAND exl3_weight_set_test)
     set_tests_properties(exl3_weight_set_test PROPERTIES SKIP_RETURN_CODE 77)
+    add_executable(exl3_layout_test src/core/exl3_layout_test.cpp)
+    target_link_libraries(exl3_layout_test PRIVATE strata_engine)
+    target_include_directories(exl3_layout_test SYSTEM PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/third_party/main/nlohmann-json)
+    add_test(NAME exl3_layout_test COMMAND exl3_layout_test)
+    set_tests_properties(exl3_layout_test PROPERTIES SKIP_RETURN_CODE 77)
     add_executable(exl3_projection_parity src/core/exl3_projection_parity.cpp)
     target_link_libraries(exl3_projection_parity PRIVATE strata_engine)
     target_include_directories(exl3_projection_parity SYSTEM PRIVATE
