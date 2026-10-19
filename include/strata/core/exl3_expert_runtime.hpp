@@ -42,7 +42,8 @@ public:
     /// experts are never read by the CPU path.  `cpu_output` is route-row storage with `ldy` stride.
     bool prepare_window(int64_t layer, const float* host_fp32_x, int64_t ldx, const int32_t* routed_ids,
                         int64_t n_tokens, float* cpu_output, int64_t ldy, std::string& err);
-    /// Run the CPU miss jobs separately, leaving the GPU plan publishable by a future caller before this call.
+    /// Run the CPU miss jobs separately. It may overlap a previously enqueued hit-only GPU plan; it never waits for
+    /// that plan. The existing enqueue() method still keeps its CPU-first contract for callers that use it directly.
     bool run_cpu(std::string& err);
 
     /// Copy the current persistent host plan image to the device image and enqueue grouped EXL3.  The caller must
@@ -50,6 +51,10 @@ public:
     /// capacities as open(): x has max_tokens rows and gpu_output has max_tokens*routed_k rows.
     bool enqueue(sycl::queue& queue, const float* device_fp32_x, int64_t ldx, float* gpu_output, int64_t ldy,
                  sycl::event& done, const std::vector<sycl::event>& deps, std::string& err);
+    /// Enqueue only the resident GPU rows after prepare_window/publish_window_plan and before run_cpu. This is the
+    /// bounded overlap path; the caller must wait_gpu() or mark_gpu_consumed() after the merge segment completes.
+    bool enqueue_hit_only(sycl::queue& queue, const float* device_fp32_x, int64_t ldx, float* gpu_output, int64_t ldy,
+                          sycl::event& done, const std::vector<sycl::event>& deps, std::string& err);
     /// Record the persistent plan copies and grouped kernel during graph capture.  It deliberately does not require
     /// a prepared CPU window and does not change the runtime's in-flight state; replay reads the host plan image that
     /// the caller updates before launching the graph.
@@ -68,6 +73,10 @@ public:
     /// Mark a graph replay consumed after the caller has synchronized its stream; graph-associated events cannot be
     /// waited through sycl::event::wait_and_throw().
     void mark_gpu_consumed();
+
+    bool prepared() const { return prepared_; }
+    bool cpu_ready() const { return cpu_ready_; }
+    bool pending_gpu() const { return pending_gpu_; }
 
     int64_t hidden() const { return hidden_; }
     int64_t n_layers() const { return n_layers_; }
@@ -98,6 +107,8 @@ public:
     int64_t gpu_entry_capacity() const { return max_entries_; }
 
 private:
+    bool enqueue_impl(sycl::queue& queue, const float* device_fp32_x, int64_t ldx, float* gpu_output, int64_t ldy,
+                      sycl::event& done, const std::vector<sycl::event>& deps, bool require_cpu, std::string& err);
     bool allocate_images(std::string& err);
     bool copy_plan(sycl::queue& queue, const std::vector<sycl::event>& deps, std::vector<sycl::event>& copies,
                    std::string& err);

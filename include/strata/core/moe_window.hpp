@@ -87,6 +87,7 @@ public:
     bool direct_resident() const { return direct_resident_; }
 
 private:
+    static bool before_cpu(void* ctx, std::string& err);
     static void publish_plan(void* ctx);
     static void fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t bytes);
     static void raise_flag(uint32_t* flag, uint32_t value);
@@ -105,6 +106,9 @@ private:
     const std::vector<strata::gpu::Graph*>* segs_ = nullptr;
     strata::gpu::Stream copy_ = nullptr;
     uint32_t cur_ring_ = 0;
+    strata::gpu::Stream active_stream_ = nullptr;
+    int active_tb_ = 0, active_n_ = 0;
+    std::string host_error_;
 
     // mapped staging: the host's view (h_) and the device's (m_) of the same bytes
     float *h_x_ = nullptr, *m_x_ = nullptr;

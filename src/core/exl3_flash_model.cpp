@@ -759,8 +759,21 @@ bool Exl3FlashModel::prepare_expert_window(size_t stage_index, int64_t layer, co
         const OnDevice on(stage.device);
         sycl::queue& queue = runtime.stream(stream);
         if (!stage.runtime->prepare_window(layer, host_x, ldx, routed_ids, n_tokens, cpu_output, ldy, err) ||
-            !stage.runtime->run_cpu(err) ||
-            !stage.runtime->enqueue(queue, device_x, ldx, device_output, ldy, done, {}, err)) {
+            !stage.runtime->enqueue_hit_only(queue, device_x, ldx, device_output, ldy, done, {}, err)) {
+            err = "EXL3 Flash: expert window: " + err;
+            return false;
+        }
+        if (!stage.runtime->run_cpu(err)) {
+            const std::string cpu_error = err;
+            if (stage.runtime->pending_gpu()) {
+                std::string drain_error;
+                if (!stage.runtime->wait_gpu(done, drain_error) && !drain_error.empty())
+                    err = cpu_error + "; GPU drain: " + drain_error;
+                else
+                    err = cpu_error;
+            } else {
+                err = cpu_error;
+            }
             err = "EXL3 Flash: expert window: " + err;
             return false;
         }

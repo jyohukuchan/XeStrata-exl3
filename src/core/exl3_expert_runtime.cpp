@@ -8,6 +8,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -16,6 +19,34 @@
 
 namespace strata::core {
 namespace {
+
+class HostTimelineScope {
+public:
+    HostTimelineScope(const char* phase, int64_t layer, int64_t hits = -1, int64_t misses = -1)
+        : phase_(phase), layer_(layer), hits_(hits), misses_(misses) {
+        static const bool enabled = [] {
+            const char* flag = std::getenv("STRATA_EXL3_TIMELINE");
+            return flag != nullptr && flag[0] != '\0' && std::strcmp(flag, "0") != 0;
+        }();
+        enabled_ = enabled;
+        if (enabled_) emit("begin");
+    }
+    ~HostTimelineScope() { if (enabled_) emit("end"); }
+    HostTimelineScope(const HostTimelineScope&) = delete;
+    HostTimelineScope& operator=(const HostTimelineScope&) = delete;
+
+private:
+    void emit(const char* edge) const {
+        const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        std::fprintf(stderr, "{\"kind\":\"exl3_host_timeline\",\"clock\":\"steady_ns\",\"ts_ns\":%lld,"
+                             "\"phase\":\"%s\",\"edge\":\"%s\",\"layer\":%lld,\"hits\":%lld,\"misses\":%lld}\n",
+                     (long long) ns, phase_, edge, (long long) layer_, (long long) hits_, (long long) misses_);
+    }
+    const char* phase_;
+    int64_t layer_, hits_, misses_;
+    bool enabled_ = false;
+};
 
 bool product_fits(int64_t a, int64_t b, int64_t limit, int64_t& result) {
     if (a <= 0 || b <= 0 || a > limit / b) return false;
@@ -317,6 +348,7 @@ bool Exl3ExpertRuntime::open(Exl3ExpertSource& source, strata::kernels::cpu::Exp
 bool Exl3ExpertRuntime::prepare_window(int64_t layer, const float* host_fp32_x, int64_t ldx,
                                        const int32_t* routed_ids, int64_t n_tokens, float* cpu_output, int64_t ldy,
                                        std::string& err) {
+    const HostTimelineScope timeline("prepare", layer);
     err.clear();
     if (!opened_ || source_ == nullptr || pool_ == nullptr) { err = "exl3 runtime: open is required"; return false; }
     if (pending_gpu_) { err = "exl3 runtime: wait_gpu must consume the previous plan first"; return false; }
@@ -400,6 +432,7 @@ bool Exl3ExpertRuntime::prepare_window(int64_t layer, const float* host_fp32_x, 
 }
 
 bool Exl3ExpertRuntime::run_cpu(std::string& err) {
+    const HostTimelineScope timeline("cpu", prepared_layer_, hit_entries_, miss_entries_);
     err.clear();
     if (!prepared_) { err = "exl3 runtime: prepare_window is required"; return false; }
     if (cpu_ready_) return true;
@@ -439,10 +472,36 @@ bool Exl3ExpertRuntime::enqueue(sycl::queue& queue, const float* device_fp32_x, 
                                 int64_t ldy, sycl::event& done, const std::vector<sycl::event>& deps,
                                 std::string& err) {
     err.clear();
-    if (!prepared_ || !cpu_ready_) { err = "exl3 runtime: run_cpu must consume the prepared window first"; return false; }
+    return enqueue_impl(queue, device_fp32_x, ldx, gpu_output, ldy, done, deps, true, err);
+}
+
+bool Exl3ExpertRuntime::enqueue_hit_only(sycl::queue& queue, const float* device_fp32_x, int64_t ldx,
+                                         float* gpu_output, int64_t ldy, sycl::event& done,
+                                         const std::vector<sycl::event>& deps, std::string& err) {
+    err.clear();
+    return enqueue_impl(queue, device_fp32_x, ldx, gpu_output, ldy, done, deps, false, err);
+}
+
+bool Exl3ExpertRuntime::enqueue_impl(sycl::queue& queue, const float* device_fp32_x, int64_t ldx, float* gpu_output,
+                                     int64_t ldy, sycl::event& done, const std::vector<sycl::event>& deps,
+                                     bool require_cpu, std::string& err) {
+    const HostTimelineScope timeline("gpu_submit", prepared_layer_, hit_entries_, miss_entries_);
+    if (pending_gpu_) {
+        err = "exl3 runtime: previous GPU plan must be consumed before enqueue";
+        return false;
+    }
+    if (!prepared_ || (require_cpu && !cpu_ready_)) {
+        err = require_cpu ? "exl3 runtime: run_cpu must consume the prepared window first"
+                          : "exl3 runtime: prepare_window must precede hit enqueue";
+        return false;
+    }
     Runtime* queue_runtime = Runtime::owner_of_stream(&queue);
     if (queue_runtime == nullptr || queue_runtime != device_runtime_) {
         err = "exl3 runtime: enqueue queue belongs to another runtime/device";
+        return false;
+    }
+    if (!queue.has_property<sycl::property::queue::in_order>()) {
+        err = "exl3 runtime: enqueue requires an in-order runtime queue";
         return false;
     }
     if (device_fp32_x == nullptr || gpu_output == nullptr || !span_fits(max_tokens_, ldx, hidden_) ||
@@ -455,11 +514,17 @@ bool Exl3ExpertRuntime::enqueue(sycl::queue& queue, const float* device_fp32_x, 
         return false;
     }
     std::vector<sycl::event> copies;
-    if (!copy_plan(queue, deps, copies, err)) return false;
+    if (!copy_plan(queue, deps, copies, err)) {
+        try { queue_runtime->finish(queue); } catch (...) {}
+        return false;
+    }
     try {
         done = strata::kernels::exl3::exl3_grouped_fp32(queue, device_plan_, device_fp32_x, ldx, gpu_output, ldy,
                                                         d_scratch_, scratch_elements_, {}, copies);
     } catch (const std::exception& e) {
+        // copy_plan may already have submitted work. Drain this queue before a caller can tear down the cache or
+        // return an error to a stage owner; the normal success path remains fully asynchronous.
+        try { queue_runtime->finish(queue); } catch (...) {}
         err = std::string("exl3 runtime: grouped enqueue: ") + e.what();
         return false;
     }
@@ -595,6 +660,7 @@ bool Exl3ExpertRuntime::publish_window_plan(GpuPlanSink& sink, std::string& err)
         sink.tok[i] = h_tok_[i];
     }
     std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (sink.before_cpu != nullptr && !sink.before_cpu(sink.ctx, err)) return false;
     if (sink.publish != nullptr) sink.publish(sink.ctx);
     // This plan contains cache hits and CPU misses only. Publish completion
     // of the empty PCIe share through the same window protocol as legacy plans.

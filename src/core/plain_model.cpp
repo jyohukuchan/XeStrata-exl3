@@ -1077,8 +1077,8 @@ bool PlainModel::open_experts(std::string& err) {
         // Fill one resident pair per routed layer first, then round-robin by expert. The actual bytes of every pair
         // are charged; EXL3 formats may differ by layer and are not rounded to max_blob.
         for (int pass = 0; pass < 2; ++pass)
-            for (int64_t l = 0; l < L; ++l)
-                for (int64_t e = 0; e < E; ++e) {
+            for (int64_t e = 0; e < E; ++e)
+                for (int64_t l = 0; l < L; ++l) {
                     if (pass == 0 && e != 0) continue;
                     if (pass == 1 && e == 0) continue;
                     const size_t at = (size_t) l * (size_t) E + (size_t) e;

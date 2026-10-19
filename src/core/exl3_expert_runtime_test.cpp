@@ -213,6 +213,23 @@ int main() {
         strata::parity::copy_out(gpuout.data(), d_gpuout, gpuout.size());
         if (!compare_merged(cpuout, gpuout, expected, max_tokens * k, ldy, hidden, "direct CPU/GPU merge")) ++failures;
 
+        // The bounded hybrid contract launches resident hits before the CPU miss pool. The same output must remain
+        // unchanged after the event is drained, while the legacy CPU-first enqueue above remains covered separately.
+        std::vector<float> overlap_cpu(expected.size(), 24680.5f), overlap_gpu(expected.size(), 24680.5f);
+        strata::parity::copy_in(d_gpuout, overlap_gpu.data(), overlap_gpu.size());
+        sycl::event overlap_done;
+        if (!runtime.prepare_window(0, x.data(), ldx, ids, max_tokens, overlap_cpu.data(), ldy, err) ||
+            !runtime.enqueue_hit_only(queue, d_x, ldx, d_gpuout, ldy, overlap_done, {}, err) ||
+            !runtime.run_cpu(err) || !runtime.wait_gpu(overlap_done, err)) {
+            std::fprintf(stderr, "runtime hit-before-CPU overlap failed: %s\n", err.c_str());
+            ++failures;
+        } else {
+            strata::parity::copy_out(overlap_gpu.data(), d_gpuout, overlap_gpu.size());
+            if (!compare_merged(overlap_cpu, overlap_gpu, expected, max_tokens * k, ldy, hidden,
+                                "hit-before-CPU merge"))
+                ++failures;
+        }
+
         // Capture the plan-copy nodes and grouped graph, then replay after prepare_window updates only the persistent
         // host plan image.  The graph is intentionally not recaptured.
         std::vector<float> graph_gpu(expected.size(), 24680.5f);

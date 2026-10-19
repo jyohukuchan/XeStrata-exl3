@@ -118,6 +118,7 @@ bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std
             return false;
         }
         sink_.cap = cap;
+        sink_.before_cpu = exl3_runtime_ != nullptr ? &MoeWindow::before_cpu : nullptr;
         sink_.publish = &MoeWindow::publish_plan;
         sink_.fetch = &MoeWindow::fetch_dma;
         sink_.ctx = this;
@@ -216,6 +217,35 @@ void MoeWindow::publish_plan(void* ctx) {
     *(volatile uint32_t*) w->h_flagA_ = w->cur_ring_;
 }
 
+bool MoeWindow::before_cpu(void* ctx, std::string& err) {
+    MoeWindow* w = static_cast<MoeWindow*>(ctx);
+    if (w->exl3_runtime_ == nullptr) return true;
+    if (w->active_tb_ != 0 || w->active_n_ <= 0) {
+        err = "moe window: EXL3 hybrid hit launch requires the single group at tb=0";
+        w->host_error_ = err;
+        return false;
+    }
+    try {
+        Runtime* owner = w->active_stream_ == nullptr ? &Runtime::get() : Runtime::owner_of_stream(w->active_stream_);
+        if (owner == nullptr) {
+            err = "moe window: EXL3 hybrid stream has no runtime owner";
+            w->host_error_ = err;
+            return false;
+        }
+        sycl::event ignored;
+        if (!w->exl3_runtime_->enqueue_hit_only(owner->stream(w->active_stream_), w->m_x_, w->sh_.n_embd,
+                                                w->hit_out_, w->sh_.n_embd, ignored, {}, err)) {
+            w->host_error_ = err;
+            return false;
+        }
+        return true;
+    } catch (const std::exception& e) {
+        err = std::string("moe window: EXL3 hit launch: ") + e.what();
+        w->host_error_ = err;
+        return false;
+    }
+}
+
 void MoeWindow::publish(uint32_t ring, int grp, int tb, int n, const float* x, const int32_t* ids, const float* w,
                         strata::gpu::Stream cs) {
     (void) ring;
@@ -270,10 +300,12 @@ bool MoeWindow::experts(int64_t layer, uint32_t ring, int grp, int tb, int n, st
         const int32_t* p_start = pl + 4;
         const int32_t* p_dst = p_start + sink_.cap + 1;
         try {
-            sycl::queue& queue = Runtime::get().stream(cs);
-            if (!exl3_runtime_->record_enqueue(queue, m_x_ + (size_t) tb * N, N,
-                                                hit_out_ + (size_t) tb * K * N, N, err))
-                return false;
+            if (!segmented_) {
+                sycl::queue& queue = Runtime::get().stream(cs);
+                if (!exl3_runtime_->record_enqueue(queue, m_x_ + (size_t) tb * N, N,
+                                                    hit_out_ + (size_t) tb * K * N, N, err))
+                    return false;
+            }
             if (!segmented_) wait_flag_ge(m_flag_, ring, cs);
             copy_rows_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N,
                                   cap, N, p_dst, p_counts + 1, cs);
@@ -406,9 +438,28 @@ bool MoeWindow::serve(int64_t rings, const int64_t* layers, const int* grps, con
         cur_ring_ = want;
         set_plan_slot(grps[r]);
         const int tb = tbs[r], n = ns[r];
+        active_stream_ = cs;
+        active_tb_ = tb;
+        active_n_ = n;
+        host_error_.clear();
         if (pool != nullptr)
             pool(user, h_x_ + (size_t) tb * sh_.n_embd, h_ids_ + (size_t) tb * sh_.k, n, sh_.k,
                  h_ymiss_ + (size_t) tb * sh_.k * sh_.n_embd, layers[r]);
+        if (!host_error_.empty()) {
+            err = host_error_;
+            return false;
+        }
+        if (exl3_runtime_ != nullptr && (!exl3_runtime_->prepared() || !exl3_runtime_->cpu_ready())) {
+            if (exl3_runtime_->pending_gpu()) {
+                if (!strata::gpu::stream_sync(cs)) {
+                    err = std::string("moe window: draining failed EXL3 hit plan: ") + strata::gpu::last_error();
+                    return false;
+                }
+                exl3_runtime_->mark_gpu_consumed();
+            }
+            err = "moe window: EXL3 CPU miss plan failed before the next segment";
+            return false;
+        }
         std::atomic_thread_fence(std::memory_order_seq_cst);
         _mm_sfence();
         if (*(volatile uint32_t*) h_flagA_ != want) {   // the pool did not publish a plan: an empty one

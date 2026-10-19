@@ -46,6 +46,9 @@ python3 tools/exl3_inventory.py /path/to/exl3-model > /path/to/inventory.json
 CPU and SYCL share `MatrixView`. SYCL FP32 GEMV/GEMM decode packed trellis weights inside the dot product,
 applying input/output H128, scales and bias. Batched GEMM accepts padded row strides and explicit event
 dependencies, with caller-owned scratch. CPU linear operations also avoid expanding the full matrix.
+The CPU initializes decoded-state tables for all three codebooks once. Linear operations read F32 values preserving
+the F16 rounding boundary into a temporary 16×16 tile. Bit-width specialization avoids runtime division during state
+extraction while keeping the existing FP64 accumulation order.
 
 `ExpertView` keeps gate/up/down as three independent packed or raw projections. CPU and SYCL expert operations compute
 `down(silu(gate(x)) * up(x))` without applying a router weight.
@@ -63,9 +66,16 @@ slot and copies exceeding slot capacity. Existing `open()` / `open_sized()` keep
 outputs while preserving each expert's independent gate/up/down formats. Scratch is allocated in advance.
 `Exl3ExpertRuntime` preloads explicitly selected resident experts into format-specific cache buckets, classifies
 hits before source I/O, and places CPU-miss and GPU-hit outputs in router order. Its persistent plan can be
-recorded in a graph. `ExpertDispatch::exl3_runtime` and `MoeWindowTier::exl3_runtime` connect it to the existing
+recorded in a graph. `STRATA_EXL3_TIMELINE=1` emits JSON lines on standard error for the start and end of host
+prepare, GPU submit and CPU pool intervals in steady-clock nanoseconds. GPU submit measures host submission time,
+not GPU kernel execution. Correlate it with a GPU profiler timeline to verify execution overlap.
+`ExpertDispatch::exl3_runtime` and `MoeWindowTier::exl3_runtime` connect it to the existing
 CPU-row/GPU-hit merge. The current path uses one group and segmented graphs; two groups and monolithic graphs
-are rejected. Each ring and the final segment are synchronized before reusing the persistent plan.
+are rejected. In the segmented path, a `publish_window_plan` callback enqueues the hit-only grouped kernel on the
+same in-order queue before the host computes CPU misses. After the CPU returns, the next segment's existing merge
+graph combines CPU rows and GPU hit rows, so it does not depend on mapped-flag visibility or a device-side spin.
+Each ring's merge segment and the final segment are synchronized before reusing the plan/cache/scratch. The existing
+CPU-first `enqueue()` contract and all-resident direct path remain unchanged.
 Qwen3.5 MoE startup uses the path below. Prefill remains separate.
 
 The dedicated n-gram decoder treats its leading F16 row scale and 160-value ring separately from ordinary
@@ -232,7 +242,8 @@ or device token IDs. `prepare_stream()` prepares any host-table copy needed by e
 Owners and embedding tables must outlive their captured graphs.
 
 `Exl3FlashModel` owns single-token Qwen3.8 AR execution. It connects per-device layer ranges, embedding, PLE,
-CPU/GPU expert merging, HC, and the head, transferring the residual between stages. The developer
+CPU/GPU expert merging, HC, and the head, transferring the residual between stages. Its expert window enqueues
+resident hits before the blocking CPU miss calculation and waits for the event afterward. The developer
 `exl3_flash_probe` accepts token IDs directly. Requests for MTP, vision, or multi-token windows are currently rejected.
 
 Numerical and functional checks of this path are separate from quality comparisons at the same source

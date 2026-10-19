@@ -43,6 +43,8 @@ python3 tools/exl3_inventory.py /path/to/exl3-model > /path/to/inventory.json
 CPU と SYCL は共通の `MatrixView` を使う。SYCL の FP32 GEMV/GEMM は圧縮 trellis を積和中に復号し、
 input/output の H128、scale、bias を適用する。batched GEMM は padding を含む row stride と明示的な
 event 依存を受け取り、scratch は呼び出し側が確保する。CPU の linear も行列全体を展開せずに計算する。
+CPU は三つの codebook の全 state に対する復号表を一度だけ作り、linear では F16 の丸めを保った F32 値を
+16×16 の一時 tile に読み出す。bit 幅ごとの展開で state 抽出の実行時除算を避け、従来の FP64 積和順序を保つ。
 
 `ExpertView` は gate/up/down の三つの packed/raw projection を独立に保持する。CPU と SYCL の expert 演算は
 `down(silu(gate(x)) * up(x))` を計算し、router weight は適用しない。
@@ -58,9 +60,16 @@ format registry は実際の blob layout の全成分を比較し、process 内�
 独立した gate/up/down 形式を保持したまま FP32 出力を計算する。scratch は事前に確保する。
 `Exl3ExpertRuntime` は明示した resident expert を形式別 cache に読み込み、hit を source I/O より前に判定し、
 CPU miss と GPU hit の出力を router 順の行へ配置する。永続的な計画を graph に記録できる。
+`STRATA_EXL3_TIMELINE=1` は host の prepare、GPU submit、CPU pool 区間の開始・終了を
+steady-clock の ns で標準エラーへ JSON 行として出す。GPU submit の時間は host の投入時間であり、
+GPU kernel の実行時間ではない。GPU profiler の timeline と照合して実行の重なりを確認する。
 `ExpertDispatch::exl3_runtime` と `MoeWindowTier::exl3_runtime` は、この runtime を既存の CPU-row/GPU-hit
 merge に接続する。現在は segmented graph の1 group 構成を使い、2 group と monolithic graph は拒否する。
-各 ring と最後の segment を同期してから永続計画を再利用する。Qwen3.5 MoE の起動時 binding は以下の経路を使う。prefill は別に行う。
+segmented 経路では `publish_window_plan` の直前 callback が同じ in-order queue に hit-only grouped kernel を投入し、
+その後 host の CPU miss 計算を開始する。CPU が戻ってから次 segment の既存 merge graph が CPU rows と GPU hit rows を
+合成するため、mapped flag の可視性や device-side spin に依存しない。各 ring の merge segment と最後の segment を
+同期してから plan/cache/scratch を再利用する。既存の CPU-first `enqueue()` 契約と all-resident direct path は維持する。
+Qwen3.5 MoE の起動時 binding は以下の経路を使う。prefill は別に行う。
 
 専用 n-gram decoder は、先頭の F16 row scale と160値の ringを通常の linear と区別して復号する。
 CPU は要求した row ID を選べ、SYCL は取得済みの packed rowを処理する。head bias は明示した head IDで
@@ -226,7 +235,8 @@ owner と embedding は、それを使う graph より長く生存させる。
 
 `Exl3FlashModel` は Qwen3.8 の単 token AR を所有する。device ごとの層範囲、embedding、PLE、
 expert の CPU/GPU merge、HC、head を接続し、stage 間では residual を転送する。開発用の
-`exl3_flash_probe` は token ID を直接受け取る。現時点では MTP、vision、複数 token の window を要求すると拒否する。
+`exl3_flash_probe` は token ID を直接受け取る。Flash の expert window は hit enqueue を CPU miss 計算より先に
+行い、CPU 完了後に event を待つ。現時点では MTP、vision、複数 token の window を要求すると拒否する。
 
 この経路の数値・機能確認と、同じ元重み・実効保存量での品質比較は別に行う。最適化前の部品や初期接続の
 速度は診断値として扱い、decode 速度を維持できるかの判定には使わない。

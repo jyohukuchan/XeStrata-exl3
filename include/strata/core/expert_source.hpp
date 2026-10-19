@@ -243,6 +243,8 @@ struct GpuPlanSink {
     unsigned long long staging = 0;
     int64_t staging_cap = 0;
     int64_t cap = 0;
+    /// Optional EXL3 segmented hook: launch resident hits before the CPU miss callback starts.
+    bool (*before_cpu)(void* ctx, std::string& err) = nullptr;
     void (*publish)(void* ctx) = nullptr;
     /// Starts the DMA copies of `n` host blobs (pinned) into staging slots 0..n-1 and signals the GPU when they land.
     void (*fetch)(void* ctx, const uint8_t* const* src, int n, size_t bytes) = nullptr;

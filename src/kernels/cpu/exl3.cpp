@@ -160,6 +160,95 @@ uint16_t decode_state_half(uint16_t state, int codebook) {
     return f32_to_f16(result);
 }
 
+using CodebookLut = std::array<std::array<uint16_t, 65536>, 3>;
+
+// The LUT is initialized once with the existing exact decoder.  Every lookup is
+// therefore bit-preserving relative to decode_state_half, including half-add and
+// MUL1 half-FMA rounding boundaries.  It stores codebook values only, never W.
+const CodebookLut& codebook_lut() {
+    static const CodebookLut table = [] {
+        CodebookLut result{};
+        for (int codebook = 0; codebook < 3; ++codebook)
+            for (uint32_t state = 0; state < 65536; ++state)
+                result[static_cast<size_t>(codebook)][state] =
+                    decode_state_half(static_cast<uint16_t>(state), codebook);
+        return result;
+    }();
+    return table;
+}
+
+inline uint16_t decode_state_half_lut(uint16_t state, int codebook) {
+    return codebook_lut()[static_cast<size_t>(codebook)][state];
+}
+
+using CodebookF32Lut = std::array<std::array<float, 65536>, 3>;
+
+// F32 values are derived from the exact F16 LUT once.  The pointer for the
+// selected codebook is hoisted by linear_with_scratch; no function/static guard
+// remains in the per-weight loop.
+const CodebookF32Lut& codebook_lut_f32() {
+    static const CodebookF32Lut table = [] {
+        CodebookF32Lut result{};
+        const auto& half_table = codebook_lut();
+        for (int codebook = 0; codebook < 3; ++codebook)
+            for (uint32_t state = 0; state < 65536; ++state)
+                result[static_cast<size_t>(codebook)][state] =
+                    f16_to_f32(half_table[static_cast<size_t>(codebook)][state]);
+        return result;
+    }();
+    return table;
+}
+
+// Hot linear path: validation and the codebook LUT pointer are already hoisted.
+// This writes only one bounded 16x16 tile in F32; it never materializes W.
+template <int Bits>
+void decode_tile_f32_hot_bits(const MatrixView& matrix, int64_t tile_k, int64_t tile_n, const float* lut,
+                              float* values) {
+    constexpr size_t words32_count = static_cast<size_t>(Bits) * 8;
+    const int64_t tiles_n = matrix.n / kTileSide;
+    const size_t packed_size = static_cast<size_t>(16 * Bits);
+    const size_t tile_index = static_cast<size_t>(tile_k) * static_cast<size_t>(tiles_n) +
+                              static_cast<size_t>(tile_n);
+    const uint16_t* packed = matrix.trellis + tile_index * packed_size;
+    for (int state = 0; state < kTileValues; ++state) {
+        const int b0 = state * Bits + Bits - 16 + 256 * Bits;
+        const int b1 = b0 + 16;
+        const size_t i0_raw = static_cast<size_t>(b0 >> 5);
+        const size_t i1_raw = static_cast<size_t>((b1 - 1) >> 5);
+        const size_t i0 = i0_raw >= words32_count ? i0_raw - words32_count : i0_raw;
+        const size_t i1 = i1_raw >= words32_count ? i1_raw - words32_count : i1_raw;
+        const int shift = (i1_raw + 1) * 32 - b1;
+        const uint64_t merged = (static_cast<uint64_t>(load_u32(packed, i0)) << 32) |
+                                load_u32(packed, i1);
+        const uint16_t packed_state = static_cast<uint16_t>((merged >> shift) & 0xffffu);
+        values[strata::kernels::exl3::tile_element_for_state(state)] = lut[packed_state];
+    }
+}
+
+template <int Bits>
+void linear_dot_tiles_f32(const MatrixView& matrix, const float* input_basis, float* y, const float* lut) {
+    const size_t k = static_cast<size_t>(matrix.k);
+    const size_t n = static_cast<size_t>(matrix.n);
+    const size_t tiles_k = k / kTileSide;
+    const size_t tiles_n = n / kTileSide;
+    std::array<float, kTileValues> tile_f32{};
+    for (size_t tile_n = 0; tile_n < tiles_n; ++tile_n) {
+        double acc[kTileSide] = {};
+        for (size_t tile_k = 0; tile_k < tiles_k; ++tile_k) {
+            decode_tile_f32_hot_bits<Bits>(matrix, static_cast<int64_t>(tile_k), static_cast<int64_t>(tile_n), lut,
+                                           tile_f32.data());
+            const size_t row_base = tile_k * kTileSide;
+            for (int row = 0; row < kTileSide; ++row) {
+                const double input = static_cast<double>(input_basis[row_base + static_cast<size_t>(row)]);
+                for (int col = 0; col < kTileSide; ++col)
+                    acc[col] += static_cast<double>(tile_f32[static_cast<size_t>(row * kTileSide + col)]) * input;
+            }
+        }
+        for (int col = 0; col < kTileSide; ++col)
+            y[tile_n * kTileSide + static_cast<size_t>(col)] = static_cast<float>(acc[col]);
+    }
+}
+
 void hadamard_normalized(float* values) {
     for (int width = 1; width < kHadamardSide; width *= 2) {
         for (int base = 0; base < kHadamardSide; base += 2 * width) {
@@ -193,6 +282,7 @@ Status linear_with_scratch(const MatrixView& matrix, const float* x, float* y, L
     const Status status = validate_linear(matrix, x, y);
     if (status != Status::ok) return status;
     const size_t k = static_cast<size_t>(matrix.k);
+    const size_t n = static_cast<size_t>(matrix.n);
     if (scratch.input_basis == nullptr || scratch.input_count < k || scratch.tile == nullptr || scratch.tile_count < 256)
         return Status::scratch_too_small;
 
@@ -205,24 +295,16 @@ Status linear_with_scratch(const MatrixView& matrix, const float* x, float* y, L
         hadamard_normalized(scratch.input_basis + base);
     }
 
-    const size_t n = static_cast<size_t>(matrix.n);
-    const size_t tiles_k = k / kTileSide;
-    const size_t tiles_n = n / kTileSide;
-    for (size_t tile_n = 0; tile_n < tiles_n; ++tile_n) {
-        double acc[kTileSide] = {};
-        for (size_t tile_k = 0; tile_k < tiles_k; ++tile_k) {
-            const Status tile_status = decode_tile(matrix, static_cast<int64_t>(tile_k), static_cast<int64_t>(tile_n),
-                                                   scratch.tile, scratch.tile_count);
-            if (tile_status != Status::ok) return tile_status;
-            const size_t row_base = tile_k * kTileSide;
-            for (int row = 0; row < kTileSide; ++row) {
-                const double input = static_cast<double>(scratch.input_basis[row_base + static_cast<size_t>(row)]);
-                for (int col = 0; col < kTileSide; ++col) {
-                    acc[col] += static_cast<double>(f16_to_f32(scratch.tile[row * kTileSide + col])) * input;
-                }
-            }
-        }
-        for (int col = 0; col < kTileSide; ++col) y[tile_n * kTileSide + static_cast<size_t>(col)] = static_cast<float>(acc[col]);
+    const float* const f32_lut = codebook_lut_f32()[static_cast<size_t>(matrix.codebook)].data();
+    switch (matrix.bits) {
+        case 1: linear_dot_tiles_f32<1>(matrix, scratch.input_basis, y, f32_lut); break;
+        case 2: linear_dot_tiles_f32<2>(matrix, scratch.input_basis, y, f32_lut); break;
+        case 3: linear_dot_tiles_f32<3>(matrix, scratch.input_basis, y, f32_lut); break;
+        case 4: linear_dot_tiles_f32<4>(matrix, scratch.input_basis, y, f32_lut); break;
+        case 5: linear_dot_tiles_f32<5>(matrix, scratch.input_basis, y, f32_lut); break;
+        case 6: linear_dot_tiles_f32<6>(matrix, scratch.input_basis, y, f32_lut); break;
+        case 7: linear_dot_tiles_f32<7>(matrix, scratch.input_basis, y, f32_lut); break;
+        default: linear_dot_tiles_f32<8>(matrix, scratch.input_basis, y, f32_lut); break;
     }
 
     for (size_t base = 0; base < n; base += kHadamardSide) {
@@ -290,7 +372,7 @@ Status decode_codebook(const uint16_t* states, size_t state_count, int codebook,
     if (states == nullptr || values == nullptr) return Status::missing_data;
     if (codebook < 0 || codebook > 2) return Status::unsupported_codebook;
     if (value_count < state_count) return Status::output_too_small;
-    for (size_t i = 0; i < state_count; ++i) values[i] = decode_state_half(states[i], codebook);
+    for (size_t i = 0; i < state_count; ++i) values[i] = decode_state_half_lut(states[i], codebook);
     return Status::ok;
 }
 
