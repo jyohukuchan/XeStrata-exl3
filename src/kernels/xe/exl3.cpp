@@ -147,8 +147,8 @@ inline uint16_t packed_decode_codebook(uint16_t state) {
     }
 }
 
-template <int Bits, int Codebook>
-inline uint16_t packed_decode_state(const uint16_t* tile, int state) {
+template <int Bits>
+inline uint16_t packed_extract_state(const uint16_t* tile, int state) {
     constexpr int word_count = Bits * 8;
     const int b0 = state * Bits + Bits - 16 + 256 * Bits;
     const int b1 = b0 + 16;
@@ -157,7 +157,7 @@ inline uint16_t packed_decode_state(const uint16_t* tile, int state) {
     const int shift = (i1 + 1) * 32 - b1;
     const uint64_t merged = ((uint64_t) load_word32(tile, i0, word_count) << 32) |
                             (uint64_t) load_word32(tile, i1, word_count);
-    return packed_decode_codebook<Codebook>((uint16_t) ((merged >> shift) & 0xFFFFu));
+    return static_cast<uint16_t>((merged >> shift) & 0xFFFFu);
 }
 
 // Scalar fallback specialization: it keeps one output column per work item and avoids the subgroup requirement.
@@ -283,28 +283,28 @@ sycl::event submit_packed_dot(sycl::queue& queue, const MatrixView& view, const 
                        [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
             const sycl::sub_group subgroup = item.get_sub_group();
             const int lane = static_cast<int>(subgroup.get_local_id()[0]);
-            const int wave = static_cast<int>(item.get_local_id(0)) / subgroup_size;
+            const int wave = static_cast<int>(subgroup.get_group_id()[0]);
             const size_t group = static_cast<size_t>(item.get_group_linear_id());
             const int64_t row = static_cast<int64_t>(group / static_cast<size_t>(n_tiles));
             const int64_t tile_n = static_cast<int64_t>(group % static_cast<size_t>(n_tiles));
             const int64_t kb_begin = (k_tiles * wave) / split_k;
             const int64_t kb_end = (k_tiles * (wave + 1)) / split_k;
             float accum = 0.0f;
-            if (lane < 16) {
-                const float* input = x + row * ldx;
-                const int64_t col_in_tile = lane;
-                for (int64_t k_tile = kb_begin; k_tile < kb_end; ++k_tile) {
-                    const uint16_t* source = view.trellis +
-                        (static_cast<size_t>(k_tile) * static_cast<size_t>(n_tiles) + static_cast<size_t>(tile_n)) *
-                        static_cast<size_t>(16 * Bits);
-                    float sum = 0.0f;
-                    for (int r = 0; r < 16; ++r) {
-                        const int state = tile_state_for_element(r * 16 + static_cast<int>(col_in_tile));
-                        sum += input[k_tile * 16 + r] *
-                               f32_from_f16(packed_decode_state<Bits, Codebook>(source, state));
-                    }
-                    accum += sum;
+            const float* input = x + row * ldx;
+            const int col_in_tile = lane & 15;
+            const int row_parity = lane >> 4;
+            for (int64_t k_tile = kb_begin; k_tile < kb_end; ++k_tile) {
+                const uint16_t* source = view.trellis +
+                    (static_cast<size_t>(k_tile) * static_cast<size_t>(n_tiles) + static_cast<size_t>(tile_n)) *
+                    static_cast<size_t>(16 * Bits);
+                float sum = 0.0f;
+                for (int rr = 0; rr < 8; ++rr) {
+                    const int r = 2 * rr + row_parity;
+                    const int state = tile_state_for_element(r * 16 + col_in_tile);
+                    const uint16_t packed_state = packed_extract_state<Bits>(source, state);
+                    sum += input[k_tile * 16 + r] * scalar_decode_codebook_f32<Codebook>(packed_state);
                 }
+                accum += sum + sycl::select_from_group(subgroup, sum, lane ^ 16);
             }
             if (lane < 16) partial[static_cast<size_t>(wave) * 16 + static_cast<size_t>(lane)] = accum;
             item.barrier();
