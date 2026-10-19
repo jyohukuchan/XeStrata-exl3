@@ -324,7 +324,7 @@ static void plain_usage(const std::string& arch) {
                  "  --dump-logits PATH   each generated token's logits, FP32 rows\n"
                  "  --serve              stay resident and take requests on stdin (server.py's protocol, text requests)\n"
                  "  --gpu PCI            the GPU (its PCI address)\n"
-                 "  --exl3 DIR           decode-only EXL3 archive (requires --metadata-gguf)\n"
+                 "  --exl3 DIR           EXL3 archive (requires --metadata-gguf; positive prompt chunks use decode windows)\n"
                  "  --metadata-gguf PATH metadata/tokenizer bootstrap for --exl3; no weights are read\n",
                  arch.c_str());
 }
@@ -428,13 +428,9 @@ int plain_main(int argc, char** argv) {
             std::fprintf(stderr, "strata plain: --exl3 requires --metadata-gguf\n");
             return 2;
         }
-        if (prompt_chunk_set && opt.prompt_chunk > 0) {
-            std::fprintf(stderr, "strata plain: EXL3 decode-only mode rejects positive --prompt-chunk\n");
-            return 2;
-        }
         opt.exl3_dir = exl3_dir;
         opt.metadata_gguf = metadata_gguf;
-        opt.prompt_chunk = 0;
+        if (!prompt_chunk_set) opt.prompt_chunk = 0;
         if (!spec_set) opt.spec = 0;
         gguf = metadata_gguf;
     }
@@ -454,16 +450,19 @@ int plain_main(int argc, char** argv) {
     model.set_sampler(sp);
     std::string err;
     const Clock::time_point t0 = Clock::now();
-    if (opt.prompt_chunk > 0) strata::prefill::Gemm::prepare();   // the products' library loads beside the model
+    if (opt.prompt_chunk > 0 && exl3_dir.empty()) strata::prefill::Gemm::prepare();   // the products' library loads beside the model
     if (!model.load(opt, err) || !model.prompt_warm(err)) {
         std::fprintf(stderr, "strata (%s): %s\n", arch.c_str(), err.c_str());
         return 1;
     }
-    if (opt.prompt_chunk > 0) {
+    if (opt.prompt_chunk > 0 && exl3_dir.empty()) {
         const char* experts = model.prompt_int8() ? strata::prefill::mmq::path() : nullptr;
         std::fprintf(stderr, "strata (%s): prompt matrix products on %s; the experts' in %s%s%s\n", arch.c_str(),
                      strata::prefill::Gemm::path(), experts ? "int8 (" : "FP16", experts ? experts : "",
                      experts ? ")" : "");
+    } else if (opt.prompt_chunk > 0 && !exl3_dir.empty()) {
+        std::fprintf(stderr, "strata (%s): EXL3 prompt uses decode-window fallback (chunks up to %d; no batched prefill)\n",
+                     arch.c_str(), std::min(opt.max_t, (int) opt.prompt_chunk));
     }
     if (serve) return plain_serve(model, opt, arch, eos.empty() ? eos_tokens(gguf) : eos, profile_save, save_min);
     const double load_s = std::chrono::duration<double>(Clock::now() - t0).count();

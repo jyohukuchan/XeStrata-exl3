@@ -183,14 +183,6 @@ const strata::artifact::exl3::ProjectionMapping* PlainModel::exl3_projection(
     return nullptr;
 }
 
-bool PlainModel::reject_exl3_features(std::string& err) const {
-    if (opt_.prompt_chunk > 0) {
-        err = "plain model: EXL3 decode-only mode does not support prefill; use --prompt-chunk 0";
-        return false;
-    }
-    return true;
-}
-
 namespace {
 
 bool exl3_axis_map(const strata::artifact::exl3::AxisMapping& axis, std::vector<int64_t>& result, std::string& err) {
@@ -317,7 +309,6 @@ bool PlainModel::run_projection(const W& w, const float* x, float* y, int rows, 
 bool PlainModel::load_exl3(std::string& err) {
     err.clear();
     try {
-        if (!reject_exl3_features(err)) return false;
         exl3_archive_ = std::make_shared<strata::artifact::exl3::Archive>(opt_.exl3_dir);
         const bool include_mtp = opt_.spec >= 2;
         if (!strata::artifact::exl3::build_model_map(*exl3_archive_, exl3_map_, err, include_mtp) ||
@@ -640,10 +631,6 @@ bool PlainModel::load_exl3_block(int64_t l, Block& b, std::string& err) {
 bool PlainModel::load(const PlainOptions& opt, std::string& err) {
     opt_ = opt;
     exl3_mode_ = !opt_.exl3_dir.empty();
-    if (exl3_mode_ && opt_.prompt_chunk > 0) {
-        err = "plain model: EXL3 decode-only mode does not support prefill; use --prompt-chunk 0";
-        return false;
-    }
     if (opt_.max_t < 1 || opt_.max_t > k::cpu::MAXT || opt_.max_cells < 16) {
         err = "plain model: the window or the context is out of range";
         return false;
@@ -944,6 +931,7 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
 }
 
 bool PlainModel::prompt_int8() const {
+    if (exl3_mode_) return false;
     const char* v = std::getenv("STRATA_PLAIN_MMQ");
     if (v != nullptr && std::strtol(v, nullptr, 10) == 0) return false;
     if (!prefill::mmq::chosen()) return false;

@@ -221,6 +221,10 @@ bool PlainModel::prompt_cpu_experts(int64_t ml, const std::vector<int32_t>& expe
 }
 
 bool PlainModel::prompt_warm(std::string& err) {
+    // EXL3 dense projections and experts use their runtime owners.  The
+    // legacy batched-product warmup below assumes GGUF W.data and an
+    // ExpertCache, neither of which exists in EXL3 mode.
+    if (exl3_mode_) return true;
     if (opt_.prompt_chunk <= 0 || prompt_host_ == nullptr) return true;
     if (!prompt_borrow(std::min<int64_t>(opt_.prompt_chunk, 512), err)) return false;
     const bool ok = prompt_warm_products(err);
@@ -284,6 +288,36 @@ bool PlainModel::prompt_warm_products(std::string& err) {
 }
 
 bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* out, float* logits, std::string& err) {
+    if (exl3_mode_) {
+        if (opt_.prompt_chunk <= 0 || n <= 0) { err.clear(); return false; }
+        if (tokens == nullptr || out == nullptr) {
+            err = "plain prompt: null token or output buffer";
+            return false;
+        }
+        if (pos < 0 || n > opt_.max_cells - pos) {
+            err = "plain prompt: past the context";
+            return false;
+        }
+        const int64_t chunk = std::max<int64_t>(1, std::min<int64_t>(opt_.prompt_chunk, opt_.max_t));
+        std::vector<int32_t> chunk_out((size_t) chunk);
+        std::vector<float> chunk_logits;
+        if (logits != nullptr) chunk_logits.resize((size_t) chunk * (size_t) n_vocab_);
+        for (int64_t offset = 0; offset < n;) {
+            const int T = (int) std::min<int64_t>(chunk, n - offset);
+            const bool last = offset + T == n;
+            if (!forward(tokens + offset, T, pos + offset, chunk_out.data(),
+                         last && logits != nullptr ? chunk_logits.data() : nullptr, err))
+                return false;
+            if (last) {
+                *out = chunk_out[(size_t) T - 1];
+                if (logits != nullptr)
+                    std::memcpy(logits, chunk_logits.data() + (size_t) (T - 1) * (size_t) n_vocab_,
+                                (size_t) n_vocab_ * sizeof(float));
+            }
+            offset += T;
+        }
+        return true;
+    }
     if (opt_.prompt_chunk <= 0 || n <= 0 || prompt_host_ == nullptr) { err.clear(); return false; }
     if (pos < 0 || pos + n > opt_.max_cells) { err = "plain prompt: past the context"; return false; }
     // one chunk the prompt's length, up to prompt_chunk (prompt_borrow may take fewer)

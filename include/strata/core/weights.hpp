@@ -39,6 +39,7 @@
 namespace strata::core {
 
 class Exl3Dense;
+class Exl3WeightSet;
 
 /// What the loader had to DO for a tensor, decided by `tools/pack_index.py` and written into the index
 /// rather than inferred here.  The four cases are distinguishable in the manifest only by combining
@@ -145,6 +146,7 @@ public:
 private:
     friend class NativeDense;
     friend class Exl3Dense;
+    friend class Exl3WeightSet;
     std::map<std::string, WeightRef> table_;
     LoadReport report_;
 };

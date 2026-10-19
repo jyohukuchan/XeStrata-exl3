@@ -127,8 +127,9 @@ axis maps and retain their original F16/BF16/F32 dtype. Norm `+1`, GDN `A_log` `
 weights required by F32 kernels are separate operations. Expert residency derives from actual blob bytes
 and device capacity and connects to the existing segmented graphs.
 
-AR uses `--prompt-chunk 0 --spec 0`; `--spec 1` also disables MTP. Positive prefill chunks are currently
-rejected on this path. MTP uses the integration below. Qwen3.8 projection maps and n-gram codecs/tables exist; its startup binding remains separate.
+AR uses `--prompt-chunk 0 --spec 0`; `--spec 1` also disables MTP. A positive `--prompt-chunk` runs prefill
+in decode windows bounded by `max-t`, returning the last row. Compressed weights remain compressed; this is
+a fallback distinct from dedicated batched prefill. MTP uses the integration below. Qwen3.8 projection maps and n-gram codecs/tables exist; its startup binding remains separate.
 
 The development tool `plain_model_logits` feeds `qbench-trace/1` token IDs in order without retokenizing,
 saving FP32 logits and a manifest for selected rows. Choose `--exl3 DIR --metadata-gguf GGUF` or `--native GGUF`,
@@ -192,6 +193,10 @@ Development layer/verify paths can explicitly attach these owners to routers, at
 shared experts and hyper-connection reads. Raw F16/BF16/F32 projections preserve their original dtype and accept
 FP32 activations. HC norms use separate F32 vectors. The loader must validate model-wide names, axis order and
 norm transformations; these components alone do not start a complete EXL3 model.
+`Exl3WeightSet` owns dense projections and FP32 auxiliary weights for a selected device and trunk layer range,
+registering them in a borrowed `WeightTable`. The head and final HC mixer can be included explicitly. Prepare each
+stream before capture; teardown waits for the device and restores only its own registrations. Embeddings, routed
+experts, PLE and MTP connect through separate owners.
 `NativeEmbed::load_exl3()` preserves raw F16/BF16/F32 embedding dtypes and gathers rows from either host tokens
 or device token IDs. Owner and embedding streams are prepared before capture.
 

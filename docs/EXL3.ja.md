@@ -120,8 +120,9 @@ raw projection は軸ごとの明示的な変換で元の F16/BF16/F32 を保持
 `A_log` の `-exp` と FP32 を要求する補助 weight の widening だけを個別に適用する。
 expert の residency は実際の blob byte 数と device の容量から決め、既存の segmented graph に接続する。
 
-AR では `--prompt-chunk 0 --spec 0` を使う。`--spec 1` も MTP 無効として扱う。正の prefill chunk は
-現在この経路で拒否する。MTP は次の接続を使う。
+AR では `--prompt-chunk 0 --spec 0` を使う。`--spec 1` も MTP 無効として扱う。正の `--prompt-chunk` は
+`max-t` 以下の decode window に分けて prefill を実行し、最後の行の出力を返す。圧縮 weight はそのまま
+使い、専用の batched prefill とは区別する。MTP は次の接続を使う。
 Qwen3.8 の projection map と n-gram codec/table はあり、同モデルの起動時 binding は別に行う。
 
 開発用 `plain_model_logits` は `qbench-trace/1` の token ID を再 tokenize せず順に入力し、指定した行の
@@ -185,6 +186,10 @@ CLI の `--exl3-head` が選ぶ対象は引き続き `output.weight` である�
 hyper-connection read に明示的に接続できる。raw F16/BF16/F32 projection は元の dtype を保ち、
 FP32 activation を受け取る。HC norm は別の F32 vector を使う。モデル全体の名前・軸順・norm の変換は
 読み込み側が検証する必要があり、これらの部品だけでモデル全体を起動できるわけではない。
+`Exl3WeightSet` は指定した device と trunk 層範囲の dense projection・FP32 補助 weight を所有し、
+借用した `WeightTable` に登録する。head と最後の HC mixer は明示して追加できる。各 stream の準備を
+capture 前に済ませ、解放時は device の処理完了を待って自分の登録だけを戻す。embedding、routed expert、
+PLE、MTP は別の owner に接続する。
 `NativeEmbed::load_exl3()` は raw F16/BF16/F32 embedding の元の dtype を保ち、host token と device token ID
 の両方から行を取得する。owner と embedding の stream は capture 前に準備する。
 

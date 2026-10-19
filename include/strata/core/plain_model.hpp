@@ -191,7 +191,6 @@ private:
                      std::string& err);
     const strata::artifact::exl3::ProjectionMapping* exl3_projection(
         strata::artifact::exl3::ProjectionKind kind, int64_t layer = -1, int64_t expert = -1) const;
-    bool reject_exl3_features(std::string& err) const;
     bool open_experts(std::string& err);
     bool record(int T, bool mtp, std::string& err);
     /// The window's inputs (embeddings, steps, positions) for `tokens` at pos .. pos + T - 1 into the mapped staging.

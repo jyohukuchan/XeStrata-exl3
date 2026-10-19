@@ -462,7 +462,8 @@ if(STRATA_ENABLE_XE)
   # verify window and the MTP drafter.  Host code over strata_core's GPU operations (strata/core/gpu.hpp).
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp
                                    src/core/remote_experts.cpp src/core/expert_cache.cpp src/core/native_head.cpp
-                                   src/core/native_dense.cpp src/core/exl3_dense.cpp src/core/verify.cpp
+                                   src/core/native_dense.cpp src/core/exl3_dense.cpp
+                                   src/core/exl3_weight_set.cpp src/core/verify.cpp
                                    src/core/exl3_expert_source.cpp src/core/exl3_expert_formats.cpp
                                    src/core/exl3_expert_runtime.cpp
                                    src/core/moe_window.cpp
@@ -719,9 +720,12 @@ if(STRATA_ENABLE_XE)
       ${CMAKE_CURRENT_SOURCE_DIR}/third_party/main/nlohmann-json)
     add_executable(plain_model_bench src/core/plain_model_bench.cpp)
     target_link_libraries(plain_model_bench PRIVATE strata_engine strata_prefill)
-    add_executable(plain_model_exl3_test src/core/plain_model_exl3_test.cpp)
-    target_link_libraries(plain_model_exl3_test PRIVATE strata_engine strata_prefill)
-    add_test(NAME plain_model_exl3_test COMMAND plain_model_exl3_test)
+    add_executable(exl3_weight_set_test src/core/exl3_weight_set_test.cpp)
+    target_link_libraries(exl3_weight_set_test PRIVATE strata_engine)
+    target_include_directories(exl3_weight_set_test SYSTEM PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/third_party/main/nlohmann-json)
+    add_test(NAME exl3_weight_set_test COMMAND exl3_weight_set_test)
+    set_tests_properties(exl3_weight_set_test PROPERTIES SKIP_RETURN_CODE 77)
     add_executable(exl3_projection_parity src/core/exl3_projection_parity.cpp)
     target_link_libraries(exl3_projection_parity PRIVATE strata_engine)
     target_include_directories(exl3_projection_parity SYSTEM PRIVATE
