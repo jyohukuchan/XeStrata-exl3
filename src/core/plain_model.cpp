@@ -188,10 +188,6 @@ bool PlainModel::reject_exl3_features(std::string& err) const {
         err = "plain model: EXL3 decode-only mode does not support prefill; use --prompt-chunk 0";
         return false;
     }
-    if (opt_.spec > 0) {
-        err = "plain model: EXL3 decode-only mode does not support MTP; use --spec 0";
-        return false;
-    }
     return true;
 }
 
@@ -323,7 +319,8 @@ bool PlainModel::load_exl3(std::string& err) {
     try {
         if (!reject_exl3_features(err)) return false;
         exl3_archive_ = std::make_shared<strata::artifact::exl3::Archive>(opt_.exl3_dir);
-        if (!strata::artifact::exl3::build_model_map(*exl3_archive_, exl3_map_, err) ||
+        const bool include_mtp = opt_.spec >= 2;
+        if (!strata::artifact::exl3::build_model_map(*exl3_archive_, exl3_map_, err, include_mtp) ||
             !exl3_map_.require_supported(err))
             return false;
         if (exl3_map_.family != strata::artifact::exl3::ModelFamily::qwen35) {
@@ -354,6 +351,10 @@ bool PlainModel::load_exl3(std::string& err) {
             err = "plain model: EXL3 geometry disagrees with metadata bootstrap";
             return false;
         }
+        if (include_mtp && (spec_.n_nextn != 1 || exl3_map_.geometry.mtp_layers != 1)) {
+            err = "plain model: EXL3 MTP requires metadata block_count=trunk+1 and one nextn layer";
+            return false;
+        }
         const auto* embedding = exl3_projection(strata::artifact::exl3::ProjectionKind::embedding);
         if (embedding == nullptr || embedding->source_name.size() <= 7 ||
             embedding->source_name.compare(embedding->source_name.size() - 7, 7, ".weight") != 0) {
@@ -363,6 +364,46 @@ bool PlainModel::load_exl3(std::string& err) {
         const std::string embedding_name = embedding->source_name.substr(0, embedding->source_name.size() - 7);
         if (!exl3_embed_.load_exl3(*exl3_archive_, embedding_name, spec_.n_embd, g.vocab_size, err)) return false;
         n_vocab_ = g.vocab_size;
+        auto load_dense_owner = [&](const strata::artifact::exl3::ProjectionMapping* mapping, W& target) {
+            if (mapping == nullptr) { err = "plain model: EXL3 MTP projection mapping is missing"; return false; }
+            auto owner = std::make_unique<Exl3Dense>();
+            if (mapping->transform == strata::artifact::exl3::MappingTransform::raw_rows) {
+                const auto* tensor = exl3_archive_->find_tensor(mapping->source_name);
+                if (tensor == nullptr) { err = "plain model: EXL3 raw projection is missing"; return false; }
+                strata::artifact::exl3::RawTensor raw;
+                std::vector<std::vector<int64_t>> axes;
+                for (const auto& axis : mapping->raw_axes) {
+                    std::vector<int64_t> map;
+                    if (!exl3_axis_map(axis, map, err)) return false;
+                    axes.push_back(std::move(map));
+                }
+                strata::artifact::exl3::RawTensor bias;
+                const strata::artifact::exl3::RawTensor* bias_ptr = nullptr;
+                const std::string suffix = ".weight";
+                const std::string base = mapping->source_name.size() > suffix.size() &&
+                                                 mapping->source_name.compare(mapping->source_name.size() - suffix.size(),
+                                                                              suffix.size(), suffix) == 0
+                                             ? mapping->source_name.substr(0, mapping->source_name.size() - suffix.size())
+                                             : mapping->source_name;
+                if (const auto* bias_tensor = exl3_archive_->find_tensor(base + ".bias"); bias_tensor != nullptr) {
+                    if (!strata::artifact::exl3::materialize_raw(*exl3_archive_, *bias_tensor, {},
+                                                                 strata::artifact::exl3::ValueTransform::identity, bias,
+                                                                 err))
+                        return false;
+                    bias_ptr = &bias;
+                }
+                if (!strata::artifact::exl3::materialize_raw(*exl3_archive_, *tensor, axes, mapping->value_transform, raw, err) ||
+                    !owner->load_raw_detached(raw, bias_ptr, err, opt_.max_t)) return false;
+            } else if (!owner->load_detached(*exl3_archive_, mapping->source_name, mapping->target_k, mapping->target_n,
+                                             exl3_block_map(mapping->input_axis), exl3_block_map(mapping->output_axis), err,
+                                             opt_.max_t)) return false;
+            if (!owner->prepare_stream(cs_, err)) return false;
+            target.n_in = (int) mapping->target_k;
+            target.n_out = (int) mapping->target_n;
+            target.exl3 = owner.get();
+            exl3_dense_.push_back(std::move(owner));
+            return true;
+        };
         const auto* head = exl3_projection(strata::artifact::exl3::ProjectionKind::lm_head);
         const auto* norm = exl3_projection(strata::artifact::exl3::ProjectionKind::final_norm);
         if (head == nullptr || norm == nullptr) {
@@ -419,7 +460,32 @@ bool PlainModel::load_exl3(std::string& err) {
             else b.attn = n_attn++;
             if (!load_exl3_block(l, b, err)) return false;
         }
-        has_mtp_ = false;
+        has_mtp_ = include_mtp;
+        if (has_mtp_) {
+            mtp_.recurrent = false;
+            mtp_.attn = n_attn++;
+            if (!load_exl3_block(spec_.n_layer, mtp_, err) ||
+                !load_dense_owner(exl3_projection(strata::artifact::exl3::ProjectionKind::mtp_fc, spec_.n_layer), mtp_eh_))
+                return false;
+            const auto find_canonical = [&](const std::string& canonical) -> const strata::artifact::exl3::ProjectionMapping* {
+                for (const auto& mapping : exl3_map_.projections)
+                    if (mapping.canonical_name == canonical) return &mapping;
+                return nullptr;
+            };
+            const auto* enorm = find_canonical("blk." + std::to_string(spec_.n_layer) + ".nextn.enorm.weight");
+            const auto* hnorm = find_canonical("blk." + std::to_string(spec_.n_layer) + ".nextn.hnorm.weight");
+            const auto* head_norm = find_canonical("blk." + std::to_string(spec_.n_layer) + ".nextn.shared_head_norm.weight");
+            if (enorm == nullptr || hnorm == nullptr || head_norm == nullptr) {
+                err = "plain model: EXL3 MTP norm mappings are missing";
+                return false;
+            }
+            if (!raw_aux_f32(*enorm,
+                             mtp_enorm_, (uint64_t) spec_.n_embd, err) ||
+                !raw_aux_f32(*hnorm,
+                             mtp_hnorm_, (uint64_t) spec_.n_embd, err) ||
+                !raw_aux_f32(*head_norm,
+                             mtp_head_norm_, (uint64_t) spec_.n_embd, err)) return false;
+        }
         return true;
     } catch (const std::exception& e) {
         err = std::string("plain model: EXL3 load: ") + e.what();
@@ -522,6 +588,9 @@ bool PlainModel::load_exl3_block(int64_t l, Block& b, std::string& err) {
         return true;
     };
     const bool q35 = spec_.arch == ModelArch::Qwen35Moe;
+    // The MTP block uses the ordinary canonical block prefix.  Only its FC and
+    // pre/head norms carry the nextn namespace (resolved separately below).
+    const std::string canonical_prefix = "blk." + std::to_string(l) + ".";
     // The map records canonical names for auxiliary tensors; find by canonical name because several auxiliaries share a kind.
     auto aux_name = [&](const std::string& canonical, const float*& out, uint64_t expected_count) {
         for (const auto& mapping : exl3_map_.projections)
@@ -529,17 +598,18 @@ bool PlainModel::load_exl3_block(int64_t l, Block& b, std::string& err) {
         err = std::string("plain model: EXL3 auxiliary mapping is missing: ") + canonical;
         return false;
     };
-    if (!aux_name("blk." + std::to_string(l) + ".attn_norm.weight", b.attn_norm, static_cast<uint64_t>(spec_.n_embd)) ||
-        !aux_name("blk." + std::to_string(l) + "." + (q35 ? "post_attention_norm.weight" : "ffn_norm.weight"), b.post_norm, static_cast<uint64_t>(spec_.n_embd)))
+    if (!aux_name(canonical_prefix + "attn_norm.weight", b.attn_norm, static_cast<uint64_t>(spec_.n_embd)) ||
+        !aux_name(canonical_prefix + (q35 ? "post_attention_norm.weight" : "ffn_norm.weight"), b.post_norm,
+                  static_cast<uint64_t>(spec_.n_embd)))
         return false;
     if (b.recurrent) {
         const int64_t C = 2 * spec_.ssm_n_group * spec_.ssm_d_state + spec_.ssm_d_inner;
         if (!dense(PK::gdn_qkv, b.qkv) || !dense(PK::gdn_z, b.z) || !dense(PK::gdn_out, b.ssm_out) ||
             !dense(PK::gdn_alpha, b.alpha) || !dense(PK::gdn_beta, b.beta) ||
-            !aux_name("blk." + std::to_string(l) + ".ssm_norm.weight", b.ssm_norm, static_cast<uint64_t>(spec_.ssm_d_state)) ||
-            !aux_name("blk." + std::to_string(l) + ".ssm_conv1d.weight", b.conv, static_cast<uint64_t>(C * spec_.ssm_d_conv)) ||
-            !aux_name("blk." + std::to_string(l) + ".ssm_dt.bias", b.dt, static_cast<uint64_t>(spec_.ssm_dt_rank)) ||
-            !aux_name("blk." + std::to_string(l) + ".ssm_a", b.a, static_cast<uint64_t>(spec_.ssm_dt_rank))) return false;
+            !aux_name(canonical_prefix + "ssm_norm.weight", b.ssm_norm, static_cast<uint64_t>(spec_.ssm_d_state)) ||
+            !aux_name(canonical_prefix + "ssm_conv1d.weight", b.conv, static_cast<uint64_t>(C * spec_.ssm_d_conv)) ||
+            !aux_name(canonical_prefix + "ssm_dt.bias", b.dt, static_cast<uint64_t>(spec_.ssm_dt_rank)) ||
+            !aux_name(canonical_prefix + "ssm_a", b.a, static_cast<uint64_t>(spec_.ssm_dt_rank))) return false;
     } else {
         const int64_t nkv = spec_.n_head_kv[(size_t) l];
         if (nkv <= 0 || spec_.n_head % nkv != 0 || (nkv_ != 0 && nkv_ != nkv)) {
@@ -548,8 +618,8 @@ bool PlainModel::load_exl3_block(int64_t l, Block& b, std::string& err) {
         }
         nkv_ = nkv;
         if (!dense(PK::qsa_q, b.q) || !dense(PK::qsa_k, b.k) || !dense(PK::qsa_v, b.v) || !dense(PK::qsa_out, b.o) ||
-            !aux_name("blk." + std::to_string(l) + ".attn_q_norm.weight", b.q_norm, static_cast<uint64_t>(spec_.key_length)) ||
-            !aux_name("blk." + std::to_string(l) + ".attn_k_norm.weight", b.k_norm, static_cast<uint64_t>(spec_.key_length))) return false;
+            !aux_name(canonical_prefix + "attn_q_norm.weight", b.q_norm, static_cast<uint64_t>(spec_.key_length)) ||
+            !aux_name(canonical_prefix + "attn_k_norm.weight", b.k_norm, static_cast<uint64_t>(spec_.key_length))) return false;
         if (b.q.n_out != (has_gate_ ? 2 : 1) * spec_.n_head * spec_.key_length ||
             b.k.n_out != nkv * spec_.key_length || b.v.n_out != nkv * spec_.value_length ||
             b.o.n_in != spec_.n_head * spec_.key_length) {
@@ -557,9 +627,10 @@ bool PlainModel::load_exl3_block(int64_t l, Block& b, std::string& err) {
             return false;
         }
     }
-    if (!aux_name("blk." + std::to_string(l) + ".ffn_gate_inp.weight", b.router, static_cast<uint64_t>(spec_.n_embd * spec_.n_expert))) return false;
+    if (!aux_name(canonical_prefix + "ffn_gate_inp.weight", b.router,
+                  static_cast<uint64_t>(spec_.n_embd * spec_.n_expert))) return false;
     if (has_shared_) {
-        if (!aux_name("blk." + std::to_string(l) + ".ffn_gate_inp_shexp.weight", b.sh_gate_inp, static_cast<uint64_t>(spec_.n_embd)) ||
+        if (!aux_name(canonical_prefix + "ffn_gate_inp_shexp.weight", b.sh_gate_inp, static_cast<uint64_t>(spec_.n_embd)) ||
             !dense(PK::shared_gate, b.sh_gate) || !dense(PK::shared_up, b.sh_up) || !dense(PK::shared_down, b.sh_down))
             return false;
     }
@@ -571,10 +642,6 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
     exl3_mode_ = !opt_.exl3_dir.empty();
     if (exl3_mode_ && opt_.prompt_chunk > 0) {
         err = "plain model: EXL3 decode-only mode does not support prefill; use --prompt-chunk 0";
-        return false;
-    }
-    if (exl3_mode_ && opt_.spec > 0) {
-        err = "plain model: EXL3 decode-only mode does not support MTP; use --spec 0";
         return false;
     }
     if (opt_.max_t < 1 || opt_.max_t > k::cpu::MAXT || opt_.max_cells < 16) {
@@ -683,17 +750,16 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
                 ++n_attn;
                 if (nkv_ == 0) nkv_ = s.n_head_kv[(size_t) l];
             }
+        if (has_mtp_) ++n_attn;
     }
     // the MTP layer, when the window checks drafts and the file has it (its K/V the last attention block's)
     {
-        if (exl3_mode_) {
-            has_mtp_ = false;
-        } else {
+        if (!exl3_mode_) {
         const std::string p = "blk." + std::to_string(s.n_layer) + ".nextn.";
         has_mtp_ = opt_.spec >= 2 && q35 && s.n_nextn == 1 && m.find(p + "eh_proj.weight") != nullptr;
         }
     }
-    if (has_mtp_) {
+    if (!exl3_mode_ && has_mtp_) {
         const std::string p = "blk." + std::to_string(s.n_layer) + ".nextn.";
         mtp_.attn = n_attn++;
         if (!load_block(m, s.n_layer, mtp_, err) || !upload(m, p + "eh_proj.weight", mtp_eh_, err) ||
@@ -769,7 +835,7 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
     // the drafts' head over a token subset (Qwen3.8's draft head, mtp.cpp): on the RX 9060 XT the whole Q8_0 head of
     // Qwen3.6's 248,320 tokens took 1.7 ms a draft, at the card's bandwidth, 2026-10-15.  The engine's row layouts
     // (upload) rewrite each row in place, so a row keeps its GGUF type's size.
-    if (has_mtp_ && n_snap_ > 0 && !opt_.draft_vocab.empty()) {
+    if (has_mtp_ && n_snap_ > 0 && !opt_.draft_vocab.empty() && !exl3_mode_) {
         std::vector<int32_t> ids;
         if (FILE* f = std::fopen(opt_.draft_vocab.c_str(), "rb")) {
             int32_t v = 0;
@@ -806,6 +872,8 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
                          (double) ((size_t) n_dvocab_ * row) / 1048576.0);
         }
     }
+    if (has_mtp_ && exl3_mode_ && !opt_.draft_vocab.empty())
+        std::fprintf(stderr, "strata plain: EXL3 MTP uses the full output head; --draft-vocab is ignored\n");
     n_pages_ = (opt_.max_cells + qs.page_size - 1) / qs.page_size;
     opt_.max_cells = n_pages_ * qs.page_size;
     {
@@ -1408,13 +1476,7 @@ bool PlainModel::record_block(const Block& b, int64_t ml, int T, uint32_t& ring,
         proj(b.sh_down, sh_gate_, shared_, T, true);
         k::f32_gemv_fp32_mmvf_multi(hn_, N, b.sh_gate_inp, sh_g_, 1, N, 1, T, cs);
     } else if (has_shared_) {
-        if (exl3_mode_) {
-            proj(b.sh_gate, hn_, sh_gate_, T, true);
-            proj(b.sh_up, hn_, sh_up_, T, false);
-            k::native_swiglu_f32(sh_gate_, sh_up_, sh_gate_, (int) FS, T, cs);
-            proj(b.sh_down, sh_gate_, shared_, T, true);
-            k::f32_gemv_fp32_mmvf_multi(hn_, N, b.sh_gate_inp, sh_g_, 1, N, 1, T, cs);
-        } else if (!k::native_mmvq_pair(b.sh_gate.type, b.sh_gate.data, b.sh_up.data, xq_, sh_gate_, sh_up_, (int) N,
+        if (!k::native_mmvq_pair(b.sh_gate.type, b.sh_gate.data, b.sh_up.data, xq_, sh_gate_, sh_up_, (int) N,
                                  (int) FS, T, cs)) {
             k::native_mmvq(b.sh_gate.type, b.sh_gate.data, xq_, sh_gate_, (int) N, (int) FS, T, cs);
             k::native_mmvq(b.sh_up.type, b.sh_up.data, xq_, sh_up_, (int) N, (int) FS, T, cs);
@@ -1478,14 +1540,19 @@ bool PlainModel::record_mtp(int T, strata::gpu::Stream cs, std::string& err) {
     const int64_t N = s.n_embd, NH = s.n_head;
     const float eps = (float) s.rms_eps;
     const int64_t NKV = attn_shapes(s, nkv_).n_head_kv;
-    k::copy_from_mapped(x_, m_emb_, (int64_t) T * N, cs);
+    if (exl3_mode_) {
+        k::copy_i32_from_mapped(m_tokens_, h_tokens_, T, cs);
+        exl3_embed_.gather_dev(m_tokens_, T, x_, cs);
+    } else k::copy_from_mapped(x_, m_emb_, (int64_t) T * N, cs);
     k::copy_i32_from_mapped(step_, m_step_, (int64_t) T * k::kStepCount, cs);
     k::copy_i32_from_mapped(pos_, m_pos_, (int64_t) opt_.max_t * (NH + NKV), cs);
     // llama.cpp's graph_mtp: the block's input is eh_proj([rms_norm(e) enorm | rms_norm(h) hnorm])
     k::native_qsa_rms_norm_weighted(x_, mtp_enorm_, hn_, (int) N, T, eps, cs);
     k::native_qsa_rms_norm_weighted(mtp_h_, mtp_hnorm_, mix_, (int) N, T, eps, cs);
     k::concat_rows(qfull_, hn_, mix_, N, T, cs);
-    if (mtp_eh_.type == kBF16) {
+    if (exl3_mode_) {
+        if (!run_projection(mtp_eh_, qfull_, x_, T, false, cs, err)) return false;
+    } else if (mtp_eh_.type == kBF16) {
         k::bf16_gemv_fp32_mmvf_multi(qfull_, 2 * N, static_cast<const uint16_t*>(mtp_eh_.data), x_, N, 2 * N, N, T, cs);
     } else {
         k::native_quantize_q8_1(qfull_, xq_, (int) (2 * N), T, cs);

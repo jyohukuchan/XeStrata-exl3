@@ -5,8 +5,8 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 # EXL3 development loading path
 
 Whole-model coverage, quality at matched effective bpw, and optimized decode speed follow the
-[EXL3 support plan](EXL3_PLAN.md). The following describes the development loading path and numerical checks. A single-GPU AR path is
-connected for Qwen3.5 MoE; coverage and performance of all target models, prefill and MTP proceed in stages.
+[EXL3 support plan](EXL3_PLAN.md). The following describes the development loading path and numerical checks. Single-GPU AR/MTP paths are
+connected for Qwen3.5 MoE; coverage and performance of all target models and prefill proceed in stages.
 
 ## Artifact
 
@@ -105,6 +105,18 @@ experts, norms and output head from the EXL3 archive. GGUF bootstraps model geom
 it never supplies fallback weights. A metadata-only GGUF containing zero tensors also works. Config and
 bootstrap geometry are checked, including auxiliary tensor element counts required by each kernel.
 
+The bootstrap can be built from the EXL3 directory's config/tokenizer without original BF16 weights.
+In an environment with the converter's Python dependencies, first create a zero-tensor GGUF, then validate it
+against the config with the helper. The helper rejects GGUFs containing weights and preserves the original types
+and bytes of metadata other than block/nextn counts.
+
+```sh
+python3 third_party/main/llama.cpp/convert_hf_to_gguf.py /path/to/exl3-model \
+    --vocab-only --no-nextn --outtype bf16 --outfile /path/to/vocab-only.gguf
+python3 tools/exl3_metadata.py /path/to/vocab-only.gguf --exl3 /path/to/exl3-model \
+    --output /path/to/metadata-only.gguf
+```
+
 ```sh
 strata --exl3 /path/to/exl3-model --metadata-gguf /path/to/metadata-only.gguf \
     --prompt-chunk 0 --spec 0 --max-t 1 --tokens 16,10,16,28 --max-new 2
@@ -115,14 +127,48 @@ axis maps and retain their original F16/BF16/F32 dtype. Norm `+1`, GDN `A_log` `
 weights required by F32 kernels are separate operations. Expert residency derives from actual blob bytes
 and device capacity and connects to the existing segmented graphs.
 
-This CLI path currently uses `--prompt-chunk 0 --spec 0`. Positive prefill chunks and MTP are explicitly
-rejected. Qwen3.8 projection maps and n-gram codecs/tables exist; its startup binding remains separate.
+AR uses `--prompt-chunk 0 --spec 0`; `--spec 1` also disables MTP. Positive prefill chunks are currently
+rejected on this path. MTP uses the integration below. Qwen3.8 projection maps and n-gram codecs/tables exist; its startup binding remains separate.
 
 The development tool `plain_model_logits` feeds `qbench-trace/1` token IDs in order without retokenizing,
 saving FP32 logits and a manifest for selected rows. Choose `--exl3 DIR --metadata-gguf GGUF` or `--native GGUF`,
 and supply `--trace TRACE.json --out-dir DIR`. `--rows 0,4` limits rows; native `--expert-profile FILE` supports
 checks with matched residency. Quality acceptance uses only `KL(P_BF16 || P_candidate)` against the original
 BF16 teacher. The diagnostic dump's runtime is not a decode speed acceptance measurement.
+
+## Qwen3.5 MoE MTP integration
+
+`--spec 2` or greater loads `mtp.fc`, three norms, and `mtp.layers.0` attention, routers and shared/routed experts
+from the archive, connecting them to existing draft/verify and GDN state rollback. The GGUF bootstrap must have
+`block_count=trunk+1` and `nextn_predict_layers=1`, and the EXL3 config must also specify one MTP layer.
+`ModelMap` adds MTP only when requested; disabled MTP leaves the trunk and head unchanged.
+Build its bootstrap by adding `--include-mtp` to `tools/exl3_metadata.py`.
+
+```sh
+strata --exl3 /path/to/exl3-model --metadata-gguf /path/to/metadata-with-mtp.gguf \
+    --prompt-chunk 0 --spec 2 --max-t 3 --tokens 16,10,16,28 --max-new 8
+```
+
+FC and other projections retain packed/raw storage and bit widths. MTP shares the trunk embedding and output head,
+using `mtp.norm.weight` for its final norm. Drafts currently compute the full head; requesting `--draft-vocab`
+prints a message explaining this behavior. Dedicated MTP embeddings and multiple MTP layers are explicitly rejected.
+
+## Fixed-token decode measurement
+
+`plain_model_bench` reads comma/whitespace-separated token IDs, repeating the same sequence to reach the required
+length. It prepares the requested context, runs its last `--warmup` tokens one at a time, then measures `--steps`
+AR decode tokens. Each repeat resets the state; context preparation, reset and model loading are excluded from
+timing. No logits are copied to the host or written during measurement. Greedy token retrieval and synchronization
+are included.
+
+```sh
+plain_model_bench --exl3 /path/to/exl3-model --metadata-gguf /path/to/metadata-only.gguf \
+    --tokens-file /path/to/token-ids.txt --context 512 --warmup 16 --steps 128 --repeats 5 --max-t 1
+```
+
+For native IQuant, replace the source with `--native GGUF --expert-profile FILE`. JSON output includes each repeat's
+and aggregate mean/median/p90 latency and token/s, expert hit/miss counts, and resident/slot counts. Match token IDs,
+context, max-t, residency and execution environment, then apply the speed gate after optimization and quality checks.
 
 ## Early output-head integration
 

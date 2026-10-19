@@ -5,8 +5,8 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 # EXL3 の開発用読み込み経路
 
 モデル全体の対応範囲と、同じ実効 bpw での精度・最適化後の decode 速度の判定は
-[EXL3 対応計画](EXL3_PLAN.ja.md)に従う。以下は開発用の読み込み経路と数値照合の部品を説明する。Qwen3.5 MoE の single GPU AR 経路を
-接続しており、全対象モデル・prefill・MTP の対応と性能の判定は段階的に進める。
+[EXL3 対応計画](EXL3_PLAN.ja.md)に従う。以下は開発用の読み込み経路と数値照合の部品を説明する。Qwen3.5 MoE の single GPU AR/MTP 経路を
+接続しており、全対象モデル・prefill の対応と性能の判定は段階的に進める。
 
 ## Artifact
 
@@ -99,6 +99,17 @@ shared/routed expert、norm と出力 head を EXL3 archive から読み込む�
 tokenizer のための bootstrap に使い、重みの fallback には使わない。tensor 数ゼロの metadata-only
 GGUF も使える。config と bootstrap の形状を照合し、補助 tensor の要素数も kernel の要求に合わせて検証する。
 
+bootstrap は EXL3 ディレクトリの config/tokenizer から作れる。元の BF16 weight は不要である。
+converter の Python 依存を用意した環境で、まず tensor 数ゼロの GGUF を作り、補助ツールで config と照合する。
+補助ツールは重み入り GGUF を拒否し、block/nextn 数以外の metadata を元の型・byte 列で保持する。
+
+```sh
+python3 third_party/main/llama.cpp/convert_hf_to_gguf.py /path/to/exl3-model \
+    --vocab-only --no-nextn --outtype bf16 --outfile /path/to/vocab-only.gguf
+python3 tools/exl3_metadata.py /path/to/vocab-only.gguf --exl3 /path/to/exl3-model \
+    --output /path/to/metadata-only.gguf
+```
+
 ```sh
 strata --exl3 /path/to/exl3-model --metadata-gguf /path/to/metadata-only.gguf \
     --prompt-chunk 0 --spec 0 --max-t 1 --tokens 16,10,16,28 --max-new 2
@@ -109,7 +120,8 @@ raw projection は軸ごとの明示的な変換で元の F16/BF16/F32 を保持
 `A_log` の `-exp` と FP32 を要求する補助 weight の widening だけを個別に適用する。
 expert の residency は実際の blob byte 数と device の容量から決め、既存の segmented graph に接続する。
 
-現在この CLI 経路では `--prompt-chunk 0 --spec 0` を使う。正の prefill chunk と MTP は明示的に拒否する。
+AR では `--prompt-chunk 0 --spec 0` を使う。`--spec 1` も MTP 無効として扱う。正の prefill chunk は
+現在この経路で拒否する。MTP は次の接続を使う。
 Qwen3.8 の projection map と n-gram codec/table はあり、同モデルの起動時 binding は別に行う。
 
 開発用 `plain_model_logits` は `qbench-trace/1` の token ID を再 tokenize せず順に入力し、指定した行の
@@ -117,6 +129,39 @@ FP32 logits と manifest を保存する。`--exl3 DIR --metadata-gguf GGUF` ま
 `--trace TRACE.json --out-dir DIR` を指定する。`--rows 0,4` で対象行を限定でき、native 経路の
 `--expert-profile FILE` は同じ residency 条件で照合するために使える。精度判定は元の BF16 教師に対する
 `KL(P_BF16 || P_candidate)` だけを使う。速度の判定にはこの診断用 dump の実行時間を使わない。
+
+## Qwen3.5 MoE の MTP 接続
+
+`--spec 2` 以上は archive の `mtp.fc`、三つの norm、`mtp.layers.0` の attention・router・shared/routed
+expert を読み込み、既存の draft/verify と GDN state の rollback に接続する。GGUF bootstrap は
+`block_count=trunk+1`、`nextn_predict_layers=1` が必要で、EXL3 config の MTP 層数も一つであることを確認する。
+`ModelMap` は MTP を明示した場合だけ追加し、MTP 無効時の trunk と head はそのまま使う。
+bootstrap は `tools/exl3_metadata.py` に `--include-mtp` を付けて作る。
+
+```sh
+strata --exl3 /path/to/exl3-model --metadata-gguf /path/to/metadata-with-mtp.gguf \
+    --prompt-chunk 0 --spec 2 --max-t 3 --tokens 16,10,16,28 --max-new 8
+```
+
+FC と各 projection は packed/raw と bit 幅を保持する。MTP の embedding と出力 head は trunk と共有し、
+最後の norm は `mtp.norm.weight` の値を使う。現在の draft はフル head で計算し、`--draft-vocab` を指定した
+場合はその旨を表示する。dedicated MTP embedding と複数の MTP 層は明示的に拒否する。
+
+## 固定 token 列の decode 計測
+
+`plain_model_bench` は token ID の comma/空白区切りファイルを受け取り、同じ列を必要な長さまで繰り返す。
+指定した context を準備し、その末尾の `--warmup` token を一 token ずつ実行してから、`--steps` token の
+AR decode を計測する。各 repeat で状態を reset し、context 準備・reset・モデル load は計測から除く。
+計測中に logits の host copy やファイル書き出しは行わない。greedy token の取得と同期は含む。
+
+```sh
+plain_model_bench --exl3 /path/to/exl3-model --metadata-gguf /path/to/metadata-only.gguf \
+    --tokens-file /path/to/token-ids.txt --context 512 --warmup 16 --steps 128 --repeats 5 --max-t 1
+```
+
+native IQuant は `--native GGUF --expert-profile FILE` に置き換える。JSON 出力には各 repeat と全体の
+mean/median/p90 latency、token/s、expert の hit/miss、resident/slot 数を含む。token 列、context、
+max-t、常駐条件と実行環境をそろえ、最適化と精度確認の後に速度ゲートへ使う。
 
 ## 出力 head の早期接続
 

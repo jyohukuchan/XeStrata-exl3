@@ -432,14 +432,10 @@ int plain_main(int argc, char** argv) {
             std::fprintf(stderr, "strata plain: EXL3 decode-only mode rejects positive --prompt-chunk\n");
             return 2;
         }
-        if (spec_set && opt.spec > 0) {
-            std::fprintf(stderr, "strata plain: EXL3 decode-only mode rejects positive --spec\n");
-            return 2;
-        }
         opt.exl3_dir = exl3_dir;
         opt.metadata_gguf = metadata_gguf;
         opt.prompt_chunk = 0;
-        opt.spec = 0;
+        if (!spec_set) opt.spec = 0;
         gguf = metadata_gguf;
     }
     if (!serve && (prompt.empty() || n_new < 1)) {

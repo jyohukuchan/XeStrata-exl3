@@ -26,6 +26,14 @@ int64_t int_value(const Json& object, const char* key, int64_t fallback = 0) {
     return it->get<int64_t>();
 }
 
+bool bool_value(const Json& object, const char* key, bool fallback = false) {
+    const auto it = object.find(key);
+    if (it == object.end()) return fallback;
+    if (it->is_boolean()) return it->get<bool>();
+    if (it->is_number_integer()) return it->get<int64_t>() != 0;
+    return fallback;
+}
+
 const Json* text_config(const Json& root) {
     const auto it = root.find("text_config");
     return it != root.end() && it->is_object() ? &*it : &root;
@@ -116,7 +124,7 @@ bool add_linear(ModelMap& map, const Archive& archive, ProjectionKind kind, int6
                                    kind == ProjectionKind::expert_gate || kind == ProjectionKind::expert_up ||
                                    kind == ProjectionKind::expert_down || kind == ProjectionKind::shared_gate ||
                                    kind == ProjectionKind::shared_up || kind == ProjectionKind::shared_down ||
-                                   kind == ProjectionKind::lm_head;
+                                   kind == ProjectionKind::lm_head || kind == ProjectionKind::mtp_fc;
         if (raw_descriptor != nullptr && raw_exception)
             return add_raw(map, archive, kind, layer, expert, source, canonical, target_k, target_n,
                            {"F16", "BF16", "F32"}, output_axis, input_axis);
@@ -331,6 +339,7 @@ const char* projection_kind_name(ProjectionKind kind) {
         case ProjectionKind::hc_down: return "hc_down";
         case ProjectionKind::hc_up: return "hc_up";
         case ProjectionKind::hc_inject: return "hc_inject";
+        case ProjectionKind::mtp_fc: return "mtp_fc";
         case ProjectionKind::embedding: return "embedding";
         case ProjectionKind::lm_head: return "lm_head";
         case ProjectionKind::final_norm: return "final_norm";
@@ -357,7 +366,7 @@ bool ModelMap::require_supported(std::string& err) const {
     return false;
 }
 
-bool build_model_map(const Archive& archive, ModelMap& result, std::string& err) {
+bool build_model_map(const Archive& archive, ModelMap& result, std::string& err, bool include_mtp) {
     result = ModelMap{};
     err.clear();
     try {
@@ -375,6 +384,9 @@ bool build_model_map(const Archive& archive, ModelMap& result, std::string& err)
         g.hidden_size = int_value(*text, "hidden_size");
         g.vocab_size = int_value(*text, "vocab_size", int_value(config, "vocab_size"));
         g.layers = int_value(*text, "num_hidden_layers");
+        g.mtp_layers = int_value(*text, "mtp_num_hidden_layers", int_value(config, "mtp_num_hidden_layers"));
+        g.dedicated_embedding = bool_value(*text, "mtp_use_dedicated_embeddings",
+                                           bool_value(config, "mtp_use_dedicated_embeddings"));
         g.experts = int_value(*text, "num_experts");
         g.experts_per_token = int_value(*text, "num_experts_per_tok");
         g.moe_intermediate = int_value(*text, "moe_intermediate_size");
@@ -527,6 +539,70 @@ bool build_model_map(const Archive& archive, ModelMap& result, std::string& err)
                            g.hidden_size, g.moe_intermediate);
                 add_linear(result, archive, ProjectionKind::expert_down, layer, expert, ep + "down_proj", ec + "down_proj",
                            g.moe_intermediate, g.hidden_size);
+            }
+        }
+        if (include_mtp) {
+            const bool mtp_fc_present = archive.find_linear("mtp.fc") != nullptr ||
+                                        archive.find_tensor("mtp.fc.weight") != nullptr;
+            if (result.family != ModelFamily::qwen35)
+                reason(result, "MTP mapping is currently supported only for Qwen3.5");
+            if (g.mtp_layers != 1)
+                reason(result, "MTP mapping requires text_config.mtp_num_hidden_layers == 1");
+            if (g.dedicated_embedding)
+                reason(result, "MTP dedicated embeddings are not supported; the MTP map requires shared embedding");
+            if (g.mtp_layers == 0 && mtp_fc_present)
+                reason(result, "MTP tensors are present but text_config.mtp_num_hidden_layers is zero");
+            if (result.family == ModelFamily::qwen35 && g.mtp_layers == 1 && !g.dedicated_embedding) {
+                const int64_t layer = g.layers;
+                const std::string p = "mtp.layers.0.";
+                const std::string cp = "blk." + std::to_string(layer) + ".";
+                add_linear(result, archive, ProjectionKind::mtp_fc, layer, -1, "mtp.fc",
+                           cp + "nextn.eh_proj.weight", 2 * g.hidden_size, g.hidden_size);
+                add_aux(result, archive, -1, "mtp.pre_fc_norm_embedding", cp + "nextn.enorm.weight",
+                        g.hidden_size, ValueTransform::add_one);
+                add_aux(result, archive, -1, "mtp.pre_fc_norm_hidden", cp + "nextn.hnorm.weight",
+                        g.hidden_size, ValueTransform::add_one);
+                add_aux(result, archive, layer, p + "input_layernorm", cp + "attn_norm.weight",
+                        g.hidden_size, ValueTransform::add_one);
+                add_aux(result, archive, layer, p + "post_attention_layernorm", cp + "post_attention_norm.weight",
+                        g.hidden_size, ValueTransform::add_one);
+                add_linear(result, archive, ProjectionKind::qsa_q, layer, -1, p + "self_attn.q_proj",
+                           cp + "attn_q.weight", g.hidden_size, 2 * g.q_heads * g.head_dim);
+                add_linear(result, archive, ProjectionKind::qsa_k, layer, -1, p + "self_attn.k_proj",
+                           cp + "attn_k.weight", g.hidden_size, g.kv_heads * g.head_dim);
+                add_linear(result, archive, ProjectionKind::qsa_v, layer, -1, p + "self_attn.v_proj",
+                           cp + "attn_v.weight", g.hidden_size, g.kv_heads * g.head_dim);
+                add_linear(result, archive, ProjectionKind::qsa_out, layer, -1, p + "self_attn.o_proj",
+                           cp + "attn_output.weight", g.q_heads * g.head_dim, g.hidden_size);
+                add_aux(result, archive, layer, p + "self_attn.q_norm", cp + "attn_q_norm.weight",
+                        g.head_dim, ValueTransform::add_one);
+                add_aux(result, archive, layer, p + "self_attn.k_norm", cp + "attn_k_norm.weight",
+                        g.head_dim, ValueTransform::add_one);
+                add_raw(result, archive, ProjectionKind::router, layer, -1, p + "mlp.gate",
+                        cp + "ffn_gate_inp.weight", g.hidden_size, g.experts);
+                add_raw(result, archive, ProjectionKind::shared_scalar, layer, -1, p + "mlp.shared_expert_gate",
+                        cp + "ffn_gate_inp_shexp.weight", g.hidden_size, 1);
+                add_linear(result, archive, ProjectionKind::shared_gate, layer, -1,
+                           p + "mlp.shared_expert.gate_proj", cp + "ffn_gate_shexp.weight",
+                           g.hidden_size, g.shared_intermediate);
+                add_linear(result, archive, ProjectionKind::shared_up, layer, -1,
+                           p + "mlp.shared_expert.up_proj", cp + "ffn_up_shexp.weight",
+                           g.hidden_size, g.shared_intermediate);
+                add_linear(result, archive, ProjectionKind::shared_down, layer, -1,
+                           p + "mlp.shared_expert.down_proj", cp + "ffn_down_shexp.weight",
+                           g.shared_intermediate, g.hidden_size);
+                for (int64_t expert = 0; expert < g.experts; ++expert) {
+                    const std::string ep = p + "mlp.experts." + std::to_string(expert) + ".";
+                    const std::string ec = cp + "experts." + std::to_string(expert) + ".";
+                    add_linear(result, archive, ProjectionKind::expert_gate, layer, expert, ep + "gate_proj",
+                               ec + "gate_proj", g.hidden_size, g.moe_intermediate);
+                    add_linear(result, archive, ProjectionKind::expert_up, layer, expert, ep + "up_proj",
+                               ec + "up_proj", g.hidden_size, g.moe_intermediate);
+                    add_linear(result, archive, ProjectionKind::expert_down, layer, expert, ep + "down_proj",
+                               ec + "down_proj", g.moe_intermediate, g.hidden_size);
+                }
+                add_aux(result, archive, -1, "mtp.norm", cp + "nextn.shared_head_norm.weight",
+                        g.hidden_size, ValueTransform::add_one);
             }
         }
         if (result.family == ModelFamily::qwen35) {

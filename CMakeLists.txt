@@ -717,6 +717,8 @@ if(STRATA_ENABLE_XE)
     target_link_libraries(plain_model_logits PRIVATE strata_engine strata_prefill)
     target_include_directories(plain_model_logits SYSTEM PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/third_party/main/nlohmann-json)
+    add_executable(plain_model_bench src/core/plain_model_bench.cpp)
+    target_link_libraries(plain_model_bench PRIVATE strata_engine strata_prefill)
     add_executable(plain_model_exl3_test src/core/plain_model_exl3_test.cpp)
     target_link_libraries(plain_model_exl3_test PRIVATE strata_engine strata_prefill)
     add_test(NAME plain_model_exl3_test COMMAND plain_model_exl3_test)

@@ -177,6 +177,13 @@ bool check_raw_gdn_fixture() {
              out->input_axis.block_permutation == std::vector<int64_t>({0, 1});
         ok = ok && alpha->output_axis.block_size == 1 && alpha->raw_to_canonical_axes == std::vector<int64_t>({1, 0});
         ok = ok && conv->raw_shape == std::vector<int64_t>({512, 1, 4}) && conv->raw_axes.front().block_offset == 256;
+        ModelMap mtp_map;
+        std::string mtp_err;
+        ok = ok && build_model_map(archive, mtp_map, mtp_err) && mtp_map.unsupported.empty();
+        ModelMap requested_mtp;
+        std::string requested_mtp_err;
+        ok = ok && build_model_map(archive, requested_mtp, requested_mtp_err, true) &&
+             !requested_mtp.unsupported.empty();
     } catch (const std::exception& e) {
         std::cerr << "raw GDN fixture exception: " << e.what() << '\n';
         ok = false;
@@ -188,7 +195,9 @@ bool check_raw_gdn_fixture() {
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc == 1) {
+    const bool include_mtp = argc > 1 && std::string(argv[1]) == "--include-mtp";
+    const int first_path = include_mtp ? 2 : 1;
+    if (argc == first_path) {
         if (!check_v_head_fixture()) {
             std::cout << "V-head permutation fixture: FAIL\n";
             return 1;
@@ -226,12 +235,12 @@ int main(int argc, char** argv) {
         return rejected ? 0 : 1;
     }
     int failures = 0;
-    for (int i = 1; i < argc; ++i) {
+    for (int i = first_path; i < argc; ++i) {
         try {
             strata::artifact::exl3::Archive archive(argv[i]);
             strata::artifact::exl3::ModelMap map;
             std::string err;
-            const bool built = strata::artifact::exl3::build_model_map(archive, map, err);
+            const bool built = strata::artifact::exl3::build_model_map(archive, map, err, include_mtp);
             bool useful = built && !map.projections.empty() && map.geometry.hidden_size > 0;
             if (useful && map.family == strata::artifact::exl3::ModelFamily::qwen35) {
                 useful = has_nontrivial_v_map(map, strata::artifact::exl3::ProjectionKind::gdn_qkv) &&
@@ -255,9 +264,24 @@ int main(int argc, char** argv) {
             if (map.family == strata::artifact::exl3::ModelFamily::qwen35)
                 useful = useful && has_mapping(map, strata::artifact::exl3::ProjectionKind::final_norm,
                                                strata::artifact::exl3::ValueTransform::add_one);
+            if (useful && include_mtp && map.family == strata::artifact::exl3::ModelFamily::qwen35) {
+                bool mtp_fc = false, enorm = false, hnorm = false, shared_head_norm = false;
+                for (const auto& item : map.projections) {
+                    mtp_fc = mtp_fc || (item.layer == map.geometry.layers &&
+                                         item.kind == strata::artifact::exl3::ProjectionKind::mtp_fc &&
+                                         item.canonical_name == "blk." + std::to_string(map.geometry.layers) + ".nextn.eh_proj.weight");
+                    enorm = enorm || item.canonical_name == "blk." + std::to_string(map.geometry.layers) + ".nextn.enorm.weight";
+                    hnorm = hnorm || item.canonical_name == "blk." + std::to_string(map.geometry.layers) + ".nextn.hnorm.weight";
+                    shared_head_norm = shared_head_norm || item.canonical_name ==
+                        "blk." + std::to_string(map.geometry.layers) + ".nextn.shared_head_norm.weight";
+                }
+                useful = map.geometry.mtp_layers == 1 && !map.geometry.dedicated_embedding &&
+                         mtp_fc && enorm && hnorm && shared_head_norm;
+            }
             std::cout << argv[i] << ": " << (useful ? "map OK" : "map FAIL") << ", family "
                       << strata::artifact::exl3::model_family_name(map.family) << ", projections "
-                      << map.projections.size() << ", unsupported " << map.unsupported.size() << '\n';
+                      << map.projections.size() << ", unsupported " << map.unsupported.size()
+                      << ", include_mtp " << (include_mtp ? "yes" : "no") << '\n';
             if (!useful) {
                 std::cerr << err << '\n';
                 ++failures;

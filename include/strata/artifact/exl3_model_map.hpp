@@ -20,6 +20,7 @@ enum class ProjectionKind {
     router, shared_scalar, shared_gate, shared_up, shared_down,
     expert_gate, expert_up, expert_down,
     hc_norm, hc_down, hc_up, hc_inject,
+    mtp_fc,
     embedding, lm_head, final_norm,
     auxiliary,
 };
@@ -34,6 +35,8 @@ struct ModelGeometry {
     int64_t hidden_size = 0;
     int64_t vocab_size = 0;
     int64_t layers = 0;
+    int64_t mtp_layers = 0;
+    bool dedicated_embedding = false;
     int64_t experts = 0;
     int64_t experts_per_token = 0;
     int64_t moe_intermediate = 0;
@@ -134,7 +137,7 @@ struct ModelMap {
 /// archive's config, EXL3 descriptors, and raw tensor headers. This reads no
 /// weight payloads and returns a useful partial map with `unsupported` reasons
 /// for recognized but not yet engine-compatible variants.
-bool build_model_map(const Archive& archive, ModelMap& result, std::string& err);
+bool build_model_map(const Archive& archive, ModelMap& result, std::string& err, bool include_mtp = false);
 
 /// Build the pinned Qwen V-head reorder independently of an archive. The
 /// returned element permutation is target-to-source and the block map is
