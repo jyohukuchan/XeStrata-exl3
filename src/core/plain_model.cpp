@@ -1071,6 +1071,8 @@ bool PlainModel::open_experts(std::string& err) {
             align256(entries * (sizeof(uint64_t) + 5u * sizeof(int32_t)) +
                     (entries + 1u) * sizeof(int32_t) +
                     (uint64_t) L * (uint64_t) E * sizeof(Exl3ExpertFormatDesc)) +
+            align256((uint64_t) L * (uint64_t) E * sizeof(uint64_t)) +
+            align256((uint64_t) L * (uint64_t) E * sizeof(int32_t)) +
             align256(entries * (uint64_t) std::max(s.n_embd, s.n_ff_exp) * 6u * sizeof(float));
         uint64_t room = free_b > reserve + window_device ? free_b - reserve - window_device : 0;
         std::vector<Exl3ExpertRuntime::ResidentPair> resident;

@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -248,6 +249,91 @@ int main() {
     check(raw_fallback.cache_stats().transient_bytes == 0 &&
               raw_fallback.copy_blob(1, 1, raw_copy.data()) && raw_fallback.cache_stats().resident_bytes == 0,
           "cold copy preserves empty window and avoids host cache duplication");
+
+    // Startup prewarm excludes both GPU residents and another stage's pairs.
+    // Extending the ownership mask later loads only the missing raw expert.
+    Source::CachePolicy eager_policy;
+    eager_policy.headroom_bytes = 0;
+    const uint64_t raw_bytes = source.exl3_layout(1, 1)->total_bytes;
+    eager_policy.max_bytes = c + raw_bytes;
+    Source eager;
+    check(eager.open(archive, 2, 2, names, err, eager_policy), "CPU prewarm source opens");
+    Source::PrewarmResult warmed;
+    std::string prewarm_why;
+    const std::vector<uint8_t> stage0_cpu = {1, 0, 1, 1};
+    const std::vector<uint8_t> both_cpu = {1, 0, 1, 0};
+    const char* prewarm_flag = std::getenv("STRATA_EXL3_SOURCE_PREWARM");
+    const bool prewarm_enabled = prewarm_flag == nullptr || std::strcmp(prewarm_flag, "0") != 0;
+    if (!prewarm_enabled) {
+        const auto before_disabled = eager.cache_stats();
+        check(!eager.prewarm_cpu(both_cpu, warmed, prewarm_why) && warmed.loaded_experts == 0 &&
+                  eager.cache_stats().materializations == before_disabled.materializations &&
+                  eager.cache_stats().resident_bytes == before_disabled.resident_bytes,
+              "prewarm environment zero keeps lazy cache untouched");
+    } else if (cache_capacity(eager, eager_policy.max_bytes, "CPU prewarm byte-exact reuse")) {
+        const auto before_eager = eager.cache_stats();
+        check(eager.prewarm_cpu(stage0_cpu, warmed, prewarm_why) && warmed.requested_experts == 1 &&
+                  warmed.requested_bytes == c && warmed.loaded_experts == 1 && warmed.loaded_bytes == c &&
+                  eager.cache_stats().resident_bytes == c && eager.cache_stats().transient_bytes == 0,
+              "prewarm loads only owned CPU pairs and excludes GPU/foreign pairs");
+        check(eager.prewarm_cpu(both_cpu, warmed, prewarm_why) && warmed.requested_experts == 2 &&
+                  warmed.requested_bytes == c + raw_bytes && warmed.loaded_experts == 1 &&
+                  warmed.loaded_bytes == raw_bytes && eager.cache_stats().resident_bytes == c + raw_bytes &&
+                  eager.cache_stats().materializations == before_eager.materializations + 2,
+              "prewarm reuses existing packed entry and retains original raw layout");
+        std::vector<uint8_t> expected_packed(static_cast<size_t>(c));
+        std::vector<uint8_t> expected_raw(static_cast<size_t>(raw_bytes));
+        check(source.copy_blob(0, 1, expected_packed.data()) && source.copy_blob(1, 1, expected_raw.data()),
+              "prewarm expected payloads copied independently");
+        const auto before_eager_hit = eager.cache_stats();
+        std::filesystem::rename(root / "model.safetensors", root / "model.unavailable");
+        eager.begin_layer(0, one, 1);
+        const uint8_t* packed_hit = eager.blob(0, 1);
+        const bool packed_exact = packed_hit != nullptr &&
+            std::memcmp(packed_hit, expected_packed.data(), expected_packed.size()) == 0;
+        eager.begin_layer(1, one, 1);
+        const uint8_t* raw_hit = eager.blob(1, 1);
+        const bool raw_exact = raw_hit != nullptr &&
+            std::memcmp(raw_hit, expected_raw.data(), expected_raw.size()) == 0;
+        std::filesystem::rename(root / "model.unavailable", root / "model.safetensors");
+        const auto after_eager_hit = eager.cache_stats();
+        check(eager.last_error().empty() && packed_exact && raw_exact &&
+                  after_eager_hit.materializations == before_eager_hit.materializations &&
+                  after_eager_hit.payload_read_bytes == before_eager_hit.payload_read_bytes &&
+                  after_eager_hit.evictions == before_eager_hit.evictions,
+              "prewarmed packed/raw windows survive archive hiding without more I/O");
+    }
+
+    // Insufficient prewarm budgets must not load/evict a partial working set.
+    // An active routed window remains usable even when prewarm is refused.
+    eager_policy.max_bytes = c;
+    Source refused;
+    check(refused.open(archive, 2, 2, names, err, eager_policy), "small prewarm budget opens");
+    refused.begin_layer(0, one, 1);
+    const uint8_t* active = refused.blob(0, 1);
+    const auto before_active_prewarm = refused.cache_stats();
+    check(!refused.prewarm_cpu(both_cpu, warmed, prewarm_why) && active != nullptr &&
+              refused.blob(0, 1) == active &&
+              refused.cache_stats().materializations == before_active_prewarm.materializations &&
+              refused.cache_stats().evictions == before_active_prewarm.evictions,
+          "refused prewarm preserves current route pointer and bytes");
+    refused.begin_layer(0, bad_ids, 2);
+    const auto before_refused = refused.cache_stats();
+    check(!refused.prewarm_cpu(both_cpu, warmed, prewarm_why) && warmed.loaded_experts == 0 &&
+              refused.cache_stats().materializations == before_refused.materializations &&
+              refused.cache_stats().resident_bytes == before_refused.resident_bytes &&
+              refused.cache_stats().evictions == before_refused.evictions &&
+              refused.cache_stats().fallbacks == before_refused.fallbacks,
+          "insufficient all-payload prewarm performs no reads, eviction or transient admission");
+    refused.begin_layer(0, one, 1);
+    check(refused.last_error().empty() && refused.blob(0, 1) != nullptr &&
+              refused.cache_stats().resident_bytes <= refused.cache_stats().capacity_bytes,
+          "lazy routing remains usable after prewarm refusal");
+    Source zero_prewarm;
+    check(zero_prewarm.open(archive, 2, 2, names, err, disabled), "zero prewarm budget opens");
+    check(!zero_prewarm.prewarm_cpu(both_cpu, warmed, prewarm_why) && warmed.loaded_experts == 0 &&
+              zero_prewarm.cache_stats().materializations == 0 && zero_prewarm.cache_stats().resident_bytes == 0,
+          "zero cache budget skips prewarm without payload I/O");
 
     // Exercise the actual ExpertDispatch -> ExpertPool boundary.  The
     // expected rows are produced independently by the single-expert CPU

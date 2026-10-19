@@ -146,7 +146,7 @@ bool Exl3ExpertRuntime::allocate_images(std::string& err) {
         !device(reinterpret_cast<void**>(&d_ngroups_), sizeof(int32_t), "group count") ||
         !device(reinterpret_cast<void**>(&d_nentries_), sizeof(int32_t), "entry count"))
         return false;
-    if (all_resident_) {
+    {
         if (pair_count_ <= 0 || static_cast<uint64_t>(pair_count_) > std::numeric_limits<size_t>::max() / sizeof(uint64_t) ||
             static_cast<uint64_t>(pair_count_) > std::numeric_limits<size_t>::max() / sizeof(int32_t) ||
             !device(reinterpret_cast<void**>(&d_pair_blob_base_), static_cast<size_t>(pair_count_) * sizeof(uint64_t),
@@ -200,8 +200,8 @@ bool Exl3ExpertRuntime::allocate_images(std::string& err) {
             err = "exl3 runtime: plan image belongs to another runtime";
             return false;
         }
-    if (all_resident_ && (Runtime::owner(d_pair_blob_base_) != device_runtime_ ||
-                          Runtime::owner(d_pair_format_index_) != device_runtime_)) {
+    if (Runtime::owner(d_pair_blob_base_) != device_runtime_ ||
+        Runtime::owner(d_pair_format_index_) != device_runtime_) {
         err = "exl3 runtime: resident pair table belongs to another runtime";
         return false;
     }
@@ -209,23 +209,24 @@ bool Exl3ExpertRuntime::allocate_images(std::string& err) {
         err = "exl3 runtime: cache arena belongs to another runtime";
         return false;
     }
-    if (all_resident_) {
+    {
         std::vector<uint64_t> pair_blobs(static_cast<size_t>(pair_count_), 0);
+        std::vector<int32_t> pair_formats(static_cast<size_t>(pair_count_), -1);
         for (int64_t layer = 0; layer < n_layers_; ++layer) {
             for (int64_t expert = 0; expert < n_expert_; ++expert) {
                 const size_t at = pair_index(layer, expert);
-                const int32_t slot = cache_.slot_of(layer, expert);
+                const int32_t slot = cache_.valid() ? cache_.slot_of(layer, expert) : kNotResident;
                 const uint8_t* blob = slot >= 0 ? cache_.device_slot(slot) : nullptr;
-                if (slot < 0 || blob == nullptr) {
-                    err = "exl3 runtime: all-resident pair table has a missing device slot";
+                if (blob == nullptr && (slot >= 0 || all_resident_)) {
+                    err = "exl3 runtime: resident pair table has a missing device slot";
                     return false;
                 }
                 pair_blobs[at] = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(blob));
+                if (blob != nullptr) pair_formats[at] = pair_format_index_[at];
             }
         }
         if (!strata::gpu::copy(d_pair_blob_base_, pair_blobs.data(), pair_blobs.size() * sizeof(uint64_t)) ||
-            !strata::gpu::copy(d_pair_format_index_, pair_format_index_.data(),
-                               pair_format_index_.size() * sizeof(int32_t))) {
+            !strata::gpu::copy(d_pair_format_index_, pair_formats.data(), pair_formats.size() * sizeof(int32_t))) {
             err = std::string("exl3 runtime: copying resident pair tables: ") + strata::gpu::last_error();
             return false;
         }
@@ -238,7 +239,8 @@ bool Exl3ExpertRuntime::allocate_images(std::string& err) {
 }
 
 bool Exl3ExpertRuntime::open(Exl3ExpertSource& source, strata::kernels::cpu::ExpertPool& pool, int64_t max_tokens,
-                             int64_t routed_k, const std::vector<ResidentPair>& resident, std::string& err) {
+                             int64_t routed_k, const std::vector<ResidentPair>& resident, std::string& err,
+                             int64_t prewarm_layer_begin, int64_t prewarm_layer_end) {
     close();
     err.clear();
     if (max_tokens <= 0 || routed_k <= 0 || max_tokens > std::numeric_limits<int32_t>::max() ||
@@ -258,6 +260,10 @@ bool Exl3ExpertRuntime::open(Exl3ExpertSource& source, strata::kernels::cpu::Exp
     max_tokens_ = max_tokens;
     routed_k_ = routed_k;
     if (n_layers_ <= 0 || n_expert_ <= 0) { err = "exl3 runtime: source geometry is invalid"; close(); return false; }
+    if (prewarm_layer_end == -1) prewarm_layer_end = n_layers_;
+    if (prewarm_layer_begin < 0 || prewarm_layer_begin > prewarm_layer_end || prewarm_layer_end > n_layers_) {
+        err = "exl3 runtime: CPU prewarm ownership range is invalid"; close(); return false;
+    }
     const uint64_t pairs = static_cast<uint64_t>(n_layers_) * static_cast<uint64_t>(n_expert_);
     if (pairs > static_cast<uint64_t>(std::numeric_limits<size_t>::max()) ||
         pairs > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
@@ -363,6 +369,22 @@ bool Exl3ExpertRuntime::open(Exl3ExpertSource& source, strata::kernels::cpu::Exp
     cpu_jobs_.resize(static_cast<size_t>(max_entries_));
     miss_ids_.reserve(static_cast<size_t>(n_expert_));
     if (!allocate_images(err)) { close(); return false; }
+    // selected already excludes GPU residents. Do not preload another stage's
+    // layer just because its pairs are absent from this stage's GPU cache.
+    for (int64_t layer = 0; layer < n_layers_; ++layer)
+        if (layer < prewarm_layer_begin || layer >= prewarm_layer_end)
+            std::fill_n(selected.begin() + static_cast<ptrdiff_t>(pair_index(layer, 0)),
+                        static_cast<size_t>(n_expert_), uint8_t{1});
+    Exl3ExpertSource::PrewarmResult prewarm;
+    std::string prewarm_why;
+    const bool prewarmed = source.prewarm_cpu(selected, prewarm, prewarm_why);
+    std::fprintf(stderr,
+                 "Exl3ExpertRuntime: CPU source prewarm=%s layers=[%lld,%lld) experts=%llu bytes=%llu "
+                 "admission=%llu loaded_experts=%llu loaded_bytes=%llu%s%s\n",
+                 prewarmed ? "ready" : "lazy", (long long) prewarm_layer_begin, (long long) prewarm_layer_end,
+                 (unsigned long long) prewarm.requested_experts, (unsigned long long) prewarm.requested_bytes,
+                 (unsigned long long) prewarm.admission_bytes, (unsigned long long) prewarm.loaded_experts,
+                 (unsigned long long) prewarm.loaded_bytes, prewarm_why.empty() ? "" : ": ", prewarm_why.c_str());
     opened_ = true;
     return true;
 }
@@ -602,25 +624,33 @@ bool Exl3ExpertRuntime::record_resident_enqueue(sycl::queue& queue, int64_t laye
         err = "exl3 runtime: the direct resident plan requires a fully resident runtime";
         return false;
     }
+    return record_device_hit_enqueue(queue, layer, device_fp32_x, device_ids, n_tokens, gpu_output, ldy, err);
+}
+
+bool Exl3ExpertRuntime::record_device_hit_enqueue(sycl::queue& queue, int64_t layer, const float* device_fp32_x,
+                                                  const int32_t* device_ids, int64_t n_tokens, float* gpu_output,
+                                                  int64_t ldy, std::string& err) {
+    err.clear();
+    if (!opened_) { err = "exl3 runtime: open is required for the device hit plan"; return false; }
     if (!valid_layer(layer) || n_tokens <= 0 || n_tokens > max_tokens_ || device_fp32_x == nullptr ||
         device_ids == nullptr || gpu_output == nullptr || !span_fits(n_tokens, hidden_, hidden_) ||
         !span_fits(max_entries_, ldy, hidden_)) {
-        err = "exl3 runtime: invalid direct resident geometry";
+        err = "exl3 runtime: invalid device hit plan geometry";
         return false;
     }
     if (!queue.has_property<sycl::property::queue::in_order>()) {
-        err = "exl3 runtime: direct resident replay requires an in-order queue";
+        err = "exl3 runtime: device hit replay requires an in-order queue";
         return false;
     }
     Runtime* queue_runtime = Runtime::owner_of_stream(&queue);
     if (queue_runtime == nullptr || queue_runtime != device_runtime_ || Runtime::owner(device_fp32_x) != queue_runtime ||
         Runtime::owner(device_ids) != queue_runtime || Runtime::owner(gpu_output) != queue_runtime) {
-        err = "exl3 runtime: direct resident pointers belong to another runtime/device";
+        err = "exl3 runtime: device hit pointers belong to another runtime/device";
         return false;
     }
     int64_t entries = 0;
     if (!product_fits(n_tokens, routed_k_, max_entries_, entries) || entries <= 0) {
-        err = "exl3 runtime: direct resident route count is out of range";
+        err = "exl3 runtime: device hit route count is out of range";
         return false;
     }
     try {
@@ -661,12 +691,15 @@ bool Exl3ExpertRuntime::record_resident_enqueue(sycl::queue& queue, int64_t laye
                                     static_cast<size_t>(expert);
                 plan_blob[entry] = pair_blob[pair];
                 plan_format[entry] = pair_format[pair];
+                // A valid CPU miss is absent from the GPU output. A valid destination with an invalid blob would
+                // poison its row with NaNs; keep that sentinel only for an invalid routed expert above.
+                if (pair_blob[pair] == 0) plan_dst[entry] = -1;
             });
         });
         (void) strata::kernels::exl3::exl3_grouped_fp32(queue, device_plan_, device_fp32_x, hidden_, gpu_output, ldy,
                                                         d_scratch_, scratch_elements_, {}, {plan});
     } catch (const std::exception& e) {
-        err = std::string("exl3 runtime: direct resident grouped enqueue: ") + e.what();
+        err = std::string("exl3 runtime: device hit grouped enqueue: ") + e.what();
         return false;
     }
     return true;

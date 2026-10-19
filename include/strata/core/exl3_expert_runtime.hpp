@@ -22,7 +22,7 @@ struct GpuPlanSink;
 /// Owns the persistent EXL3 plan images, cache, and grouped scratch.  The source and CPU pool are borrowed and must
 /// outlive this object. Captured graphs retain pointers to this object's plan/cache/scratch, so the runtime must
 /// outlive every graph that captured enqueue() until that graph has been destroyed. A prepared window must be
-/// consumed with wait_gpu() before prepare_window() is called again.
+/// consumed with wait_gpu() or mark_gpu_consumed() after its readers finish, before prepare_window() is called again.
 class Exl3ExpertRuntime {
 public:
     using ResidentPair = std::pair<int32_t, int32_t>;
@@ -34,8 +34,12 @@ public:
 
     /// Discover every exact source layout, register format identities, build optional cache buckets, preload only the
     /// explicit resident pairs, and allocate permanent host/device plan images plus six-plane grouped scratch.
+    /// After every runtime/workspace allocation, optionally prewarm CPU pairs
+    /// in [prewarm_layer_begin, prewarm_layer_end); -1 means the source's end.
+    /// Stage owners pass their own range; a single runtime defaults to all.
     bool open(Exl3ExpertSource& source, strata::kernels::cpu::ExpertPool& pool, int64_t max_tokens, int64_t routed_k,
-              const std::vector<ResidentPair>& resident, std::string& err);
+              const std::vector<ResidentPair>& resident, std::string& err,
+              int64_t prewarm_layer_begin = 0, int64_t prewarm_layer_end = -1);
     void close();
 
     /// Classify hits before touching the source.  Only unique CPU-miss IDs are passed to source.begin_layer(); cached
@@ -66,12 +70,18 @@ public:
     bool record_resident_enqueue(sycl::queue& queue, int64_t layer, const float* device_fp32_x,
                                  const int32_t* device_ids, int64_t n_tokens, float* gpu_output, int64_t ldy,
                                  std::string& err);
+    /// Record a device route-plan builder for the immutable cache's hits, followed by grouped EXL3. Valid misses
+    /// have no GPU destination; the caller supplies their CPU rows and a separate compact hit list for merging.
+    /// Host prepare_window() images are independent of this plan and must never be copied over it during replay.
+    bool record_device_hit_enqueue(sycl::queue& queue, int64_t layer, const float* device_fp32_x,
+                                   const int32_t* device_ids, int64_t n_tokens, float* gpu_output, int64_t ldy,
+                                   std::string& err);
     /// Publish only the hit entry list through the legacy window sink so its CPU-row merge can reuse the existing
     /// mapped plan and flag protocol.  EXL3's own grouped plan remains in the persistent runtime images.
     bool publish_window_plan(GpuPlanSink& sink, std::string& err) const;
     bool wait_gpu(sycl::event& done, std::string& err);
-    /// Mark a graph replay consumed after the caller has synchronized its stream; graph-associated events cannot be
-    /// waited through sycl::event::wait_and_throw().
+    /// Mark a graph replay consumed after stream synchronization, or after observing the next ring from that same
+    /// in-order graph (all previous plan/row/merge readers have finished). Graph events cannot be waited directly.
     void mark_gpu_consumed();
 
     bool prepared() const { return prepared_; }
@@ -161,8 +171,8 @@ private:
     int32_t* d_dst_ = nullptr;
     int32_t* d_ngroups_ = nullptr;
     int32_t* d_nentries_ = nullptr;
-    uint64_t* d_pair_blob_base_ = nullptr;   ///< [n_layers*n_expert], uploaded once for the all-resident route builder
-    int32_t* d_pair_format_index_ = nullptr; ///< [n_layers*n_expert], uploaded once for the all-resident route builder
+    uint64_t* d_pair_blob_base_ = nullptr;   ///< [n_layers*n_expert], immutable; zero for CPU-only pairs
+    int32_t* d_pair_format_index_ = nullptr; ///< [n_layers*n_expert], immutable; -1 for CPU-only pairs
     int64_t pair_count_ = 0;
     float* d_scratch_ = nullptr;
     size_t scratch_elements_ = 0;

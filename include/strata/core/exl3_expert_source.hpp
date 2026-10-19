@@ -56,6 +56,14 @@ public:
         uint64_t materialization_ns = 0;
     };
 
+    struct PrewarmResult {
+        uint64_t requested_experts = 0;
+        uint64_t requested_bytes = 0;
+        uint64_t loaded_experts = 0;
+        uint64_t loaded_bytes = 0;
+        uint64_t admission_bytes = 0;
+    };
+
     Exl3ExpertSource() = default;
     Exl3ExpertSource(std::shared_ptr<const strata::artifact::exl3::Archive> archive, int64_t n_layers,
                      int64_t n_expert, Names names);
@@ -77,6 +85,15 @@ public:
     void begin_layer(int64_t layer, const int32_t* ids, int64_t k) override;
     int64_t reads() const override { return reads_.load(std::memory_order_relaxed); }
     CacheStats cache_stats() const;
+
+    /// Optional startup prewarm. Nonzero mask entries exclude GPU residents or
+    /// pairs owned by another runtime; the mask has n_layers*n_expert entries.
+    /// Only start if every remaining compressed/raw payload fits the current
+    /// persistent budget. Never evict, pin a window, or use transient storage.
+    /// False leaves a bounded lazy cache (possibly partially warmed after later
+    /// memory pressure/I/O failure), and explains why; no active window changes.
+    /// STRATA_EXL3_SOURCE_PREWARM=0 disables the optional preload.
+    bool prewarm_cpu(const std::vector<uint8_t>& excluded, PrewarmResult& result, std::string& why);
 
     const std::string& last_error() const { return failure_; }
     int64_t n_layers() const { return n_layers_; }
@@ -106,7 +123,7 @@ private:
     void touch_locked(size_t at);
     void unlink_locked(size_t at);
     bool evict_one_locked();
-    void refresh_capacity_locked();
+    void refresh_capacity_locked(bool evict = true);
 
     std::shared_ptr<const strata::artifact::exl3::Archive> archive_;
     int64_t n_layers_ = 0;

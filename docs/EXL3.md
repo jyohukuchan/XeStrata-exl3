@@ -73,7 +73,11 @@ at each window. `STRATA_EXL3_SOURCE_CACHE_MIB` adds an upper bound; zero restore
 All requested experts are pinned before eviction, with window-only storage when capacity is insufficient.
 Cold GPU-preload `copy_blob()` calls do not populate the CPU cache. Final source statistics report cache hits/misses,
 materialization counts/times and payload bytes. Payload bytes count successfully materialized tensor spans, not
-physical disk I/O. `ExpertPool::prepare_exl3()` preallocates worker scratch, and
+physical disk I/O. After GPU cache and workspace allocation, the runtime preloads compressed CPU-owned experts
+within its layer range only if all of them plus existing cached data fit the current RAM budget. Otherwise it keeps
+the lazy cache without eviction. GPU residents and other stages' layers are excluded; decreasing memory room also
+stops an in-progress preload. `STRATA_EXL3_SOURCE_PREWARM=0` disables startup preloading while retaining the LRU cache.
+`ExpertPool::prepare_exl3()` preallocates worker scratch, and
 `run_exl3()` computes experts from FP32 inputs. CPU dispatch preserves routed output rows and rejects
 combinations with legacy GPU plans or residency tables.
 
@@ -88,12 +92,18 @@ recorded in a graph. `STRATA_EXL3_TIMELINE=1` emits JSON lines on standard error
 prepare, GPU submit and CPU pool intervals in steady-clock nanoseconds. GPU submit measures host submission time,
 not GPU kernel execution. Correlate it with a GPU profiler timeline to verify execution overlap.
 `ExpertDispatch::exl3_runtime` and `MoeWindowTier::exl3_runtime` connect it to the existing
-CPU-row/GPU-hit merge. The current path uses one group and segmented graphs; two groups and monolithic graphs
-are rejected. In the segmented path, a `publish_window_plan` callback enqueues the hit-only grouped kernel on the
+CPU-row/GPU-hit merge. The current path uses one group and rejects two groups. Segmented graphs are the default.
+In the segmented path, a `publish_window_plan` callback enqueues the hit-only grouped kernel on the
 same in-order queue before the host computes CPU misses. After the CPU returns, the next segment's existing merge
 graph combines CPU rows and GPU hit rows, so it does not depend on mapped-flag visibility or a device-side spin.
 Each ring's merge segment and the final segment are synchronized before reusing the plan/cache/scratch. The existing
 CPU-first `enqueue()` contract and all-resident direct path remain unchanged.
+`STRATA_EXL3_DEVICE_HIT_PLAN=1` uses a monolithic graph with a device-built hit plan when an in-order queue passes
+the runtime doorbell-visibility probe. CPU misses have no GPU output destination. The host publishes CPU results
+and a compact hit list without enqueuing GPU work. Observing the next ring's doorbell permits reuse of the previous
+ring's host state; the final stream synchronization remains. CPU failures still answer the remaining rings with
+empty plans and zero CPU rows, drain the graph, and then return an error. A failed probe or
+`STRATA_VERIFY_SEGMENTED=1` selects the segmented path. GPU cache residency remains immutable after startup.
 Qwen3.5 MoE startup uses the path below. Prefill remains separate.
 
 The dedicated n-gram decoder treats its leading F16 row scale and 160-value ring separately from ordinary
@@ -153,7 +163,7 @@ strata --exl3 /path/to/exl3-model --metadata-gguf /path/to/metadata-only.gguf \
 Packed projections reorder H128 blocks, moving GDN V-heads to canonical order. Raw projections use explicit
 axis maps and retain their original F16/BF16/F32 dtype. Norm `+1`, GDN `A_log` `-exp`, and widening auxiliary
 weights required by F32 kernels are separate operations. Expert residency derives from actual blob bytes
-and device capacity. Partial residency uses the existing segmented graphs. When all `(layer, expert)` pairs
+and device capacity. Partial residency uses the existing segmented graphs by default. When all `(layer, expert)` pairs
 are GPU resident, the graph builds its route plan from device IDs without CPU ring service. The same owner's
 plan/scratch is reused sequentially on an in-order queue. `STRATA_EXL3_RESIDENT_GRAPH=0` or
 `STRATA_VERIFY_SEGMENTED=1` selects the earlier path for comparison. On devices supporting SG32, grouped
@@ -176,7 +186,8 @@ BF16 teacher. The diagnostic dump's runtime is not a decode speed acceptance mea
 
 Qwen3.8 `--exl3 DIR` starts directly from the archive's HF config without requiring a metadata GGUF.
 An optional `--metadata-gguf` supplies EOS metadata. Pass input IDs with `--tokens` or `--tokens-file`,
-and choose layer-stage device ordinals with `--stage-devices`.
+and choose layer-stage device ordinals with `--stage-devices`. `--pool-workers N` sets CPU workers per stage.
+The default zero derives the count from physical cores; measure the best value on the actual model.
 
 ```sh
 strata --exl3 /path/to/qwen38-exl3 --tokens 16,10,16,28 --max-new 2 \

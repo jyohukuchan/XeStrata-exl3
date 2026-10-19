@@ -85,6 +85,8 @@ public:
     Exl3ExpertRuntime* exl3_runtime() const { return exl3_runtime_; }
     /// True when this window has the all-resident direct route-plan path and therefore needs no host ring service.
     bool direct_resident() const { return direct_resident_; }
+    /// Device cache-hit computation plus host-serviced CPU misses, in one graph using the mapped flag protocol.
+    bool device_hit_plan() const { return device_hit_plan_; }
 
 private:
     static bool before_cpu(void* ctx, std::string& err);
@@ -100,6 +102,8 @@ private:
     MoeWindowTier tier_;
     Exl3ExpertRuntime* exl3_runtime_ = nullptr;
     bool direct_resident_ = false;
+    bool device_hit_plan_ = false;
+    bool plan_ready_ = false;
     const float* direct_x_ = nullptr;
     const int32_t* direct_ids_ = nullptr;
     bool segmented_ = false;

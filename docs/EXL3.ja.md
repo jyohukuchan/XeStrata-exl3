@@ -68,6 +68,10 @@ CPU・GPU 併用時の decode 計測が必要になる。
 window 中だけ保持する。GPU preload の cold `copy_blob()` は CPU cache に追加しない。
 終了時の source 統計は cache hit/miss、materialization 回数・時間と payload bytes を示す。payload bytes は
 成功した tensor span の合計で、OS の実ディスク I/O 量ではない。
+GPU cache と workspace の確保後、所有 layer の CPU 担当分を圧縮したまま事前読み込みする。
+全量と既存 cache が現在の RAM 予算に収まる場合だけ開始し、不足時は既存データを退避せず lazy cache を使う。
+GPU 常駐分と他 stage の layer は対象外で、途中で余裕が減った場合も予算を再確認して停止する。
+`STRATA_EXL3_SOURCE_PREWARM=0` はこの事前読み込みを無効にする。既存の LRU cache は維持する。
 `ExpertPool::prepare_exl3()` は worker の scratch を事前確保し、`run_exl3()` は FP32 入力で expert を計算する。
 CPU dispatch は router の出力行を保ち、既存形式の GPU plan・residency との併用を拒否する。
 
@@ -81,11 +85,17 @@ CPU miss と GPU hit の出力を router 順の行へ配置する。永続的な
 steady-clock の ns で標準エラーへ JSON 行として出す。GPU submit の時間は host の投入時間であり、
 GPU kernel の実行時間ではない。GPU profiler の timeline と照合して実行の重なりを確認する。
 `ExpertDispatch::exl3_runtime` と `MoeWindowTier::exl3_runtime` は、この runtime を既存の CPU-row/GPU-hit
-merge に接続する。現在は segmented graph の1 group 構成を使い、2 group と monolithic graph は拒否する。
+merge に接続する。現在は1 group 構成を使い、2 group は拒否する。既定は segmented graph を使う。
 segmented 経路では `publish_window_plan` の直前 callback が同じ in-order queue に hit-only grouped kernel を投入し、
 その後 host の CPU miss 計算を開始する。CPU が戻ってから次 segment の既存 merge graph が CPU rows と GPU hit rows を
 合成するため、mapped flag の可視性や device-side spin に依存しない。各 ring の merge segment と最後の segment を
 同期してから plan/cache/scratch を再利用する。既存の CPU-first `enqueue()` 契約と all-resident direct path は維持する。
+`STRATA_EXL3_DEVICE_HIT_PLAN=1` は、doorbell 可視性の実行時 probe に通った in-order queue で、
+GPU が hit plan を作る monolithic graph を使う。CPU miss は GPU の出力対象から除外し、host は
+GPU を enqueue せず CPU 結果と compact hit list を公開する。次 ring の doorbell を観測してから前 ring の
+host state を再利用し、最後は stream を同期する。CPU 処理が失敗した場合も、残りの ring に空の plan と
+ゼロの CPU rows を返して graph を drain してからエラーを返す。probe 不合格、または
+`STRATA_VERIFY_SEGMENTED=1` の場合は segmented 経路を使う。GPU cache の residency は起動後に変更しない。
 Qwen3.5 MoE の起動時 binding は以下の経路を使う。prefill は別に行う。
 
 専用 n-gram decoder は、先頭の F16 row scale と160値の ringを通常の linear と区別して復号する。
@@ -144,7 +154,7 @@ strata --exl3 /path/to/exl3-model --metadata-gguf /path/to/metadata-only.gguf \
 packed projection は H128 block の並べ替えを行い、GDN の V-head の順序を canonical 配置へ移す。
 raw projection は軸ごとの明示的な変換で元の F16/BF16/F32 を保持する。norm の `+1`、GDN の
 `A_log` の `-exp` と FP32 を要求する補助 weight の widening だけを個別に適用する。
-expert の residency は実際の blob byte 数と device の容量から決める。部分常駐時は既存の segmented graph に接続する。
+expert の residency は実際の blob byte 数と device の容量から決める。部分常駐時は既定で既存の segmented graph に接続する。
 全 `(layer, expert)` が GPU に常駐する場合は、device 上の route ID から graph 内で経路表を作り、
 CPU の ring 応答を省く。同じ owner の plan/scratch は in-order queue 上で順番に再利用する。
 `STRATA_EXL3_RESIDENT_GRAPH=0` または `STRATA_VERIFY_SEGMENTED=1` で比較用に従来経路を選べる。
@@ -169,6 +179,8 @@ FP32 logits と manifest を保存する。`--exl3 DIR --metadata-gguf GGUF` ま
 Qwen3.8 の `--exl3 DIR` は archive の HF config から直接起動し、metadata GGUF を必要としない。
 `--metadata-gguf` を指定した場合は EOS metadata の取得に使う。`--tokens` または `--tokens-file` で
 入力 ID を渡し、`--stage-devices` で層分割する device ordinal を選べる。
+`--pool-workers N` は stage ごとの CPU worker 数を指定する。既定の0は物理 core に基づく自動設定で、
+最適な値は実モデルで測定する。
 
 ```sh
 strata --exl3 /path/to/qwen38-exl3 --tokens 16,10,16,28 --max-new 2 \

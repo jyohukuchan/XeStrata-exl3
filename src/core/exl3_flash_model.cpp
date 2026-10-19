@@ -222,6 +222,10 @@ bool Exl3FlashModel::open(const std::filesystem::path& directory, const Exl3Flas
             err = "EXL3 Flash: vision input is not supported by the initial AR coordinator";
             return false;
         }
+        if (options.pool_workers < 0) {
+            err = "EXL3 Flash: pool_workers must be nonnegative";
+            return false;
+        }
         if (options.max_rows != 1) {
             err = "EXL3 Flash: the initial coordinator accepts exactly one autoregressive row";
             return false;
@@ -352,7 +356,7 @@ bool Exl3FlashModel::open(const std::filesystem::path& directory, const Exl3Flas
             stage.layer_end = layer_count * (stage_index + 1) / stage_count;
             stage.weights = std::make_unique<Exl3WeightSet>();
             stage.source = std::make_unique<Exl3ExpertSource>();
-            stage.pool = std::make_unique<strata::kernels::cpu::ExpertPool>();
+            stage.pool = std::make_unique<strata::kernels::cpu::ExpertPool>(options.pool_workers);
             stage.runtime = std::make_unique<Exl3ExpertRuntime>();
             impl_->stages.push_back(std::move(stage));
             Impl::Stage& current = impl_->stages.back();
@@ -377,7 +381,8 @@ bool Exl3FlashModel::open(const std::filesystem::path& directory, const Exl3Flas
             for (int64_t layer = current.layer_begin; layer < current.layer_end; ++layer)
                 for (int64_t expert = 0; expert < impl_->geometry.n_expert; ++expert)
                     resident.emplace_back(static_cast<int32_t>(layer), static_cast<int32_t>(expert));
-            if (!current.runtime->open(*current.source, *current.pool, options.max_rows, routed_k, resident, err)) {
+            if (!current.runtime->open(*current.source, *current.pool, options.max_rows, routed_k, resident, err,
+                                       current.layer_begin, current.layer_end)) {
                 const std::string first_error = err;
                 if (!options.allow_cpu_expert_miss || !capacity_error(first_error)) {
                     err = "EXL3 Flash: stage " + std::to_string(stage_index) + " expert runtime: " + first_error;
@@ -385,7 +390,8 @@ bool Exl3FlashModel::open(const std::filesystem::path& directory, const Exl3Flas
                 }
                 current.runtime->close();
                 resident.clear();
-                if (!current.runtime->open(*current.source, *current.pool, options.max_rows, routed_k, resident, err)) {
+                if (!current.runtime->open(*current.source, *current.pool, options.max_rows, routed_k, resident, err,
+                                           current.layer_begin, current.layer_end)) {
                     err = "EXL3 Flash: stage " + std::to_string(stage_index) +
                           " expert cache does not fit and CPU-miss fallback failed: " + err;
                     return false;

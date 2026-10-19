@@ -157,14 +157,27 @@ bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std
     strata::gpu::Stream probe = strata::gpu::stream_create();
     if (!probe) { err = "moe window: stream create failed"; return false; }
     const char* v = std::getenv("STRATA_VERIFY_SEGMENTED");
-    segmented_ = v != nullptr ? std::strtol(v, nullptr, 10) != 0 : !strata::kernels::doorbell_visible(probe);
+    const char* device_hit = std::getenv("STRATA_EXL3_DEVICE_HIT_PLAN");
+    const bool request_device_hit = exl3 && device_hit != nullptr && std::strtol(device_hit, nullptr, 10) == 1;
+    const bool force_segmented = v != nullptr && std::strtol(v, nullptr, 10) != 0;
+    const bool visible = (!force_segmented && (request_device_hit || v == nullptr)) &&
+                         strata::kernels::doorbell_visible(probe);
+    Runtime* probe_owner = Runtime::owner_of_stream(probe);
+    const bool in_order = probe_owner != nullptr &&
+                          probe_owner->stream(probe).has_property<sycl::property::queue::in_order>();
+    device_hit_plan_ = request_device_hit && visible && in_order;
+    segmented_ = v != nullptr ? force_segmented : !visible;
     strata::gpu::stream_destroy(probe);
     if (exl3_runtime_ != nullptr) {
-        if (v != nullptr && std::strtol(v, nullptr, 10) == 0) {
+        if (!device_hit_plan_ && !request_device_hit && v != nullptr && !force_segmented) {
             err = "moe window: EXL3 runtime requires segmented graph execution";
             return false;
         }
-        segmented_ = true;
+        segmented_ = !device_hit_plan_;
+        // The graph already contains its device hit plan. A callback must not enqueue behind that executing graph.
+        if (device_hit_plan_) sink_.before_cpu = nullptr;
+        std::fprintf(stderr, "moe window: EXL3 device_hit_plan=%d segmented=%d\n",
+                     static_cast<int>(device_hit_plan_), static_cast<int>(segmented_));
     }
     return true;
 }
@@ -213,6 +226,10 @@ void MoeWindow::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t by
 
 void MoeWindow::publish_plan(void* ctx) {
     MoeWindow* w = (MoeWindow*) ctx;
+    w->plan_ready_ = true;
+    // run_cpu follows plan preparation inside the callback. Defer flag A until it succeeds so an error can still
+    // replace the current ring's merge list with an empty one before the GPU copies it.
+    if (w->device_hit_plan_) return;
     _mm_sfence();
     *(volatile uint32_t*) w->h_flagA_ = w->cur_ring_;
 }
@@ -252,6 +269,10 @@ void MoeWindow::publish(uint32_t ring, int grp, int tb, int n, const float* x, c
     (void) grp;
     using namespace strata::kernels;
     const int64_t N = sh_.n_embd, K = sh_.k;
+    if (device_hit_plan_) {
+        direct_x_ = x;
+        direct_ids_ = ids;
+    }
     if (direct_resident_) {
         // The router's device buffers are stable across graph replay.  Keep their addresses for the later direct
         // plan builder; a doorbell copy into mapped staging would only add a kernel and two host-visible buffers.
@@ -272,7 +293,7 @@ bool MoeWindow::experts(int64_t layer, uint32_t ring, int grp, int tb, int n, st
     if (exl3_runtime_ != nullptr) {
         const int64_t N = sh_.n_embd, K = sh_.k;
         if (layer < 0 || layer >= exl3_runtime_->n_layers() || grp != 0 || tb < 0 || n <= 0 ||
-            tb > sh_.max_t - n) {
+            tb > sh_.max_t - n || (device_hit_plan_ && tb != 0)) {
             err = "moe window: EXL3 ring geometry is invalid";
             return false;
         }
@@ -294,13 +315,24 @@ bool MoeWindow::experts(int64_t layer, uint32_t ring, int grp, int tb, int n, st
         }
         const int64_t cap = (int64_t) n * K;
         int32_t* pl = plan_ + (size_t) grp * (size_t) (plan_i32_ + 16);
+        if (device_hit_plan_) {
+            try {
+                sycl::queue& queue = Runtime::get().stream(cs);
+                if (!exl3_runtime_->record_device_hit_enqueue(queue, layer, direct_x_, direct_ids_, n,
+                                                              hit_out_, N, err))
+                    return false;
+            } catch (const std::exception& e) {
+                err = "moe window, device hit EXL3 layer " + std::to_string(layer) + ": " + e.what();
+                return false;
+            }
+        }
         if (!segmented_) wait_flag_ge(m_flagA_, ring, cs);
         copy_i32_from_mapped(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, cs);
         const int32_t* p_counts = pl;
         const int32_t* p_start = pl + 4;
         const int32_t* p_dst = p_start + sink_.cap + 1;
         try {
-            if (!segmented_) {
+            if (!segmented_ && !device_hit_plan_) {
                 sycl::queue& queue = Runtime::get().stream(cs);
                 if (!exl3_runtime_->record_enqueue(queue, m_x_ + (size_t) tb * N, N,
                                                     hit_out_ + (size_t) tb * K * N, N, err))
@@ -403,6 +435,7 @@ bool MoeWindow::serve(int64_t rings, const int64_t* layers, const int* grps, con
     static int64_t n_rings = 0, n_windows = 0;
     const Clock::time_point w0 = Clock::now();
     Clock::time_point last_answer = w0;
+    std::string deferred_error;
     for (int64_t r = 0; r < rings; ++r) {
         const uint32_t want = (uint32_t) (r + 1);
         const Clock::time_point a = Clock::now();
@@ -412,9 +445,11 @@ bool MoeWindow::serve(int64_t rings, const int64_t* layers, const int* grps, con
             err = std::string("moe window: segment ") + std::to_string(r) + ": " + strata::gpu::last_error();
             return false;
         }
-        if (exl3_runtime_ != nullptr && r > 0) exl3_runtime_->mark_gpu_consumed();
         while (*seq < want) {
             _mm_pause();
+            // Monolithic EXL3 service only touches mapped host memory until all rings have been answered. Querying
+            // or synchronizing the executing queue here could wait behind a flag this thread still has to raise.
+            if (device_hit_plan_) continue;
             if ((++spins & 1023u) != 0) continue;
             const auto now = Clock::now();
             if (now - last_flush > std::chrono::microseconds(2000)) {
@@ -434,6 +469,10 @@ bool MoeWindow::serve(int64_t rings, const int64_t* layers, const int* grps, con
                 return false;
             }
         }
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        // The next publish is ordered after every prior device-plan, hit-output, mapped-plan, CPU-row and combine
+        // reader. Only observing this ring (or the segmented sync above) permits reusing the persistent host state.
+        if (exl3_runtime_ != nullptr && r > 0) exl3_runtime_->mark_gpu_consumed();
         const Clock::time_point rung = Clock::now();
         cur_ring_ = want;
         set_plan_slot(grps[r]);
@@ -442,33 +481,63 @@ bool MoeWindow::serve(int64_t rings, const int64_t* layers, const int* grps, con
         active_tb_ = tb;
         active_n_ = n;
         host_error_.clear();
-        if (pool != nullptr)
-            pool(user, h_x_ + (size_t) tb * sh_.n_embd, h_ids_ + (size_t) tb * sh_.k, n, sh_.k,
-                 h_ymiss_ + (size_t) tb * sh_.k * sh_.n_embd, layers[r]);
-        if (!host_error_.empty()) {
-            err = host_error_;
-            return false;
+        plan_ready_ = false;
+        if (deferred_error.empty()) {
+            try {
+                if (pool != nullptr)
+                    pool(user, h_x_ + (size_t) tb * sh_.n_embd, h_ids_ + (size_t) tb * sh_.k, n, sh_.k,
+                         h_ymiss_ + (size_t) tb * sh_.k * sh_.n_embd, layers[r]);
+            } catch (const std::exception& e) {
+                if (exl3_runtime_ == nullptr) throw;
+                host_error_ = std::string("moe window: CPU callback: ") + e.what();
+            } catch (...) {
+                if (exl3_runtime_ == nullptr) throw;
+                host_error_ = "moe window: CPU callback failed with an unknown exception";
+            }
         }
-        if (exl3_runtime_ != nullptr && (!exl3_runtime_->prepared() || !exl3_runtime_->cpu_ready())) {
+        if (device_hit_plan_) {
+            if (deferred_error.empty() && (!host_error_.empty() || !plan_ready_ ||
+                !exl3_runtime_->prepared() || !exl3_runtime_->cpu_ready())) {
+                deferred_error = host_error_.empty() ?
+                    "moe window: EXL3 CPU miss plan failed at ring " + std::to_string(want) : host_error_;
+            }
+            if (!deferred_error.empty()) {
+                // Flag A has not been raised for this ring. No GPU reader can race this bounded replacement;
+                // after flag publication the graph drains normally, including every remaining ring and combine.
+                std::fill(h_ymiss_ + (size_t) tb * sh_.k * sh_.n_embd,
+                          h_ymiss_ + (size_t) (tb + n) * sh_.k * sh_.n_embd, 0.0f);
+                sink_.counts[0] = sink_.counts[1] = sink_.counts[2] = sink_.counts[3] = 0;
+                sink_.start[0] = sink_.start2[0] = 0;
+                plan_ready_ = false;
+            }
+        }
+        if (exl3_runtime_ != nullptr && !device_hit_plan_ &&
+            (!host_error_.empty() || !exl3_runtime_->prepared() || !exl3_runtime_->cpu_ready())) {
             if (exl3_runtime_->pending_gpu()) {
                 if (!strata::gpu::stream_sync(cs)) {
                     err = std::string("moe window: draining failed EXL3 hit plan: ") + strata::gpu::last_error();
                     return false;
                 }
-                exl3_runtime_->mark_gpu_consumed();
             }
-            err = "moe window: EXL3 CPU miss plan failed before the next segment";
+            exl3_runtime_->mark_gpu_consumed();
+            err = host_error_.empty() ? "moe window: EXL3 CPU miss plan failed before the next segment" : host_error_;
             return false;
         }
         std::atomic_thread_fence(std::memory_order_seq_cst);
         _mm_sfence();
-        if (*(volatile uint32_t*) h_flagA_ != want) {   // the pool did not publish a plan: an empty one
+        if (!device_hit_plan_ && *(volatile uint32_t*) h_flagA_ != want) {
             sink_.counts[0] = 0;
             sink_.counts[1] = 0;
             sink_.counts[2] = 0;
             sink_.start[0] = 0;
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
+            *(volatile uint32_t*) h_flagA_ = want;
+            raise_flag(h_flagB_, want);
+        }
+        if (device_hit_plan_) {
+            // No callback in this mode raises A. Both the successful plan and an error's empty plan are complete.
+            _mm_sfence();
             *(volatile uint32_t*) h_flagA_ = want;
             raise_flag(h_flagB_, want);
         }
@@ -496,8 +565,8 @@ bool MoeWindow::serve(int64_t rings, const int64_t* layers, const int* grps, con
         return false;
     }
     if (exl3_runtime_ != nullptr) {
-        // The last segment still reads the persistent host plan. Do not let
-        // another window overwrite it until that graph has consumed it.
+        // The final graph readers still own the persistent plans and CPU rows. Do not let another window overwrite
+        // them until the last segment or monolithic replay has completed, including an error's drain.
         if (!strata::gpu::stream_sync(cs)) {
             err = std::string("moe window: final EXL3 segment: ") + strata::gpu::last_error();
             return false;
@@ -512,6 +581,7 @@ bool MoeWindow::serve(int64_t rings, const int64_t* layers, const int* grps, con
                          (long long) n_rings, t_wait / (double) n_rings, t_answer / (double) n_rings,
                          t_tail / (double) n_windows);
     }
+    if (!deferred_error.empty()) { err = deferred_error; return false; }
     return true;
 }
 

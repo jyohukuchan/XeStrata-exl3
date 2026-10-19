@@ -212,7 +212,7 @@ bool Exl3ExpertSource::evict_one_locked() {
     return false;
 }
 
-void Exl3ExpertSource::refresh_capacity_locked() {
+void Exl3ExpertSource::refresh_capacity_locked(bool evict) {
     detail::HostMemory memory;
     uint64_t room = 0;
     if (startup_capacity_bytes_ != 0 && detail::host_available_memory(memory)) {
@@ -225,7 +225,89 @@ void Exl3ExpertSource::refresh_capacity_locked() {
         room = subtract_floor(room, stats_.transient_bytes);
     }
     stats_.admission_bytes = std::min(startup_capacity_bytes_, room);
-    while (stats_.resident_bytes > stats_.admission_bytes && evict_one_locked()) {}
+    if (evict)
+        while (stats_.resident_bytes > stats_.admission_bytes && evict_one_locked()) {}
+}
+
+bool Exl3ExpertSource::prewarm_cpu(const std::vector<uint8_t>& excluded, PrewarmResult& result,
+                                  std::string& why) {
+    std::unique_lock<std::shared_mutex> lifecycle(lifecycle_);
+    std::unique_lock<std::mutex> lock(mutex_);
+    result = {};
+    why.clear();
+    if (archive_ == nullptr || excluded.size() != entries_.size()) {
+        why = "source or prewarm exclusion mask is invalid";
+        return false;
+    }
+    uint64_t missing = 0;
+    for (size_t at = 0; at < entries_.size(); ++at) {
+        if (excluded[at] != 0) continue;
+        const uint64_t bytes = layouts_[at].total_bytes;
+        if (bytes > std::numeric_limits<uint64_t>::max() - result.requested_bytes) {
+            why = "CPU prewarm payload bytes overflow";
+            return false;
+        }
+        ++result.requested_experts;
+        result.requested_bytes += bytes;
+        if (entries_[at].state != State::ready || !entries_[at].persistent) missing += bytes;
+    }
+    if (result.requested_experts == 0) return true;
+    const char* enabled = std::getenv("STRATA_EXL3_SOURCE_PREWARM");
+    if (enabled != nullptr && std::strcmp(enabled, "0") == 0) {
+        why = "disabled by STRATA_EXL3_SOURCE_PREWARM=0";
+        return false;
+    }
+    if (active_layer_ >= 0) {
+        why = "an active source window must finish before prewarm";
+        return false;
+    }
+    const auto fits = [&] {
+        // A refused preload must not throw away an already warm cache. Unlike
+        // begin_layer, this check only samples/clamps; it performs no eviction.
+        refresh_capacity_locked(false);
+        result.admission_bytes = stats_.admission_bytes;
+        return result.requested_bytes <= stats_.admission_bytes &&
+               stats_.resident_bytes <= stats_.admission_bytes &&
+               missing <= stats_.admission_bytes - stats_.resident_bytes;
+    };
+    if (!fits()) {
+        why = "all owned CPU payloads do not fit the current source cache budget";
+        return false;
+    }
+    for (size_t at = 0; at < entries_.size(); ++at) {
+        Entry& e = entries_[at];
+        if (excluded[at] != 0 || e.state == State::ready) continue;
+        if (result.loaded_experts != 0 && !fits()) {
+            why = "host memory room decreased during CPU prewarm";
+            return false;
+        }
+        const uint64_t bytes = layouts_[at].total_bytes;
+        e.state = State::loading;
+        e.persistent = true;
+        stats_.resident_bytes += bytes;
+        stats_.peak_resident_bytes = std::max(stats_.peak_resident_bytes, stats_.resident_bytes);
+        std::unique_ptr<strata::artifact::exl3::ExpertBlob> loaded;
+        std::string err;
+        lock.unlock();
+        const bool ok = materialize(at, loaded, err, false);
+        lock.lock();
+        if (!ok) {
+            stats_.resident_bytes -= bytes;
+            e.state = State::empty;
+            e.persistent = false;
+            ready_.notify_all();
+            why = "CPU prewarm stopped at expert " + std::to_string(at) + ": " + err;
+            return false;
+        }
+        e.blob = std::move(loaded);
+        e.state = State::ready;
+        touch_locked(at);
+        missing -= bytes;
+        ++result.loaded_experts;
+        result.loaded_bytes += bytes;
+        ready_.notify_all();
+    }
+    return true;
 }
 
 void Exl3ExpertSource::release_window_locked() {

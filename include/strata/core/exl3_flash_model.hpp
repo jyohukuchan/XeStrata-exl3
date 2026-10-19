@@ -42,6 +42,7 @@ class NativeEmbed;
 /// are rejected by open() until their callers register those contracts.
 struct Exl3FlashModelOptions {
     std::vector<int> stage_devices;       ///< explicit runtime ordinals, one per layer stage
+    int pool_workers = 0;                 ///< workers per stage; 0 preserves the automatic physical-core default
     int64_t max_rows = 1;                 ///< persistent projection/expert row capacity
     int64_t max_cells = 0;                ///< 0: config.max_position_embeddings
     int64_t routed_k = 0;                 ///< 0: text_config.num_experts_per_tok

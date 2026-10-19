@@ -116,6 +116,7 @@ void usage() {
                  "  --max-new N         generated token count (default 16)\n"
                  "  --context N         K/V context capacity (default model config)\n"
                  "  --stage-devices L   explicit runtime ordinals, e.g. 0,1\n"
+                 "  --pool-workers N    CPU expert workers per stage (default 0: automatic)\n"
                  "  --stop-eos          stop after an EOS token\n"
                  "  --eos ID            add an EOS token and enable stopping\n"
                  "  --eos-ids LIST      replace EOS IDs and enable stopping\n"
@@ -169,7 +170,7 @@ int exl3_flash_main(int argc, char** argv) {
     std::string metadata_gguf, dump_path;
     int64_t max_new = 16, context = 0;
     bool stop_eos = false;
-    int spec = 0;
+    int spec = 0, pool_workers = 0;
     bool prompt_seen = false, eos_explicit = false;
     for (int i = 1; i < argc; ++i) {
         const std::string argument = argv[i];
@@ -219,6 +220,14 @@ int exl3_flash_main(int argc, char** argv) {
                 std::fprintf(stderr, "strata exl3-flash: --stage-devices must be a nonempty ordinal list\n");
                 return 2;
             }
+        } else if (argument == "--pool-workers") {
+            int64_t value = 0;
+            if (!parse_i64(next("--pool-workers"), value) || value < 0 ||
+                value > std::numeric_limits<int>::max()) {
+                std::fprintf(stderr, "strata exl3-flash: --pool-workers must be a nonnegative int32 (0: automatic)\n");
+                return 2;
+            }
+            pool_workers = static_cast<int>(value);
         } else if (argument == "--stop-eos") stop_eos = true;
         else if (argument == "--eos") {
             int64_t value = 0;
@@ -304,6 +313,7 @@ int exl3_flash_main(int argc, char** argv) {
     strata::core::Exl3FlashModel model;
     strata::core::Exl3FlashModelOptions options;
     options.stage_devices = stage_devices;
+    options.pool_workers = pool_workers;
     options.max_cells = context;
     options.include_mtp = false;
     options.vision = false;
