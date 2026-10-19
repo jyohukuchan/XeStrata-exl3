@@ -55,7 +55,13 @@ extraction while keeping the existing FP64 accumulation order.
 
 `Exl3ExpertSource` accepts an explicit name table per layer/expert and loads compressed blobs only for
 requested experts. Blob pointers stay stable throughout a layer/window, and `copy_blob()` can also copy
-compressed components from another layer. `ExpertPool::prepare_exl3()` preallocates worker scratch, and
+compressed components from another layer. A persistent LRU cache reuses compressed blobs across layers without
+retaining expanded weights. Its capacity follows compressed payload size and available host memory, checked again
+at each window. `STRATA_EXL3_SOURCE_CACHE_MIB` adds an upper bound; zero restores temporary window loading.
+All requested experts are pinned before eviction, with window-only storage when capacity is insufficient.
+Cold GPU-preload `copy_blob()` calls do not populate the CPU cache. Final source statistics report cache hits/misses,
+materialization counts/times and payload bytes. Payload bytes count successfully materialized tensor spans, not
+physical disk I/O. `ExpertPool::prepare_exl3()` preallocates worker scratch, and
 `run_exl3()` computes experts from FP32 inputs. CPU dispatch preserves routed output rows and rejects
 combinations with legacy GPU plans or residency tables.
 

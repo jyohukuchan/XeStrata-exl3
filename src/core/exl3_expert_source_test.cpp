@@ -5,6 +5,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -24,6 +25,13 @@ int failures = 0;
 void check(bool ok, const std::string& label) {
     std::cout << "  " << label << ": " << (ok ? "OK" : "FAIL") << '\n';
     if (!ok) ++failures;
+}
+
+bool cache_capacity(const strata::core::Exl3ExpertSource& source, uint64_t required, const char* label) {
+    const uint64_t capacity = source.cache_stats().capacity_bytes;
+    if (capacity >= required) return true;
+    std::cout << "  " << label << ": SKIP (cache capacity " << capacity << " < " << required << ")\n";
+    return false;
 }
 
 std::vector<uint8_t> words(size_t n, uint16_t seed) {
@@ -57,7 +65,10 @@ void write_archive(const std::filesystem::path& root, std::vector<strata::artifa
             const std::string base = "layers." + std::to_string(layer) + ".experts." + std::to_string(expert);
             names.push_back({base + ".gate", base + ".up", base + ".down"});
             const int bits = 2 + ((layer * 2 + expert) % 4);
-            add_linear(tensors, base + ".gate", bits, layer % 3);
+            if (layer == 1 && expert == 1)
+                tensors.emplace_back(base + ".gate.weight", "BF16", std::vector<uint64_t>{128, 128},
+                                     words(128 * 128, 0x3f80));
+            else add_linear(tensors, base + ".gate", bits, layer % 3);
             add_linear(tensors, base + ".up", 2 + ((bits + 1) % 4), (layer + expert + 1) % 3);
             add_linear(tensors, base + ".down", 2 + ((bits + 2) % 4), (layer + expert + 2) % 3);
         }
@@ -86,6 +97,12 @@ int main() {
     write_archive(root, names);
     auto archive = std::make_shared<strata::artifact::exl3::Archive>(root);
     strata::core::Exl3ExpertSource source(archive, 2, 2, names);
+    // Preserve the original window-scoped I/O-failure checks independently
+    // of the new persistent-cache cases below.
+    strata::core::Exl3ExpertSource::CachePolicy disabled;
+    disabled.max_bytes = 0;
+    std::string source_error;
+    check(source.open(archive, 2, 2, names, source_error, disabled), "zero-budget open succeeds");
     check(source.last_error().empty(), "metadata open succeeds");
     int32_t ids[] = {0, 1, 1};
     source.begin_layer(0, ids, 3);
@@ -121,6 +138,116 @@ int main() {
     strata::core::Exl3ExpertSource oversized;
     check(!oversized.open(archive, std::numeric_limits<int64_t>::max(), 2, names, err),
           "oversized layer dimensions are rejected");
+
+    // 1. Variable-width/codebook compressed experts survive another layer.
+    // A missing archive must remain readable on hits without materialization.
+    using Source = strata::core::Exl3ExpertSource;
+    Source::CachePolicy cache_policy;
+    cache_policy.headroom_bytes = 0;
+    uint64_t all_bytes = 0;
+    for (int layer = 0; layer < 2; ++layer)
+        for (int expert = 0; expert < 2; ++expert)
+            all_bytes += source.exl3_layout(layer, expert)->total_bytes;
+    cache_policy.max_bytes = all_bytes;
+    Source reused;
+    check(reused.open(archive, 2, 2, names, err, cache_policy), "persistent source opens");
+    const int32_t both[] = {0, 1};
+    const int32_t zero[] = {0};
+    // External cache caps and tight host/cgroup limits may intentionally disable
+    // persistence. Keep the legacy/fallback checks below active in that case.
+    const uint64_t reuse_required = all_bytes - source.exl3_layout(1, 1)->total_bytes;
+    if (cache_capacity(reused, reuse_required, "persistent reuse")) {
+        reused.begin_layer(0, both, 2);
+        const uint8_t* kept = reused.blob(0, 0);
+        reused.begin_layer(1, zero, 1);
+        const auto before_reuse = reused.cache_stats();
+        std::filesystem::rename(root / "model.safetensors", root / "model.unavailable");
+        reused.begin_layer(0, both, 2);
+        const bool hit_ok = kept != nullptr && reused.last_error().empty() && reused.blob(0, 0) == kept;
+        const auto after_reuse = reused.cache_stats();
+        std::filesystem::rename(root / "model.unavailable", root / "model.safetensors");
+        check(hit_ok && after_reuse.hits == before_reuse.hits + 2 &&
+                  after_reuse.materializations == before_reuse.materializations &&
+                  after_reuse.payload_read_bytes == before_reuse.payload_read_bytes,
+              "repeated layer uses compressed cache without source reads");
+        check(after_reuse.resident_bytes <= after_reuse.capacity_bytes && reused.transient(0, 0),
+              "persistent budget and borrowed-pointer contract are bounded");
+    }
+
+    // 2. The oldest entry is requested second. Pre-pinning the complete route
+    // keeps it alive while the first requested miss evicts another layer.
+    const uint64_t a = source.exl3_layout(0, 0)->total_bytes;
+    const uint64_t b = source.exl3_layout(1, 0)->total_bytes;
+    const uint64_t c = source.exl3_layout(0, 1)->total_bytes;
+    cache_policy.max_bytes = std::max(a + b, a + c);
+    Source evicting;
+    check(evicting.open(archive, 2, 2, names, err, cache_policy), "LRU source opens");
+    if (cache_capacity(evicting, cache_policy.max_bytes, "LRU eviction and pinning")) {
+        evicting.begin_layer(0, zero, 1);
+        const uint8_t* pinned = evicting.blob(0, 0);
+        check(pinned != nullptr, "LRU first blob materializes");
+        std::vector<uint8_t> pinned_bytes(static_cast<size_t>(a));
+        if (pinned != nullptr) std::memcpy(pinned_bytes.data(), pinned, pinned_bytes.size());
+        evicting.begin_layer(1, zero, 1);
+        const int32_t miss_before_hit[] = {1, 0};
+        evicting.begin_layer(0, miss_before_hit, 2);
+        const auto evicted = evicting.cache_stats();
+        check(pinned != nullptr && evicting.last_error().empty() && evicting.blob(0, 0) == pinned &&
+                  std::memcmp(pinned, pinned_bytes.data(), pinned_bytes.size()) == 0 && evicted.evictions == 1 &&
+                  evicted.resident_bytes <= evicted.capacity_bytes,
+              "all requested ids are pinned before LRU admission");
+        const auto before_invalid = evicting.cache_stats();
+        evicting.begin_layer(0, bad_ids, 2);
+        check(!evicting.last_error().empty() && evicting.blob(0, 0) == nullptr &&
+                  evicting.cache_stats().transient_bytes == 0,
+              "invalid window clears pins and transient state");
+        evicting.begin_layer(1, zero, 1);
+        check(evicting.last_error().empty() && evicting.blob(1, 0) != nullptr &&
+                  evicting.cache_stats().evictions > before_invalid.evictions,
+              "entries from a failed window are evictable again");
+    }
+
+    // All requested blobs remain valid even when their sum exceeds the cache.
+    cache_policy.max_bytes = std::min(a, c);
+    Source overflowing;
+    check(overflowing.open(archive, 2, 2, names, err, cache_policy), "small-budget source opens");
+    overflowing.begin_layer(0, both, 2);
+    const uint8_t* small_first = overflowing.blob(0, 0);
+    const uint8_t* small_second = overflowing.blob(0, 1);
+    const auto overflowed = overflowing.cache_stats();
+    check(small_first != nullptr && small_second != nullptr && overflowing.blob(0, 0) == small_first &&
+              overflowed.fallbacks > 0 && overflowed.transient_bytes > 0 &&
+              overflowed.resident_bytes <= overflowed.capacity_bytes,
+          "over-budget window retains simultaneous transient fallbacks");
+
+    // 3. A zero budget retains raw source bytes/dtypes and rereads next window;
+    // cold copy_blob (used by GPU/MTP preload) never admits a CPU cache entry.
+    Source raw_fallback;
+    check(raw_fallback.open(archive, 2, 2, names, err, disabled), "raw fallback opens");
+    const int32_t one[] = {1};
+    raw_fallback.begin_layer(1, one, 1);
+    const auto* raw_layout = raw_fallback.exl3_layout(1, 1);
+    const uint8_t* raw_first = raw_fallback.blob(1, 1);
+    std::vector<uint8_t> raw_copy(static_cast<size_t>(raw_layout->total_bytes));
+    std::vector<uint8_t> raw_original;
+    archive->read_tensor(*archive->find_tensor(names[3].gate + ".weight"), raw_original);
+    check(raw_fallback.copy_blob(1, 1, raw_copy.data()) && raw_first != nullptr &&
+              std::memcmp(raw_first, raw_copy.data(), raw_copy.size()) == 0 &&
+              std::memcmp(raw_first + raw_layout->gate.raw_weights.offset, raw_original.data(),
+                          raw_original.size()) == 0 &&
+              raw_layout->gate.storage == strata::kernels::exl3::ProjectionStorage::raw &&
+              raw_layout->gate.raw_dtype == strata::kernels::raw::DType::BF16,
+          "zero-budget packed/raw mixture preserves source bytes and dtype");
+    const auto before_raw = raw_fallback.cache_stats();
+    raw_fallback.begin_layer(1, one, 1);
+    const auto after_raw = raw_fallback.cache_stats();
+    check(raw_fallback.last_error().empty() && after_raw.resident_bytes == 0 && after_raw.capacity_bytes == 0 &&
+              after_raw.materializations == before_raw.materializations + 1,
+          "zero-budget path materializes each window without persistent residence");
+    raw_fallback.begin_layer(0, nullptr, 0);
+    check(raw_fallback.cache_stats().transient_bytes == 0 &&
+              raw_fallback.copy_blob(1, 1, raw_copy.data()) && raw_fallback.cache_stats().resident_bytes == 0,
+          "cold copy preserves empty window and avoids host cache duplication");
 
     // Exercise the actual ExpertDispatch -> ExpertPool boundary.  The
     // expected rows are produced independently by the single-expert CPU
