@@ -130,6 +130,9 @@ are GPU resident, the graph builds its route plan from device IDs without CPU ri
 plan/scratch is reused sequentially on an in-order queue. `STRATA_EXL3_RESIDENT_GRAPH=0` or
 `STRATA_VERIFY_SEGMENTED=1` selects the earlier path for comparison. On devices supporting SG32, grouped
 expert H128 transforms use a register FWHT; other devices retain the existing transform.
+Gate/up K partitioning derives from work-group, sub-group and local-memory limits. A positive
+`STRATA_EXL3_GU_SPLIT_K` sets an upper bound for per-device tuning; `1` selects a single-sub-group
+comparison path.
 
 AR uses `--prompt-chunk 0 --spec 0`; `--spec 1` also disables MTP. A positive `--prompt-chunk` runs prefill
 in decode windows bounded by `max-t`, returning the last row. Compressed weights remain compressed; this is

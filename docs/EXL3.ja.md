@@ -123,6 +123,9 @@ expert の residency は実際の blob byte 数と device の容量から決め�
 CPU の ring 応答を省く。同じ owner の plan/scratch は in-order queue 上で順番に再利用する。
 `STRATA_EXL3_RESIDENT_GRAPH=0` または `STRATA_VERIFY_SEGMENTED=1` で比較用に従来経路を選べる。
 SG32 を使える device では grouped expert の H128 変換を register FWHT で実行し、他では既存の変換を使う。
+gate/up の K 分割数は work-group、sub-group と local memory の上限から決める。
+`STRATA_EXL3_GU_SPLIT_K` に正の整数を指定すると、その値を上限として device ごとに調整できる。
+`1` は一つの sub-group で積和を実行する比較経路になる。
 
 AR では `--prompt-chunk 0 --spec 0` を使う。`--spec 1` も MTP 無効として扱う。正の `--prompt-chunk` は
 `max-t` 以下の decode window に分けて prefill を実行し、最後の行の出力を返す。圧縮 weight はそのまま

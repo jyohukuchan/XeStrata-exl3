@@ -16,6 +16,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -133,6 +134,18 @@ inline float decoded_weight(const MatrixView& view, int64_t row, int64_t col) {
     const uint16_t* tile = view.trellis + tile_index * (size_t) (16 * view.bits);
     const int state = tile_state_for_element((int) ((row & 15) * 16 + (col & 15)));
     return decode_state_f32(extract_state(tile, view.bits, state), view.codebook);
+}
+
+// The caller has already checked that this packed matrix uses codebook 2.  Keep bits runtime
+// and preserve the exact trellis extraction; the literal codebook lets the compiler fold decode_state_f32's
+// non-CB2 path without changing the accumulation order or tile/padding guards.
+inline float decoded_weight_cb2(const MatrixView& view, int64_t row, int64_t col) {
+    const int tile_row = (int) (row >> 4);
+    const int tile_col = (int) (col >> 4);
+    const size_t tile_index = (size_t) tile_row * (size_t) (view.n >> 4) + (size_t) tile_col;
+    const uint16_t* tile = view.trellis + tile_index * (size_t) (16 * view.bits);
+    const int state = tile_state_for_element((int) ((row & 15) * 16 + (col & 15)));
+    return decode_state_f32(extract_state(tile, view.bits, state), 2);
 }
 
 inline bool valid_raw_dtype(raw::DType dtype) {
@@ -503,17 +516,46 @@ bool grouped_cooperative_capability(const sycl::queue& queue) {
     }
 }
 
+int gate_up_split_k(const sycl::queue& queue, const GroupedPlan& plan) {
+    if (plan.hidden <= 0 || (plan.hidden & 3) != 0) return 1;
+    try {
+        const auto device = queue.get_device();
+        const size_t max_waves = device.get_info<sycl::info::device::max_work_group_size>() / 32;
+        const size_t subgroup_limit = device.get_info<sycl::info::device::max_num_sub_groups>();
+        // Each wave reserves two padded 16-column planes for the eight gate/up partials.
+        const size_t local_waves = device.get_info<sycl::info::device::local_mem_size>() / (2 * 16 * sizeof(float));
+        const size_t cap = std::max<size_t>(1, std::min({max_waves, subgroup_limit, local_waves}));
+        int split = static_cast<int>(std::min<size_t>(static_cast<size_t>(plan.hidden / 4), cap));
+        // An explicit upper bound supports per-device tuning without embedding a one-device threshold.
+        const char* text = std::getenv("STRATA_EXL3_GU_SPLIT_K");
+        if (text != nullptr) {
+            char* end = nullptr;
+            const long requested = std::strtol(text, &end, 10);
+            if (end != text && *end == '\0' && requested > 0)
+                split = static_cast<int>(std::min<long>(split, requested));
+        }
+        return std::max(1, split);
+    } catch (...) {
+        return 1;
+    }
+}
+
 sycl::event submit_gate_up_dot_cooperative(sycl::queue& queue, const GroupedPlan& plan, float* scratch,
                                            int64_t plane, GroupedOptions options,
                                            const std::vector<sycl::event>& deps) {
+    const int split_k = gate_up_split_k(queue, plan);
     const size_t tiles = (static_cast<size_t>(plan.max_ff) + 7u) / 8u;
     const size_t groups = static_cast<size_t>(plan.max_entries) * tiles;
+    const size_t local_size = static_cast<size_t>(split_k) * 32u;
+    const int64_t k_iters = plan.hidden / 4;
     return queue.submit([&](sycl::handler& h) {
         if (!deps.empty()) h.depends_on(deps);
-        h.parallel_for(sycl::nd_range<1>(sycl::range<1>(groups * 32u), sycl::range<1>(32)),
+        sycl::local_accessor<float, 1> reduce(sycl::range<1>(static_cast<size_t>(split_k) * 32u), h);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>(groups * local_size), sycl::range<1>(local_size)),
                        [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
             const sycl::sub_group subgroup = item.get_sub_group();
             const int lane = static_cast<int>(subgroup.get_local_id()[0]);
+            const int wave = static_cast<int>(item.get_local_id(0)) / 32;
             const int column_lane = lane >> 2;
             const int k_lane = lane & 3;
             const size_t group = static_cast<size_t>(item.get_group_linear_id());
@@ -525,21 +567,43 @@ sycl::event submit_gate_up_dot_cooperative(sycl::queue& queue, const GroupedPlan
             const float* gate_input = active ? scratch + static_cast<size_t>(entry) * static_cast<size_t>(plane) : nullptr;
             const float* up_input = active ? scratch + static_cast<size_t>(plan.max_entries) * static_cast<size_t>(plane) +
                                                    static_cast<size_t>(entry) * static_cast<size_t>(plane) : nullptr;
+            const int64_t iter_begin = (k_iters * wave) / split_k;
+            const int64_t iter_end = (k_iters * (wave + 1)) / split_k;
             float gate_partial = 0.0f;
             float up_partial = 0.0f;
             if (active) {
                 if (resolved.gate.is_packed()) {
                     const MatrixView gate = resolved.gate.packed_matrix();
-                    for (int64_t row = k_lane; row < gate.k; row += 4)
-                        gate_partial += gate_input[row] * decoded_weight(gate, row, col);
-                } else if (k_lane == 0) {
+                    if (gate.codebook == 2) {
+                        for (int64_t iter = iter_begin; iter < iter_end; ++iter) {
+                            const int64_t row = iter * 4 + k_lane;
+                            gate_partial += gate_input[row] * decoded_weight_cb2(gate, row, col);
+                        }
+                    } else {
+                        for (int64_t iter = iter_begin; iter < iter_end; ++iter) {
+                            const int64_t row = iter * 4 + k_lane;
+                            gate_partial += gate_input[row] * decoded_weight(gate, row, col);
+                        }
+                    }
+                } else if (wave == 0 && k_lane == 0) {
+                    // Preserve the existing raw/mixed projection summation order; only packed EXL3 dots are K-split.
                     gate_partial = dot_value(resolved.gate, gate_input, col);
                 }
                 if (resolved.up.is_packed()) {
                     const MatrixView up = resolved.up.packed_matrix();
-                    for (int64_t row = k_lane; row < up.k; row += 4)
-                        up_partial += up_input[row] * decoded_weight(up, row, col);
-                } else if (k_lane == 0) {
+                    if (up.codebook == 2) {
+                        for (int64_t iter = iter_begin; iter < iter_end; ++iter) {
+                            const int64_t row = iter * 4 + k_lane;
+                            up_partial += up_input[row] * decoded_weight_cb2(up, row, col);
+                        }
+                    } else {
+                        for (int64_t iter = iter_begin; iter < iter_end; ++iter) {
+                            const int64_t row = iter * 4 + k_lane;
+                            up_partial += up_input[row] * decoded_weight(up, row, col);
+                        }
+                    }
+                } else if (wave == 0 && k_lane == 0) {
+                    // Preserve the existing raw/mixed projection summation order; only packed EXL3 dots are K-split.
                     up_partial = dot_value(resolved.up, up_input, col);
                 }
             }
@@ -548,12 +612,25 @@ sycl::event submit_gate_up_dot_cooperative(sycl::queue& queue, const GroupedPlan
             float up_reduced = up_partial + sycl::permute_group_by_xor(subgroup, up_partial, 1);
             up_reduced += sycl::permute_group_by_xor(subgroup, up_reduced, 2);
             if (active && k_lane == 0) {
+                reduce[static_cast<size_t>(wave) * 16u + static_cast<size_t>(column_lane)] = gate_reduced;
+                reduce[static_cast<size_t>(split_k) * 16u + static_cast<size_t>(wave) * 16u +
+                       static_cast<size_t>(column_lane)] = up_reduced;
+            }
+            item.barrier();
+            if (active && wave == 0 && k_lane == 0) {
+                float gate_sum = 0.0f;
+                float up_sum = 0.0f;
+                for (int w = 0; w < split_k; ++w) {
+                    gate_sum += reduce[static_cast<size_t>(w) * 16u + static_cast<size_t>(column_lane)];
+                    up_sum += reduce[static_cast<size_t>(split_k) * 16u + static_cast<size_t>(w) * 16u +
+                                      static_cast<size_t>(column_lane)];
+                }
                 float* gate_dot = scratch + 2 * static_cast<size_t>(plan.max_entries) * static_cast<size_t>(plane) +
                                   static_cast<size_t>(entry) * static_cast<size_t>(plane);
                 float* up_dot = scratch + 3 * static_cast<size_t>(plan.max_entries) * static_cast<size_t>(plane) +
                                 static_cast<size_t>(entry) * static_cast<size_t>(plane);
-                gate_dot[col] = gate_reduced;
-                up_dot[col] = up_reduced;
+                gate_dot[col] = gate_sum;
+                up_dot[col] = up_sum;
             }
         });
     });
@@ -648,8 +725,13 @@ sycl::event submit_down_dot_cooperative(sycl::queue& queue, const GroupedPlan& p
             if (active) {
                 if (resolved.down.is_packed()) {
                     const MatrixView down = resolved.down.packed_matrix();
-                    for (int64_t row = k_lane; row < down.k; row += 4)
-                        partial += input[row] * decoded_weight(down, row, col);
+                    if (down.codebook == 2) {
+                        for (int64_t row = k_lane; row < down.k; row += 4)
+                            partial += input[row] * decoded_weight_cb2(down, row, col);
+                    } else {
+                        for (int64_t row = k_lane; row < down.k; row += 4)
+                            partial += input[row] * decoded_weight(down, row, col);
+                    }
                 } else if (k_lane == 0) {
                     partial = dot_value(resolved.down, input, col);
                 }
