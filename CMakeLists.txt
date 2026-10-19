@@ -1007,9 +1007,11 @@ endif()
 
 add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
             src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp src/kernels/cpu/exl3.cpp
+            src/kernels/cpu/exl3_mul1_intdot.cpp
             src/kernels/cpu/exl3_expert.cpp src/kernels/cpu/exl3_ngram.cpp src/kernels/cpu/raw_linear.cpp)
 target_include_directories(strata_kernels_cpu PUBLIC include)
 set_source_files_properties(src/kernels/xe/exl3.cpp src/kernels/cpu/exl3.cpp
+                           src/kernels/cpu/exl3_mul1_intdot.cpp
                            src/kernels/cpu/exl3_expert.cpp src/kernels/cpu/exl3_ngram.cpp
                            src/kernels/cpu/raw_linear.cpp
                            PROPERTIES COMPILE_OPTIONS "-fno-fast-math;-ffp-contract=off;-Wall;-Wextra")
@@ -1019,6 +1021,12 @@ if(STRATA_BUILD_TESTS)
   target_compile_options(exl3_pool_test PRIVATE -fno-fast-math -ffp-contract=off)
   add_test(NAME exl3_pool_test COMMAND exl3_pool_test)
   set_tests_properties(exl3_pool_test PROPERTIES TIMEOUT 120)
+  add_executable(exl3_mul1_intdot_test src/kernels/cpu/exl3_mul1_intdot_test.cpp)
+  target_link_libraries(exl3_mul1_intdot_test PRIVATE strata_kernels_cpu strata_warnings)
+  target_compile_options(exl3_mul1_intdot_test PRIVATE -fno-fast-math -ffp-contract=off)
+  add_test(NAME exl3_mul1_intdot_test COMMAND exl3_mul1_intdot_test)
+  set_tests_properties(exl3_mul1_intdot_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120
+                      ENVIRONMENT "STRATA_EXL3_CPU_INTDOT=1;STRATA_NO_EXL3_AVX2=0")
   add_executable(exl3_cpu_ngram_parity src/kernels/cpu/exl3_ngram_parity.cpp)
   target_link_libraries(exl3_cpu_ngram_parity PRIVATE strata_kernels_cpu strata_warnings)
   target_compile_options(exl3_cpu_ngram_parity PRIVATE -fno-fast-math -ffp-contract=off)

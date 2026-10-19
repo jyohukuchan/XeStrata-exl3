@@ -126,6 +126,8 @@ private:
     int64_t max_entries_ = 0;
     int64_t hidden_ = 0;
     int64_t max_ff_ = 0;
+    // Optional packed output-block workspace; zero keeps whole-expert dispatch.
+    int64_t cpu_rowparallel_jobs_ = 0;
     bool opened_ = false;
     bool prepared_ = false;
     bool cpu_ready_ = false;

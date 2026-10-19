@@ -6,12 +6,26 @@
 // The packed-tile and codebook rules are derived from exllamav3's MIT code;
 // the implementation here remains portable C++ with an AVX2-safe baseline.
 #include "strata/kernels/cpu/exl3.hpp"
+#include "strata/kernels/cpu/exl3_mul1_intdot.hpp"
 
 #include <array>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <vector>
+
+// Clang also supports per-function targets for the MSVC ABI. Other compilers
+// retain the generic implementation rather than emitting unguarded AVX2.
+#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__clang__) || defined(__GNUC__))
+#include "strata/kernels/cpu/expert_layout.hpp"
+#include <immintrin.h>
+#define EXL3_HAVE_TARGET_AVX2 1
+#define EXL3_TARGET_AVX2 __attribute__((target("avx2")))
+#else
+#define EXL3_HAVE_TARGET_AVX2 0
+#define EXL3_TARGET_AVX2
+#endif
 
 namespace strata::kernels::cpu::exl3 {
 namespace {
@@ -199,6 +213,29 @@ const CodebookF32Lut& codebook_lut_f32() {
     return table;
 }
 
+#if EXL3_HAVE_TARGET_AVX2
+// CB2's byte sum has only 1021 possible values.  Keeping the exact final
+// binary16 result here avoids a 65536-entry gather table in the AVX2 path.
+// Four spare entries make the AVX2 32-bit gather at index 1020 in-bounds.
+using Cb2SumHalfLut = std::array<uint16_t, 1024>;
+const Cb2SumHalfLut& cb2_sum_half_lut() {
+    static const Cb2SumHalfLut table = [] {
+        Cb2SumHalfLut result{};
+        const float inv = f16_to_f32(0x1eeeu);
+        const float bias = f16_to_f32(0xc931u);
+        for (int sum = 0; sum <= 1020; ++sum) {
+            const uint16_t h = static_cast<uint16_t>(0x6400u + sum);
+            volatile float product = f16_to_f32(h) * inv;
+            volatile float value = product + bias;
+            result[static_cast<size_t>(sum)] = f32_to_f16(value);
+        }
+        return result;
+    }();
+    return table;
+}
+
+#endif
+
 // Hot linear path: validation and the codebook LUT pointer are already hoisted.
 // This writes only one bounded 16x16 tile in F32; it never materializes W.
 template <int Bits>
@@ -226,13 +263,12 @@ void decode_tile_f32_hot_bits(const MatrixView& matrix, int64_t tile_k, int64_t 
 }
 
 template <int Bits>
-void linear_dot_tiles_f32(const MatrixView& matrix, const float* input_basis, float* y, const float* lut) {
+void linear_dot_range_f32(const MatrixView& matrix, const float* input_basis, size_t first_tile,
+                          size_t tile_count, float* dot, const float* lut) {
     const size_t k = static_cast<size_t>(matrix.k);
-    const size_t n = static_cast<size_t>(matrix.n);
     const size_t tiles_k = k / kTileSide;
-    const size_t tiles_n = n / kTileSide;
     std::array<float, kTileValues> tile_f32{};
-    for (size_t tile_n = 0; tile_n < tiles_n; ++tile_n) {
+    for (size_t tile_n = first_tile; tile_n < first_tile + tile_count; ++tile_n) {
         double acc[kTileSide] = {};
         for (size_t tile_k = 0; tile_k < tiles_k; ++tile_k) {
             decode_tile_f32_hot_bits<Bits>(matrix, static_cast<int64_t>(tile_k), static_cast<int64_t>(tile_n), lut,
@@ -245,7 +281,147 @@ void linear_dot_tiles_f32(const MatrixView& matrix, const float* input_basis, fl
             }
         }
         for (int col = 0; col < kTileSide; ++col)
-            y[tile_n * kTileSide + static_cast<size_t>(col)] = static_cast<float>(acc[col]);
+            dot[(tile_n - first_tile) * kTileSide + static_cast<size_t>(col)] = static_cast<float>(acc[col]);
+    }
+}
+
+#if EXL3_HAVE_TARGET_AVX2
+
+// Each tile is staged once as dwords, followed by three wrapped dwords.
+// An eight-state window spans at most four dwords; one unaligned 16-byte
+// load plus a broadcast/vpermd therefore replaces the two packed-word
+// vpgatherdd operations used by the gather prototype.
+EXL3_TARGET_AVX2 void decode_cb2_8_f32_avx2(const uint32_t* staged, size_t words32_count,
+                                            int bits, int state_base, float* values) {
+    int relative0[8];
+    int relative1[8];
+    int shift_right[8];
+    const int first_b0 = state_base * bits + bits - 16 + 256 * bits;
+    const size_t first_i0_raw = static_cast<size_t>(first_b0 >> 5);
+    const int word_base = static_cast<int>(first_i0_raw >= words32_count ? first_i0_raw - words32_count : first_i0_raw);
+    for (int lane = 0; lane < 8; ++lane) {
+        const int state = state_base + lane;
+        const int b0 = state * bits + bits - 16 + 256 * bits;
+        const int b1 = b0 + 16;
+        const size_t i0_raw = static_cast<size_t>(b0 >> 5);
+        const size_t i1_raw = static_cast<size_t>((b1 - 1) >> 5);
+        relative0[lane] = static_cast<int>(i0_raw - first_i0_raw);
+        relative1[lane] = static_cast<int>(i1_raw - first_i0_raw);
+        shift_right[lane] = static_cast<int>((i1_raw + 1) * 32 - b1);
+    }
+
+    const __m256i vrelative0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(relative0));
+    const __m256i vrelative1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(relative1));
+    const __m256i vshift = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(shift_right));
+    const __m256i vleft_shift = _mm256_sub_epi32(_mm256_set1_epi32(32), vshift);
+    const __m128i four_words = _mm_loadu_si128(reinterpret_cast<const __m128i*>(staged + word_base));
+    const __m256i broadcast_words = _mm256_broadcastsi128_si256(four_words);
+    const __m256i word0 = _mm256_permutevar8x32_epi32(broadcast_words, vrelative0);
+    const __m256i word1 = _mm256_permutevar8x32_epi32(broadcast_words, vrelative1);
+    const __m256i merged = _mm256_or_si256(_mm256_sllv_epi32(word0, vleft_shift),
+                                           _mm256_srlv_epi32(word1, vshift));
+    const __m256i state = _mm256_and_si256(merged, _mm256_set1_epi32(0xffff));
+
+    const __m256i multiplied = _mm256_mullo_epi32(state, _mm256_set1_epi32(static_cast<int>(kCb2Multiplier)));
+    const __m256i byte_pairs = _mm256_maddubs_epi16(multiplied, _mm256_set1_epi8(1));
+    const __m256i byte_sum = _mm256_madd_epi16(byte_pairs, _mm256_set1_epi16(1));
+    const __m256i half_words = _mm256_and_si256(
+        _mm256_i32gather_epi32(reinterpret_cast<const int*>(cb2_sum_half_lut().data()), byte_sum, 2),
+        _mm256_set1_epi32(0xffff));
+
+    // CB2's fixed formula produces only normal finite half values for all
+    // 1021 sums (verified by the gather prototype's all-state proof).
+    const __m256i exponent = _mm256_slli_epi32(
+        _mm256_add_epi32(_mm256_and_si256(_mm256_srli_epi32(half_words, 10), _mm256_set1_epi32(0x1f)),
+                         _mm256_set1_epi32(112)),
+        23);
+    const __m256i sign = _mm256_slli_epi32(_mm256_and_si256(half_words, _mm256_set1_epi32(0x8000)), 16);
+    const __m256i mantissa = _mm256_slli_epi32(_mm256_and_si256(half_words, _mm256_set1_epi32(0x3ff)), 13);
+    const __m256 packed_f32 = _mm256_castsi256_ps(_mm256_or_si256(sign, _mm256_or_si256(exponent, mantissa)));
+    _mm256_storeu_ps(values, packed_f32);
+}
+
+template <int Bits>
+EXL3_TARGET_AVX2 void decode_tile_f32_hot_bits_avx2_cb2(const MatrixView& matrix, int64_t tile_k,
+                                                        int64_t tile_n, float* values) {
+    const int64_t tiles_n = matrix.n / kTileSide;
+    const size_t packed_size = static_cast<size_t>(16 * Bits);
+    const size_t tile_index = static_cast<size_t>(tile_k) * static_cast<size_t>(tiles_n) +
+                              static_cast<size_t>(tile_n);
+    const uint16_t* packed = matrix.trellis + tile_index * packed_size;
+    const size_t words32_count = static_cast<size_t>(Bits) * 8;
+    alignas(32) uint32_t staged[64 + 3];
+    std::memcpy(staged, packed, words32_count * sizeof(uint32_t));
+    std::memcpy(staged + words32_count, staged, 3 * sizeof(uint32_t));
+    alignas(32) float decoded[8];
+    for (int state_base = 0; state_base < kTileValues; state_base += 8) {
+        decode_cb2_8_f32_avx2(staged, words32_count, Bits, state_base, decoded);
+        for (int lane = 0; lane < 8; ++lane)
+            values[strata::kernels::exl3::tile_element_for_state(state_base + lane)] = decoded[lane];
+    }
+}
+
+template <int Bits>
+EXL3_TARGET_AVX2 void linear_dot_range_f32_avx2(const MatrixView& matrix, const float* input_basis, size_t first_tile,
+                                               size_t tile_count, float* dot, const float* lut) {
+    const size_t k = static_cast<size_t>(matrix.k);
+    const size_t tiles_k = k / kTileSide;
+    std::array<float, kTileValues> tile_f32{};
+    for (size_t tile_n = first_tile; tile_n < first_tile + tile_count; ++tile_n) {
+        double acc[kTileSide] = {};
+        for (size_t tile_k = 0; tile_k < tiles_k; ++tile_k) {
+            if (matrix.codebook == 2)
+                decode_tile_f32_hot_bits_avx2_cb2<Bits>(matrix, static_cast<int64_t>(tile_k),
+                                                        static_cast<int64_t>(tile_n), tile_f32.data());
+            else
+                decode_tile_f32_hot_bits<Bits>(matrix, static_cast<int64_t>(tile_k), static_cast<int64_t>(tile_n),
+                                               lut, tile_f32.data());
+            const size_t row_base = tile_k * kTileSide;
+            for (int row = 0; row < kTileSide; ++row) {
+                const double input = static_cast<double>(input_basis[row_base + static_cast<size_t>(row)]);
+                for (int col = 0; col < kTileSide; ++col)
+                    acc[col] += static_cast<double>(tile_f32[static_cast<size_t>(row * kTileSide + col)]) * input;
+            }
+        }
+        for (int col = 0; col < kTileSide; ++col)
+            dot[(tile_n - first_tile) * kTileSide + static_cast<size_t>(col)] = static_cast<float>(acc[col]);
+    }
+}
+
+#endif  // EXL3_HAVE_TARGET_AVX2
+
+void linear_dot_range_dispatch(const MatrixView& matrix, const float* input_basis, size_t first_tile,
+                               size_t tile_count, float* dot, const Mul1Input* mul1 = nullptr) {
+    if (mul1 != nullptr && linear_mul1_dot_range(matrix, *mul1, first_tile, tile_count, dot)) return;
+    const float* const lut = codebook_lut_f32()[static_cast<size_t>(matrix.codebook)].data();
+#if EXL3_HAVE_TARGET_AVX2
+    static const bool use_avx2 = [] {
+        const char* const force_generic = std::getenv("STRATA_NO_EXL3_AVX2");
+        return !(force_generic != nullptr && force_generic[0] == '1') && strata::kernels::cpu::cpu_avx2_ok();
+    }();
+    if (use_avx2) {
+        switch (matrix.bits) {
+            case 1: linear_dot_range_f32_avx2<1>(matrix, input_basis, first_tile, tile_count, dot, lut); break;
+            case 2: linear_dot_range_f32_avx2<2>(matrix, input_basis, first_tile, tile_count, dot, lut); break;
+            case 3: linear_dot_range_f32_avx2<3>(matrix, input_basis, first_tile, tile_count, dot, lut); break;
+            case 4: linear_dot_range_f32_avx2<4>(matrix, input_basis, first_tile, tile_count, dot, lut); break;
+            case 5: linear_dot_range_f32_avx2<5>(matrix, input_basis, first_tile, tile_count, dot, lut); break;
+            case 6: linear_dot_range_f32_avx2<6>(matrix, input_basis, first_tile, tile_count, dot, lut); break;
+            case 7: linear_dot_range_f32_avx2<7>(matrix, input_basis, first_tile, tile_count, dot, lut); break;
+            default: linear_dot_range_f32_avx2<8>(matrix, input_basis, first_tile, tile_count, dot, lut); break;
+        }
+        return;
+    }
+#endif
+    switch (matrix.bits) {
+        case 1: linear_dot_range_f32<1>(matrix, input_basis, first_tile, tile_count, dot, lut); break;
+        case 2: linear_dot_range_f32<2>(matrix, input_basis, first_tile, tile_count, dot, lut); break;
+        case 3: linear_dot_range_f32<3>(matrix, input_basis, first_tile, tile_count, dot, lut); break;
+        case 4: linear_dot_range_f32<4>(matrix, input_basis, first_tile, tile_count, dot, lut); break;
+        case 5: linear_dot_range_f32<5>(matrix, input_basis, first_tile, tile_count, dot, lut); break;
+        case 6: linear_dot_range_f32<6>(matrix, input_basis, first_tile, tile_count, dot, lut); break;
+        case 7: linear_dot_range_f32<7>(matrix, input_basis, first_tile, tile_count, dot, lut); break;
+        default: linear_dot_range_f32<8>(matrix, input_basis, first_tile, tile_count, dot, lut); break;
     }
 }
 
@@ -295,17 +471,9 @@ Status linear_with_scratch(const MatrixView& matrix, const float* x, float* y, L
         hadamard_normalized(scratch.input_basis + base);
     }
 
-    const float* const f32_lut = codebook_lut_f32()[static_cast<size_t>(matrix.codebook)].data();
-    switch (matrix.bits) {
-        case 1: linear_dot_tiles_f32<1>(matrix, scratch.input_basis, y, f32_lut); break;
-        case 2: linear_dot_tiles_f32<2>(matrix, scratch.input_basis, y, f32_lut); break;
-        case 3: linear_dot_tiles_f32<3>(matrix, scratch.input_basis, y, f32_lut); break;
-        case 4: linear_dot_tiles_f32<4>(matrix, scratch.input_basis, y, f32_lut); break;
-        case 5: linear_dot_tiles_f32<5>(matrix, scratch.input_basis, y, f32_lut); break;
-        case 6: linear_dot_tiles_f32<6>(matrix, scratch.input_basis, y, f32_lut); break;
-        case 7: linear_dot_tiles_f32<7>(matrix, scratch.input_basis, y, f32_lut); break;
-        default: linear_dot_tiles_f32<8>(matrix, scratch.input_basis, y, f32_lut); break;
-    }
+    Mul1Input mul1;
+    prepare_mul1_input(matrix, scratch.input_basis, scratch.mul1_duplicated, scratch.mul1_count, mul1);
+    linear_dot_range_dispatch(matrix, scratch.input_basis, 0, n / kTileSide, y, &mul1);
 
     for (size_t base = 0; base < n; base += kHadamardSide) {
         hadamard_normalized(y + base);
@@ -319,6 +487,50 @@ Status linear_with_scratch(const MatrixView& matrix, const float* x, float* y, L
         }
     }
     return Status::ok;
+}
+
+Status prepare_input_basis_impl(const MatrixView& matrix, const float* x, float* basis) {
+    const Status status = validate_linear(matrix, x, basis);
+    if (status != Status::ok) return status;
+    for (size_t base = 0; base < static_cast<size_t>(matrix.k); base += kHadamardSide) {
+        for (size_t i = 0; i < kHadamardSide; ++i) {
+            const float scale = f16_to_f32(matrix.suh[base + i]);
+            volatile float product = x[base + i] * scale;
+            basis[base + i] = product;
+        }
+        hadamard_normalized(basis + base);
+    }
+    return Status::ok;
+}
+
+Status linear_output_block_impl(const MatrixView& matrix, const float* input_basis, int64_t col0, float* y,
+                                LinearScratch& scratch) {
+    const Status status = validate_linear(matrix, input_basis, y);
+    if (status != Status::ok) return status;
+    if (col0 < 0 || col0 % kHadamardSide != 0 || col0 > matrix.n - kHadamardSide ||
+        scratch.input_basis == nullptr || scratch.input_count < kHadamardSide || scratch.tile == nullptr ||
+        scratch.tile_count < kTileValues)
+        return Status::scratch_too_small;
+    linear_dot_range_dispatch(matrix, input_basis, static_cast<size_t>(col0 / kTileSide),
+                              kHadamardSide / kTileSide, scratch.input_basis, scratch.mul1_prepared);
+    hadamard_normalized(scratch.input_basis);
+    for (size_t i = 0; i < kHadamardSide; ++i) {
+        volatile float scaled = scratch.input_basis[i] * f16_to_f32(matrix.svh[col0 + static_cast<int64_t>(i)]);
+        y[col0 + static_cast<int64_t>(i)] = scaled;
+        if (matrix.bias != nullptr) {
+            volatile float with_bias = y[col0 + static_cast<int64_t>(i)] +
+                                       f16_to_f32(matrix.bias[col0 + static_cast<int64_t>(i)]);
+            y[col0 + static_cast<int64_t>(i)] = with_bias;
+        }
+    }
+    return Status::ok;
+}
+
+void silu_mul_block_impl(const float* gate, const float* up, float* out, size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+        const float value = gate[i];
+        out[i] = (value / (1.0f + std::exp(-value))) * up[i];
+    }
 }
 
 }  // namespace
@@ -336,6 +548,19 @@ const char* status_string(Status status) {
         case Status::size_overflow: return "EXL3 size overflow";
     }
     return "unknown EXL3 status";
+}
+
+Status prepare_input_basis(const MatrixView& matrix, const float* x, float* basis) {
+    return prepare_input_basis_impl(matrix, x, basis);
+}
+
+Status linear_output_block(const MatrixView& matrix, const float* input_basis, int64_t col0, float* y,
+                           LinearScratch& scratch) {
+    return linear_output_block_impl(matrix, input_basis, col0, y, scratch);
+}
+
+void silu_mul_block(const float* gate, const float* up, float* out, size_t count) {
+    silu_mul_block_impl(gate, up, out, count);
 }
 
 Status validate(const MatrixView& matrix) {

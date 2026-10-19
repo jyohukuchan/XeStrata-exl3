@@ -122,6 +122,21 @@ int main() {
         }
     }
 
+    // Reuse one prepared block-phase pool after a smaller batch. The wide
+    // H128/FF256 job leaves fewer down tasks than gate/up tasks, so a later
+    // larger batch must use reserved capacity rather than the last phase size.
+    {
+        cpu::ExpertPool pool(2, false, true);
+        if (pool.prepare_exl3_rowparallel(4, 2, max_hidden, max_ff) != exl3::Status::ok) return 4;
+        for (int count : {1, 2, 1, 2}) {
+            for (auto& output : actual) std::fill(output.begin(), output.end(), -1234.0f);
+            if (pool.run_exl3_rowparallel(jobs, count) != exl3::Status::ok) return 5;
+            for (int i = 0; i < count; ++i)
+                if (std::memcmp(expected[i].data(), actual[i].data(), expected[i].size() * sizeof(float)) != 0)
+                    ++failures;
+        }
+    }
+
     // A packed 2bpw gate with raw F16 up and raw BF16 down exercises the
     // tagged projection path through the same persistent pool scratch.
     Expert mixed_packed(128, 128, 2, 2, 2, 211);
@@ -139,6 +154,14 @@ int main() {
     cpu::ExpertPool mixed_pool(2, false, true);
     if (mixed_pool.prepare_exl3(4, 128, 128) != exl3::Status::ok ||
         mixed_pool.run_exl3(&mixed_job, 1) != exl3::Status::ok ||
+        std::memcmp(mixed_expected.data(), mixed_actual.data(), mixed_expected.size() * sizeof(float)) != 0)
+        ++failures;
+    if (mixed_pool.prepare_exl3_rowparallel(4, 1, 128, 128) != exl3::Status::ok) return 6;
+    std::fill(mixed_actual.begin(), mixed_actual.end(), -1234.0f);
+    if (mixed_pool.run_exl3_rowparallel(&mixed_job, 1) != exl3::Status::unsupported_layout ||
+        !std::all_of(mixed_actual.begin(), mixed_actual.end(), [](float v) { return v == -1234.0f; }))
+        ++failures;
+    if (mixed_pool.run_exl3(&mixed_job, 1) != exl3::Status::ok ||
         std::memcmp(mixed_expected.data(), mixed_actual.data(), mixed_expected.size() * sizeof(float)) != 0)
         ++failures;
     std::printf("  mixed packed2/F16/BF16 roles through ExpertPool: %s\n", failures ? "FAIL" : "OK");

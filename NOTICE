@@ -47,7 +47,7 @@ Every copyright holder whose work is in this repository, its license and where t
   unmodified copy), which the image engine (strata-image) is compiled with - third_party/main/stb/LICENSE,
   LICENSES/MIT.txt, LICENSES/Unlicense.txt
 - Copyright (c) 2025 Turboderp; Copyright (c) 2026 jyohukuchan
-  MIT - EXL3 trellis, codebook, Hadamard and specialized n-gram storage rules transcribed from exllamav3
+  MIT - EXL3 trellis, codebook, Hadamard, specialized n-gram storage and CPU MUL1 integer-dot rules transcribed from exllamav3
   and rocm_exl3 in the EXL3 components under include/, src/ and tools/. The original code stays under MIT;
   the changed files as a whole are under LGPL-3.0-or-later AND MIT - text below and LICENSES/MIT.txt
 - Copyright (c) 2013-2025 Niels Lohmann

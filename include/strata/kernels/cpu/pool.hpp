@@ -33,6 +33,7 @@
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/exl3_expert.hpp"
+#include "strata/kernels/cpu/exl3_mul1_intdot.hpp"
 
 #include <atomic>
 #include <array>
@@ -81,6 +82,15 @@ struct ExpertJobExl3 {
     float* y = nullptr;
     int64_t ldy = 0;
     int slot = -1;
+};
+
+/// A bounded row/block task used only by the packed EXL3 row-parallel phases.
+struct Exl3RowTask {
+    enum class Kind : uint8_t { input_gate_up, gate_block, up_block, silu_down_input, down_block };
+    Kind kind = Kind::input_gate_up;
+    uint16_t job = 0;
+    uint16_t row = 0;
+    uint16_t block = 0;
 };
 
 /// One logical processor per PHYSICAL core, so a worker is never scheduled onto an SMT sibling of another
@@ -174,6 +184,9 @@ public:
     /// Validate all jobs, then run each matrix row through the persistent pool.
     /// A failed validation returns before the epoch is published.
     exl3::Status run_exl3(ExpertJobExl3* jobs, int n);
+    /// Prepare and run packed-only output-block phases. Raw or over-bounded jobs return a fallback status before output.
+    exl3::Status prepare_exl3_rowparallel(int64_t max_rows, int64_t max_jobs, int64_t max_hidden, int64_t max_ff);
+    exl3::Status run_exl3_rowparallel(ExpertJobExl3* jobs, int n);
     /// run_split_multi's phases, accumulated ms: gate/up rows, the intermediate quantization, down rows.
     double ms_multi_gu = 0, ms_multi_q = 0, ms_multi_down = 0;
     int64_t multi_bytes = 0;
@@ -269,20 +282,34 @@ private:
     std::vector<int> worker_cpus_;
     std::vector<ExpertScratch> scratch_;   // one per worker: no allocation, no false sharing of the hot data
     struct Exl3Scratch {
+        std::vector<int32_t> mul1_duplicated;
         std::vector<float> input;
         std::vector<float> gate;
         std::vector<float> up;
         std::array<uint16_t, 256> tile{};
         exl3::ExpertScratch expert() {
-            return {{input.data(), input.size(), tile.data(), tile.size()}, gate.data(), gate.size(), up.data(), up.size()};
+            return {{input.data(), input.size(), tile.data(), tile.size(), mul1_duplicated.data(),
+                     mul1_duplicated.size(), nullptr}, gate.data(), gate.size(), up.data(), up.size()};
         }
+    };
+    struct Exl3RowWorkspace {
+        std::vector<float> input_gate, input_up, input_down, gate, up;
+        std::vector<int32_t> quant_gate, quant_up, quant_down;
+        std::vector<exl3::Mul1Input> mul1_gate, mul1_up, mul1_down;
+        std::vector<Exl3RowTask> tasks;
     };
     std::vector<Exl3Scratch> exl3_scratch_;
     Exl3Scratch host_exl3_scratch_;
     ExpertJobExl3* exl3_jobs_ = nullptr;
+    ExpertJobExl3* exl3_row_jobs_ = nullptr;
+    Exl3RowWorkspace exl3_rows_;
     int64_t exl3_max_rows_ = 0;
     int64_t exl3_max_hidden_ = 0;
     int64_t exl3_max_ff_ = 0;
+    int64_t exl3_row_max_rows_ = 0;
+    int64_t exl3_row_max_jobs_ = 0;
+    int64_t exl3_row_max_hidden_ = 0;
+    int64_t exl3_row_max_ff_ = 0;
     std::atomic<int> exl3_error_{static_cast<int>(exl3::Status::ok)};
     // run_split state: mode 0 = whole experts, 1 = gate/up row parts, 2 = down row parts
     int mode_ = 0;

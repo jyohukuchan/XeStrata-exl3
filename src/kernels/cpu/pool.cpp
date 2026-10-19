@@ -492,7 +492,74 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
         const uint32_t i = (uint32_t) ci;
         if (id >= 0) wstate_[(size_t) id].store(ci, std::memory_order_relaxed);
         else { hstate_.store(ci, std::memory_order_relaxed); hstate_ms_.store(now_ms(), std::memory_order_relaxed); }
-        if (mode_ == 10) {
+        if (mode_ >= 11 && mode_ <= 14) {
+            const Exl3RowTask& task = exl3_rows_.tasks[i];
+            const ExpertJobExl3& j = exl3_row_jobs_[task.job];
+            Exl3Scratch& exl3_scratch = id >= 0 ? exl3_scratch_[(size_t) id] : host_exl3_scratch_;
+            exl3::LinearScratch linear_scratch = exl3_scratch.expert().linear;
+            const size_t row_slot = static_cast<size_t>(task.job) * static_cast<size_t>(exl3_row_max_rows_) + task.row;
+            const size_t hidden_stride = static_cast<size_t>(exl3_row_max_hidden_);
+            const size_t ff_stride = static_cast<size_t>(exl3_row_max_ff_);
+            const size_t hidden_offset = row_slot * hidden_stride;
+            const size_t ff_offset = row_slot * ff_stride;
+            exl3::Status status = exl3::Status::ok;
+            switch (task.kind) {
+                case Exl3RowTask::Kind::input_gate_up:
+                    status = exl3::prepare_input_basis(
+                        j.view.gate.packed_matrix(), j.x + static_cast<size_t>(task.row) * static_cast<size_t>(j.ldx),
+                        exl3_rows_.input_gate.data() + hidden_offset);
+                    if (status == exl3::Status::ok)
+                        status = exl3::prepare_input_basis(
+                            j.view.up.packed_matrix(), j.x + static_cast<size_t>(task.row) * static_cast<size_t>(j.ldx),
+                            exl3_rows_.input_up.data() + hidden_offset);
+                    if (status == exl3::Status::ok && !exl3_rows_.quant_gate.empty()) {
+                        exl3::prepare_mul1_input(j.view.gate.packed_matrix(),
+                            exl3_rows_.input_gate.data() + hidden_offset,
+                            exl3_rows_.quant_gate.data() + hidden_offset, hidden_stride, exl3_rows_.mul1_gate[row_slot]);
+                        exl3::prepare_mul1_input(j.view.up.packed_matrix(),
+                            exl3_rows_.input_up.data() + hidden_offset,
+                            exl3_rows_.quant_up.data() + hidden_offset, hidden_stride, exl3_rows_.mul1_up[row_slot]);
+                    }
+                    break;
+                case Exl3RowTask::Kind::gate_block:
+                    linear_scratch.mul1_prepared = &exl3_rows_.mul1_gate[row_slot];
+                    status = exl3::linear_output_block(
+                        j.view.gate.packed_matrix(), exl3_rows_.input_gate.data() + hidden_offset,
+                        static_cast<int64_t>(task.block) * 128,
+                        exl3_rows_.gate.data() + ff_offset, linear_scratch);
+                    break;
+                case Exl3RowTask::Kind::up_block:
+                    linear_scratch.mul1_prepared = &exl3_rows_.mul1_up[row_slot];
+                    status = exl3::linear_output_block(
+                        j.view.up.packed_matrix(), exl3_rows_.input_up.data() + hidden_offset,
+                        static_cast<int64_t>(task.block) * 128,
+                        exl3_rows_.up.data() + ff_offset, linear_scratch);
+                    break;
+                case Exl3RowTask::Kind::silu_down_input:
+                    exl3::silu_mul_block(exl3_rows_.gate.data() + ff_offset, exl3_rows_.up.data() + ff_offset,
+                                         exl3_rows_.gate.data() + ff_offset, static_cast<size_t>(j.view.gate.n));
+                    status = exl3::prepare_input_basis(
+                        j.view.down.packed_matrix(), exl3_rows_.gate.data() + ff_offset,
+                        exl3_rows_.input_down.data() + ff_offset);
+                    if (status == exl3::Status::ok && !exl3_rows_.quant_down.empty())
+                        exl3::prepare_mul1_input(j.view.down.packed_matrix(),
+                            exl3_rows_.input_down.data() + ff_offset,
+                            exl3_rows_.quant_down.data() + ff_offset, ff_stride, exl3_rows_.mul1_down[row_slot]);
+                    break;
+                case Exl3RowTask::Kind::down_block:
+                    linear_scratch.mul1_prepared = &exl3_rows_.mul1_down[row_slot];
+                    status = exl3::linear_output_block(
+                        j.view.down.packed_matrix(), exl3_rows_.input_down.data() + ff_offset,
+                        static_cast<int64_t>(task.block) * 128,
+                        j.y + static_cast<size_t>(task.row) * static_cast<size_t>(j.ldy),
+                        linear_scratch);
+                    break;
+            }
+            if (status != exl3::Status::ok) {
+                int expected = static_cast<int>(exl3::Status::ok);
+                exl3_error_.compare_exchange_strong(expected, static_cast<int>(status), std::memory_order_release);
+            }
+        } else if (mode_ == 10) {
             Exl3Scratch& exl3_scratch = id >= 0 ? exl3_scratch_[(size_t) id] : host_exl3_scratch_;
             const ExpertJobExl3& j = exl3_jobs_[i];
             exl3::ExpertScratch routed_scratch = exl3_scratch.expert();
@@ -679,11 +746,13 @@ exl3::Status ExpertPool::prepare_exl3(int64_t max_rows, int64_t max_hidden, int6
         std::vector<Exl3Scratch> prepared((size_t) n_);
         for (Exl3Scratch& scratch : prepared) {
             scratch.input.resize(static_cast<size_t>((std::max)(max_hidden, max_ff)));
+            if (exl3::mul1_intdot_enabled()) scratch.mul1_duplicated.resize(scratch.input.size());
             scratch.gate.resize(static_cast<size_t>(max_rows) * static_cast<size_t>(max_ff));
             scratch.up.resize(static_cast<size_t>(max_rows) * static_cast<size_t>(max_ff));
         }
         Exl3Scratch prepared_host;
         prepared_host.input.resize(static_cast<size_t>((std::max)(max_hidden, max_ff)));
+        if (exl3::mul1_intdot_enabled()) prepared_host.mul1_duplicated.resize(prepared_host.input.size());
         prepared_host.gate.resize(static_cast<size_t>(max_rows) * static_cast<size_t>(max_ff));
         prepared_host.up.resize(static_cast<size_t>(max_rows) * static_cast<size_t>(max_ff));
         exl3_scratch_.swap(prepared);
@@ -730,6 +799,142 @@ exl3::Status ExpertPool::run_exl3(ExpertJobExl3* jobs, int n) {
     wait_parked("after an EXL3 batch");
     mode_ = 0;
     exl3_jobs_ = nullptr;
+    hstate_.store(kIdle, std::memory_order_relaxed);
+    hstate_ms_.store(now_ms(), std::memory_order_relaxed);
+    return static_cast<exl3::Status>(exl3_error_.load(std::memory_order_acquire));
+}
+
+exl3::Status ExpertPool::prepare_exl3_rowparallel(int64_t max_rows, int64_t max_jobs, int64_t max_hidden,
+                                                   int64_t max_ff) {
+    if (max_rows <= 0 || max_jobs <= 0 || max_hidden <= 0 || max_ff <= 0 || max_jobs > kMaxTasks ||
+        max_rows > std::numeric_limits<uint16_t>::max() || max_jobs > std::numeric_limits<uint16_t>::max())
+        return exl3::Status::invalid_argument;
+    const auto mul_u64 = [](uint64_t a, uint64_t b, uint64_t& out) {
+        if (b != 0 && a > std::numeric_limits<uint64_t>::max() / b) return false;
+        out = a * b;
+        return true;
+    };
+    uint64_t rows_jobs = 0;
+    if (!mul_u64(static_cast<uint64_t>(max_rows), static_cast<uint64_t>(max_jobs), rows_jobs))
+        return exl3::Status::size_overflow;
+    const uint64_t blocks_ff = (static_cast<uint64_t>(max_ff) + 127u) / 128u;
+    const uint64_t blocks_hidden = (static_cast<uint64_t>(max_hidden) + 127u) / 128u;
+    uint64_t gu_tasks = 0, down_tasks = 0, doubled_rows = 0;
+    if (!mul_u64(rows_jobs, 2u, doubled_rows) || !mul_u64(doubled_rows, blocks_ff, gu_tasks) ||
+        !mul_u64(rows_jobs, blocks_hidden, down_tasks))
+        return exl3::Status::size_overflow;
+    const uint64_t phase_tasks_max = (std::max)({rows_jobs, gu_tasks, down_tasks});
+    if (rows_jobs == 0 || gu_tasks == 0 || down_tasks == 0 || phase_tasks_max > kMaxTasks ||
+        blocks_ff > std::numeric_limits<uint16_t>::max() || blocks_hidden > std::numeric_limits<uint16_t>::max())
+        return exl3::Status::unsupported_layout;
+    const auto fits = [](uint64_t count) {
+        return count <= static_cast<uint64_t>(std::numeric_limits<ptrdiff_t>::max()) / sizeof(float);
+    };
+    uint64_t hidden_values = 0, ff_values = 0, hidden_twice = 0, ff_triple = 0;
+    if (!mul_u64(rows_jobs, static_cast<uint64_t>(max_hidden), hidden_values) ||
+        !mul_u64(rows_jobs, static_cast<uint64_t>(max_ff), ff_values) ||
+        !mul_u64(hidden_values, 2u, hidden_twice) || !mul_u64(ff_values, 3u, ff_triple) ||
+        !fits(hidden_values) || !fits(ff_values) || !fits(hidden_twice) || !fits(ff_triple))
+        return exl3::Status::size_overflow;
+    const exl3::Status base = prepare_exl3(max_rows, max_hidden, max_ff);
+    if (base != exl3::Status::ok) return base;
+    try {
+        Exl3RowWorkspace prepared;
+        prepared.input_gate.resize(static_cast<size_t>(hidden_values));
+        prepared.input_up.resize(static_cast<size_t>(hidden_values));
+        prepared.input_down.resize(static_cast<size_t>(ff_values));
+        prepared.gate.resize(static_cast<size_t>(ff_values));
+        prepared.up.resize(static_cast<size_t>(ff_values));
+        prepared.mul1_gate.resize(static_cast<size_t>(rows_jobs));
+        prepared.mul1_up.resize(static_cast<size_t>(rows_jobs));
+        prepared.mul1_down.resize(static_cast<size_t>(rows_jobs));
+        if (exl3::mul1_intdot_enabled()) {
+            prepared.quant_gate.resize(static_cast<size_t>(hidden_values));
+            prepared.quant_up.resize(static_cast<size_t>(hidden_values));
+            prepared.quant_down.resize(static_cast<size_t>(ff_values));
+        }
+        prepared.tasks.resize(static_cast<size_t>(phase_tasks_max));
+        exl3_rows_ = std::move(prepared);
+        exl3_row_max_rows_ = max_rows;
+        exl3_row_max_jobs_ = max_jobs;
+        exl3_row_max_hidden_ = max_hidden;
+        exl3_row_max_ff_ = max_ff;
+        return exl3::Status::ok;
+    } catch (const std::bad_alloc&) {
+        return exl3::Status::scratch_too_small;
+    } catch (const std::length_error&) {
+        return exl3::Status::size_overflow;
+    }
+}
+
+exl3::Status ExpertPool::run_exl3_rowparallel(ExpertJobExl3* jobs, int n) {
+    if (n <= 0) return exl3::Status::ok;
+    if (jobs == nullptr || n > exl3_row_max_jobs_) return exl3::Status::invalid_argument;
+    const auto add_u64 = [](uint64_t a, uint64_t b, uint64_t& out) {
+        if (a > std::numeric_limits<uint64_t>::max() - b) return false;
+        out = a + b;
+        return true;
+    };
+    const auto mul_u64 = [](uint64_t a, uint64_t b, uint64_t& out) {
+        if (b != 0 && a > std::numeric_limits<uint64_t>::max() / b) return false;
+        out = a * b;
+        return true;
+    };
+    uint64_t input_tasks = 0, gu_tasks = 0, middle_tasks = 0, down_tasks = 0;
+    for (int i = 0; i < n; ++i) {
+        const ExpertJobExl3& job = jobs[i];
+        const exl3::Status valid = validate_pool_exl3_job(job, exl3_row_max_rows_, exl3_row_max_hidden_, exl3_row_max_ff_);
+        if (valid != exl3::Status::ok) return valid;
+        if (!job.view.gate.is_packed() || !job.view.up.is_packed() || !job.view.down.is_packed())
+            return exl3::Status::unsupported_layout;
+        const uint64_t rows = static_cast<uint64_t>(job.rows);
+        const uint64_t ff_blocks = (static_cast<uint64_t>(job.view.gate.n) + 127u) / 128u;
+        const uint64_t hidden_blocks = (static_cast<uint64_t>(job.view.down.n) + 127u) / 128u;
+        uint64_t job_gu = 0, job_down = 0, doubled_rows = 0;
+        if (!mul_u64(rows, 2u, doubled_rows) || !mul_u64(doubled_rows, ff_blocks, job_gu) ||
+            !mul_u64(rows, hidden_blocks, job_down) || !add_u64(input_tasks, rows, input_tasks) ||
+            !add_u64(gu_tasks, job_gu, gu_tasks) || !add_u64(middle_tasks, rows, middle_tasks) ||
+            !add_u64(down_tasks, job_down, down_tasks))
+            return exl3::Status::size_overflow;
+    }
+    const uint64_t phase_max = (std::max)({input_tasks, gu_tasks, middle_tasks, down_tasks});
+    if (phase_max == 0 || phase_max > kMaxTasks || phase_max > exl3_rows_.tasks.capacity())
+        return exl3::Status::unsupported_layout;
+
+    wait_parked("before an EXL3 row batch");
+    exl3_row_jobs_ = jobs;
+    exl3_error_.store(static_cast<int>(exl3::Status::ok), std::memory_order_release);
+    auto run_tasks = [&](Exl3RowTask::Kind kind, int mode) {
+        exl3_rows_.tasks.clear();
+        for (int job_index = 0; job_index < n; ++job_index) {
+            const ExpertJobExl3& job = jobs[job_index];
+            const uint64_t blocks = kind == Exl3RowTask::Kind::down_block
+                                        ? (static_cast<uint64_t>(job.view.down.n) + 127u) / 128u
+                                        : (static_cast<uint64_t>(job.view.gate.n) + 127u) / 128u;
+            for (int64_t row = 0; row < job.rows; ++row) {
+                if (kind == Exl3RowTask::Kind::input_gate_up || kind == Exl3RowTask::Kind::silu_down_input) {
+                    exl3_rows_.tasks.push_back(
+                        Exl3RowTask{kind, static_cast<uint16_t>(job_index), static_cast<uint16_t>(row), 0});
+                } else {
+                    for (uint64_t block = 0; block < blocks; ++block) {
+                        exl3_rows_.tasks.push_back(Exl3RowTask{kind, static_cast<uint16_t>(job_index),
+                                                              static_cast<uint16_t>(row), static_cast<uint16_t>(block)});
+                        if (kind == Exl3RowTask::Kind::gate_block)
+                            exl3_rows_.tasks.push_back(Exl3RowTask{Exl3RowTask::Kind::up_block,
+                                                                  static_cast<uint16_t>(job_index),
+                                                                  static_cast<uint16_t>(row), static_cast<uint16_t>(block)});
+                    }
+                }
+            }
+        }
+        run_phase(mode, static_cast<int>(exl3_rows_.tasks.size()));
+    };
+    run_tasks(Exl3RowTask::Kind::input_gate_up, 11);
+    run_tasks(Exl3RowTask::Kind::gate_block, 12);
+    run_tasks(Exl3RowTask::Kind::silu_down_input, 13);
+    run_tasks(Exl3RowTask::Kind::down_block, 14);
+    mode_ = 0;
+    exl3_row_jobs_ = nullptr;
     hstate_.store(kIdle, std::memory_order_relaxed);
     hstate_ms_.store(now_ms(), std::memory_order_relaxed);
     return static_cast<exl3::Status>(exl3_error_.load(std::memory_order_acquire));

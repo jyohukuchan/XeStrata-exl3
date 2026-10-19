@@ -49,6 +49,18 @@ dependencies, with caller-owned scratch. CPU linear operations also avoid expand
 The CPU initializes decoded-state tables for all three codebooks once. Linear operations read F32 values preserving
 the F16 rounding boundary into a temporary 16×16 tile. Bit-width specialization avoids runtime division during state
 extraction while keeping the existing FP64 accumulation order.
+On AVX2 CPUs, mul1 packed tiles use register permutations and a small decode table.
+`STRATA_NO_EXL3_AVX2=1` restores the generic path.
+
+`STRATA_EXL3_CPU_ROWPARALLEL=1` processes CPU misses through four existing-pool phases: Hpre,
+gate/up output blocks, SiLU plus down Hpre, and down output blocks. Raw projections and batches beyond
+prepared capacity use whole-expert execution. Worker count remains configurable; check scaling on the actual model.
+`STRATA_EXL3_CPU_INTDOT=1` enables experimental mul1 integer accumulation. It quantizes the transformed input to Q8
+and corrects the Gaussian codebook affine constant, but omits the final codebook F16 rounding, so its precision
+contract differs from the default exact path. CB0/1, raw projections, unsupported CPUs, nonfinite/tiny inputs and
+K dimensions that could overflow the integer accumulator retain the exact path. Neither path expands the full
+weight matrix or increases stored bpw. Adoption requires actual-model KL and cooperative CPU/GPU decode measurements
+with these settings recorded.
 
 `ExpertView` keeps gate/up/down as three independent packed or raw projections. CPU and SYCL expert operations compute
 `down(silu(gate(x)) * up(x))` without applying a router weight.

@@ -45,6 +45,17 @@ input/output の H128、scale、bias を適用する。batched GEMM は padding 
 event 依存を受け取り、scratch は呼び出し側が確保する。CPU の linear も行列全体を展開せずに計算する。
 CPU は三つの codebook の全 state に対する復号表を一度だけ作り、linear では F16 の丸めを保った F32 値を
 16×16 の一時 tile に読み出す。bit 幅ごとの展開で state 抽出の実行時除算を避け、従来の FP64 積和順序を保つ。
+AVX2 対応 CPU では mul1 の packed tile を register permutation と小さい復号表で処理する。
+`STRATA_NO_EXL3_AVX2=1` は汎用経路へ戻す。
+
+`STRATA_EXL3_CPU_ROWPARALLEL=1` は CPU miss を Hpre、gate/up の出力 block、SiLU と down Hpre、
+down の出力 block の4段階に分け、既存 pool で処理する。raw projection と準備容量を超える batch は
+expert 単位の経路を使う。worker 数は既存の設定で選び、コア数を増やした効果は実モデルで確認する。
+`STRATA_EXL3_CPU_INTDOT=1` は実験用の mul1 整数積和を有効にする。Hpre 後の入力を Q8 にし、
+Gaussian codebook の affine 定数を補正するが、codebook の最終 F16 丸めは省略するため、既定の exact 経路と
+精度契約が異なる。CB0/1、raw、未対応 CPU、非有限・過小入力と整数 overflow の可能性がある K は exact 経路へ戻す。
+全行列の展開や保存 bpw の増加は行わない。品質と速度の採用判定には、この設定を明記した実モデルの KL と
+CPU・GPU 併用時の decode 計測が必要になる。
 
 `ExpertView` は gate/up/down の三つの packed/raw projection を独立に保持する。CPU と SYCL の expert 演算は
 `down(silu(gate(x)) * up(x))` を計算し、router weight は適用しない。

@@ -96,6 +96,7 @@ void Exl3ExpertRuntime::close() {
     pool_ = nullptr;
     n_layers_ = n_expert_ = max_tokens_ = routed_k_ = max_entries_ = hidden_ = max_ff_ = 0;
     pair_count_ = 0;
+    cpu_rowparallel_jobs_ = 0;
     scratch_elements_ = 0;
     pair_formats_.clear(); pair_format_index_.clear(); format_table_host_.clear();
     cpu_jobs_.clear(); miss_ids_.clear(); registry_.clear();
@@ -300,6 +301,27 @@ bool Exl3ExpertRuntime::open(Exl3ExpertSource& source, strata::kernels::cpu::Exp
     if (pool.prepare_exl3(1, hidden_, max_ff_) != strata::kernels::cpu::exl3::Status::ok) {
         err = "exl3 runtime: CPU pool EXL3 scratch preparation failed"; close(); return false;
     }
+    const char* rowparallel = std::getenv("STRATA_EXL3_CPU_ROWPARALLEL");
+    if (rowparallel != nullptr && rowparallel[0] == '1') {
+        // Every runtime miss entry is a one-row job. Bound the prepared job
+        // count by the largest phase rather than disabling a large window:
+        // a larger actual miss batch takes the existing whole-expert path.
+        const uint64_t ff_blocks = (static_cast<uint64_t>(max_ff_) + 127u) / 128u;
+        const uint64_t hidden_blocks = (static_cast<uint64_t>(hidden_) + 127u) / 128u;
+        const uint64_t tasks_per_job = (std::max)({2u * ff_blocks, hidden_blocks, uint64_t{1}});
+        const uint64_t bounded_jobs = static_cast<uint64_t>(strata::kernels::cpu::ExpertPool::kMaxTasks) / tasks_per_job;
+        const int64_t row_jobs = static_cast<int64_t>((std::min)(static_cast<uint64_t>(max_entries_), bounded_jobs));
+        if (row_jobs > 0) {
+            const auto row_status = pool.prepare_exl3_rowparallel(1, row_jobs, hidden_, max_ff_);
+            if (row_status == strata::kernels::cpu::exl3::Status::ok) {
+                cpu_rowparallel_jobs_ = row_jobs;
+            } else if (row_status != strata::kernels::cpu::exl3::Status::unsupported_layout) {
+                err = std::string("exl3 runtime: CPU row scratch preparation: ") +
+                      strata::kernels::cpu::exl3::status_string(row_status);
+                close(); return false;
+            }
+        }
+    }
     if (resident.size() > static_cast<size_t>(n_layers_) * static_cast<size_t>(n_expert_)) {
         err = "exl3 runtime: resident pair list is too large"; close(); return false;
     }
@@ -436,7 +458,17 @@ bool Exl3ExpertRuntime::run_cpu(std::string& err) {
     err.clear();
     if (!prepared_) { err = "exl3 runtime: prepare_window is required"; return false; }
     if (cpu_ready_) return true;
-    const auto status = pool_->run_exl3(cpu_jobs_.data(), static_cast<int>(miss_entries_));
+    using CpuStatus = strata::kernels::cpu::exl3::Status;
+    CpuStatus status;
+    if (cpu_rowparallel_jobs_ > 0 && miss_entries_ <= cpu_rowparallel_jobs_) {
+        status = pool_->run_exl3_rowparallel(cpu_jobs_.data(), static_cast<int>(miss_entries_));
+        // The packed phase API validates raw/unsupported geometry and task
+        // bounds before publishing or writing output. Other errors propagate.
+        if (status == CpuStatus::unsupported_layout)
+            status = pool_->run_exl3(cpu_jobs_.data(), static_cast<int>(miss_entries_));
+    } else {
+        status = pool_->run_exl3(cpu_jobs_.data(), static_cast<int>(miss_entries_));
+    }
     if (status != strata::kernels::cpu::exl3::Status::ok) {
         err = std::string("exl3 runtime: CPU miss run: ") + strata::kernels::cpu::exl3::status_string(status);
         return false;

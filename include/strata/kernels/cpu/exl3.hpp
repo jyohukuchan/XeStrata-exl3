@@ -62,11 +62,17 @@ Status reconstruct(const strata::kernels::exl3::MatrixView& matrix, uint16_t* va
 /// Caller-owned bounded workspace for `linear`.  `input_basis` needs k float
 /// entries and `tile` needs 256 uint16 entries.  The caller may reuse it for
 /// every token and matrix.  The buffers may alias neither one another nor y.
+struct Mul1Input;
+
 struct LinearScratch {
     float* input_basis = nullptr;
     size_t input_count = 0;
     uint16_t* tile = nullptr;
     size_t tile_count = 0;
+    // Optional experimental Q8 workspace; absent means exact F16/FP64 path.
+    int32_t* mul1_duplicated = nullptr;
+    size_t mul1_count = 0;
+    const Mul1Input* mul1_prepared = nullptr;
 };
 
 /// Number of bytes needed by a conventional contiguous scratch allocation:
@@ -83,7 +89,20 @@ size_t scratch_bytes(const strata::kernels::exl3::MatrixView& matrix);
 /// Hadamard butterflies and scale/bias operations are FP32.  W-hat values
 /// are converted from their exact decoded binary16 bits.  k and n must be
 /// positive multiples of 128 because the EXL3 transforms are H128 blocks.
+/// The explicitly enabled integer prototype uses Q8 input and pre-RNE affine
+/// CB2 weights only when optional MUL1 scratch is supplied; otherwise exact.
 Status linear(const strata::kernels::exl3::MatrixView& matrix, const float* x, float* y, LinearScratch& scratch);
+
+/// Prepare one packed projection's H128 input basis without computing a dot.  The arithmetic order matches linear().
+Status prepare_input_basis(const strata::kernels::exl3::MatrixView& matrix, const float* x, float* basis);
+
+/// Compute one 128-column packed output block from a prepared input basis.  The block includes Hpost, svh and bias.
+/// `col0` must be 128-aligned; only this block is written.  The scratch input vector is used as a local dot block.
+Status linear_output_block(const strata::kernels::exl3::MatrixView& matrix, const float* input_basis, int64_t col0,
+                           float* y, LinearScratch& scratch);
+
+/// Exact scalar SiLU and multiply used by the existing routed expert composition.
+void silu_mul_block(const float* gate, const float* up, float* out, size_t count);
 
 /// Convenience wrapper using a bounded temporary input vector and one tile;
 /// it still never materialises the full weight matrix.  Callers on a token
