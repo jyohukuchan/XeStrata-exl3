@@ -72,7 +72,10 @@ the Dense preload flag.
 With `STRATA_EXL3_WORD_TILE_PRELOAD=1`, the packed codebook 2 path selects the number of physical waves from the
 independent output tile count and the device's compute unit count and work-group capacity. Each original logical K
 partition retains its accumulation, and partials are added in the same order. A wave handling multiple logical
-partitions computes their accumulators independently, preserving FP32 addition order.
+partitions computes their accumulators independently, preserving FP32 addition order. The number of K tiles one wave
+reads is bounded to sixteen tiles (256 K elements): a wave that covers the whole K span reads its tiles one after
+the other and cannot overlap the loads, which leaves the memory latency exposed when the wave count fills the device
+once. The wave count does not change any logical partition's accumulation or the order the partials are added in.
 
 Enabled by default. Set `STRATA_EXL3_DENSE_SCHEDULE=0` to restore the previous wave layout. This does not apply to
 the wide scalar path.

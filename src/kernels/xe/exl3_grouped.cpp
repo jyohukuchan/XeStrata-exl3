@@ -117,8 +117,10 @@ inline float decode_state_f32(uint16_t state, int codebook) {
     if (codebook != 2) return f32_from_f16(decode_state(state, codebook));
     const uint32_t x = state * 0x83DCD12Du;
     const int byte_sum = cb2_byte_sum_dp4a(x);
-    const int32_t numerator = 887 * static_cast<int32_t>(byte_sum) - 452608;
-    const float value = static_cast<float>(numerator) * 0x1.0p-17f;
+    // The value is (887 * byte_sum - 452608) * 2^-17.  887 * 2^-17 and 452608 * 2^-17 are exact in F32,
+    // and for every byte sum in [0, 1020] the product and the difference are exact as well, so the FMA
+    // returns the same value as the integer numerator did, whether it is contracted or not.
+    const float value = sycl::fma(static_cast<float>(byte_sum), 887.0f * 0x1.0p-17f, -452608.0f * 0x1.0p-17f);
     uint32_t u = 0;
     std::memcpy(&u, &value, sizeof(u));
     // All byte sums give abs(value) >= 238 * 2^-17, within the finite F16 normal range.
