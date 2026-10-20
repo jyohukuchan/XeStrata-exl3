@@ -182,6 +182,30 @@ It drafts tokens with the model's MTP layer, which makes decode faster.
 For the three BETA models, the RAM is about the download plus 8 GB. With less, the experts are read from the model
 file instead of loaded into RAM, which is slower.
 
+### The EXL3 format (in development)
+
+EXL3 is exllamav3's quantization format, and **at the same size it is more accurate than I-Quant**.
+XeStrata reads it from the command line (the server path does not have it yet).
+
+- **What it reads**: an EXL3 checkpoint (a set of safetensors weights) and a metadata GGUF that carries
+  the shape only
+- **The models it covers**: the Qwen3.5 family of MoE models (AR and MTP), and Qwen3.8 Flash (AR, one token)
+- **Accuracy**: with the same source model, the same 32x1024 calibration tokens and the same six holdouts,
+  `KL(P_BF16 || P_candidate)` is 0.0090 for EXL3 at 4.5 bpw and 0.0218 for I-Quant's mixed IQ4_XS,
+  so EXL3 is 59 percent lower. The gap is larger at 2 and 3 bpw, and at 5 bpw it is 60 percent lower at
+  the same size
+- **Speed**: with every expert resident on a 32 GB GPU it reaches 95 percent of I-Quant. With an 8 GiB
+  limit and the CPU and the GPU sharing the work it reaches 73 to 85 percent. EXL3 decodes its weights with
+  more work than I-Quant does, so it does not reach the same speed
+
+```sh
+strata --exl3 /path/to/exl3-model --metadata-gguf /path/to/metadata-only.gguf \
+    --prompt-chunk 0 --spec 0 --max-t 1 --tokens 16,10,16,28 --max-new 2
+```
+
+The format, how the accuracy is measured and what the speed difference is are in
+[docs/EXL3.md](docs/EXL3.md).
+
 ## Install
 
 ### Podman
