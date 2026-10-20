@@ -58,6 +58,37 @@ uint64_t environment_cap() {
     return mib << 20;
 }
 
+/// The device's copy of a host blob: the same bytes in the canonical tile
+/// order.  A resident blob may hold the CPU block order, and the device
+/// kernels read the canonical one only.
+void copy_blob_canonical(const strata::artifact::exl3::ExpertBlob& blob, uint8_t* dst) {
+    std::memcpy(dst, blob.data(), blob.bytes());
+    if (blob.tile_order != strata::kernels::exl3::TileOrder::cpu_block) return;
+    const strata::kernels::exl3::ExpertProjectionLayout* projections[3] = {&blob.layout.gate, &blob.layout.up,
+                                                                           &blob.layout.down};
+    for (const auto* projection : projections) {
+        if (projection->storage != strata::kernels::exl3::ProjectionStorage::packed_trellis) continue;
+        if (projection->trellis.bytes == 0) continue;
+        const auto* source = reinterpret_cast<const uint16_t*>(blob.data() + projection->trellis.offset);
+        auto* destination = reinterpret_cast<uint16_t*>(dst + projection->trellis.offset);
+        strata::artifact::exl3::copy_packed_tiles(source, destination, projection->k, projection->n, projection->bits,
+                                                  strata::kernels::exl3::TileOrder::cpu_block,
+                                                  strata::kernels::exl3::TileOrder::canonical);
+    }
+}
+
+/// Whether the host cache keeps the CPU block tile order.  The switch is a
+/// diagnostic knob: with it off the host cache holds the format's own order,
+/// and every result is the same.  The order of a resident blob and the order
+/// the CPU kernels read always agree.
+bool cpu_block_order_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("STRATA_EXL3_CPU_BLOCK_ORDER");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
 }  // namespace
 
 Exl3ExpertSource::Exl3ExpertSource(std::shared_ptr<const strata::artifact::exl3::Archive> archive,
@@ -337,7 +368,11 @@ bool Exl3ExpertSource::materialize(size_t at, std::unique_ptr<strata::artifact::
     bool ok = false;
     try {
         blob = std::make_unique<strata::artifact::exl3::ExpertBlob>();
-        ok = strata::artifact::exl3::materialize_expert(*archive_, names_[at], *blob, err);
+        // The host cache keeps the CPU block order; a copy for the device keeps
+        // the format's own order, which is the one the device kernels read.
+        const auto order = (copy || !cpu_block_order_enabled()) ? strata::kernels::exl3::TileOrder::canonical
+                                                                 : strata::kernels::exl3::TileOrder::cpu_block;
+        ok = strata::artifact::exl3::materialize_expert(*archive_, names_[at], *blob, err, 8, order);
         if (ok && blob->layout.total_bytes != layouts_[at].total_bytes) {
             err = "materialized blob layout changed after metadata discovery";
             ok = false;
@@ -467,6 +502,15 @@ bool Exl3ExpertSource::transient(int64_t layer, int64_t expert) const {
     return valid_pair(layer, expert);
 }
 
+strata::kernels::exl3::TileOrder Exl3ExpertSource::exl3_tile_order(int64_t layer, int64_t expert) const {
+    std::shared_lock<std::shared_mutex> lifecycle(lifecycle_);
+    if (!valid_pair(layer, expert)) return strata::kernels::exl3::TileOrder::canonical;
+    const auto& layout = layouts_[index(layer, expert)];
+    if (!cpu_block_order_enabled()) return strata::kernels::exl3::TileOrder::canonical;
+    return strata::kernels::exl3::cpu_tile_order_applies(layout) ? strata::kernels::exl3::TileOrder::cpu_block
+                                                                 : strata::kernels::exl3::TileOrder::canonical;
+}
+
 bool Exl3ExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
     std::shared_lock<std::shared_mutex> lifecycle(lifecycle_);
     if (dst == nullptr || !valid_pair(layer, expert)) return false;
@@ -476,7 +520,7 @@ bool Exl3ExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
         ready_.wait(lock, [&] { return entries_[at].state != State::loading; });
         Entry& e = entries_[at];
         if (e.state == State::ready) {
-            std::memcpy(dst, e.blob->data(), e.blob->bytes());
+            copy_blob_canonical(*e.blob, dst);
             if (e.persistent) touch_locked(at);
             ++stats_.copy_hits;
             return true;

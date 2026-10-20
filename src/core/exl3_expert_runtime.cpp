@@ -445,7 +445,7 @@ bool Exl3ExpertRuntime::prepare_window(int64_t layer, const float* host_fp32_x, 
         const auto* layout = source_->exl3_layout(layer, expert);
         if (blob == nullptr || layout == nullptr) { err = "exl3 runtime: CPU miss source read failed"; return false; }
         auto& job = cpu_jobs_[(size_t) miss_entries_++];
-        job.view = strata::kernels::exl3::expert_view(*layout, blob);
+        job.view = strata::kernels::exl3::expert_view(*layout, blob, source_->exl3_tile_order(layer, expert));
         job.rows = 1;
         job.x = host_fp32_x + (entry / routed_k_) * ldx;
         job.ldx = ldx;

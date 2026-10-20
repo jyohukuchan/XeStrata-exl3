@@ -187,7 +187,28 @@ bool checked_storage_words(uint64_t bytes, size_t& words) {
     return true;
 }
 
+/// The packed trellis of one projection, in the given tile order.
+bool packed_tiles_supported(int64_t k, int64_t n, int bits) {
+    return k > 0 && n > 0 && k % 16 == 0 && n % 16 == 0 && bits >= 1 && bits <= 8;
+}
+
 }  // namespace
+
+void copy_packed_tiles(const uint16_t* source, uint16_t* destination, int64_t k, int64_t n, int bits,
+                        strata::kernels::exl3::TileOrder from, strata::kernels::exl3::TileOrder to) {
+    if (source == nullptr || destination == nullptr || !packed_tiles_supported(k, n, bits)) return;
+    const int64_t tiles_k = k / 16;
+    const int64_t tiles_n = n / 16;
+    const size_t words = static_cast<size_t>(16 * bits);
+    for (int64_t tile_n = 0; tile_n < tiles_n; ++tile_n) {
+        for (int64_t tile_k = 0; tile_k < tiles_k; ++tile_k) {
+            const size_t source_tile = strata::kernels::exl3::trellis_tile_index(from, tile_k, tile_n, tiles_k, tiles_n);
+            const size_t destination_tile =
+                strata::kernels::exl3::trellis_tile_index(to, tile_k, tile_n, tiles_k, tiles_n);
+            std::memcpy(destination + destination_tile * words, source + source_tile * words, words * sizeof(uint16_t));
+        }
+    }
+}
 
 bool describe_expert(const Archive& archive, const ExpertTensorNames& names,
                      strata::kernels::exl3::ExpertBlobLayout& layout, std::string& err, size_t alignment) {
@@ -234,9 +255,13 @@ bool describe_expert(const Archive& archive, const ExpertTensorNames& names,
 }
 
 bool materialize_expert(const Archive& archive, const ExpertTensorNames& names, ExpertBlob& output, std::string& err,
-                        size_t alignment) {
+                        size_t alignment, strata::kernels::exl3::TileOrder order) {
     strata::kernels::exl3::ExpertBlobLayout metadata;
     if (!describe_expert(archive, names, metadata, err, alignment)) return false;
+    // The CPU block order is applied only where it is defined; every other
+    // expert keeps the format's own order.
+    const bool cpu_order = order == strata::kernels::exl3::TileOrder::cpu_block &&
+                           strata::kernels::exl3::cpu_tile_order_applies(metadata);
     try {
         ResolvedProjection resolved[3];
         const std::string role_names[3] = {names.gate, names.up, names.down};
@@ -246,6 +271,8 @@ bool materialize_expert(const Archive& archive, const ExpertTensorNames& names, 
 
         ExpertBlob result;
         result.layout = metadata;
+        result.tile_order = cpu_order ? strata::kernels::exl3::TileOrder::cpu_block
+                                      : strata::kernels::exl3::TileOrder::canonical;
         size_t words = 0;
         if (!checked_storage_words(metadata.total_bytes, words))
             throw std::runtime_error("expert blob size cannot be represented by aligned storage");
@@ -260,7 +287,17 @@ bool materialize_expert(const Archive& archive, const ExpertTensorNames& names, 
                     matrix.svh.size() * sizeof(uint16_t) != layouts[i]->svh.bytes ||
                     matrix.bias.size() * sizeof(uint16_t) != layouts[i]->bias.bytes)
                     throw std::runtime_error("materialized packed component size differs from metadata layout");
-                copy_bytes(result.storage, layouts[i]->trellis, matrix.trellis.data(), layouts[i]->trellis.bytes);
+                if (cpu_order) {
+                    // The same bytes, in the CPU block order: the tiles of one
+                    // 128-output block become adjacent.
+                    auto* base = reinterpret_cast<uint8_t*>(result.storage.data());
+                    copy_packed_tiles(matrix.trellis.data(),
+                                      reinterpret_cast<uint16_t*>(base + layouts[i]->trellis.offset), layouts[i]->k,
+                                      layouts[i]->n, layouts[i]->bits, strata::kernels::exl3::TileOrder::canonical,
+                                      strata::kernels::exl3::TileOrder::cpu_block);
+                } else {
+                    copy_bytes(result.storage, layouts[i]->trellis, matrix.trellis.data(), layouts[i]->trellis.bytes);
+                }
                 copy_bytes(result.storage, layouts[i]->suh, matrix.suh.data(), layouts[i]->suh.bytes);
                 copy_bytes(result.storage, layouts[i]->svh, matrix.svh.data(), layouts[i]->svh.bytes);
                 copy_bytes(result.storage, layouts[i]->bias, matrix.bias.data(), layouts[i]->bias.bytes);

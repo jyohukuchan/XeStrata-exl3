@@ -244,8 +244,8 @@ void decode_tile_f32_hot_bits(const MatrixView& matrix, int64_t tile_k, int64_t 
     constexpr size_t words32_count = static_cast<size_t>(Bits) * 8;
     const int64_t tiles_n = matrix.n / kTileSide;
     const size_t packed_size = static_cast<size_t>(16 * Bits);
-    const size_t tile_index = static_cast<size_t>(tile_k) * static_cast<size_t>(tiles_n) +
-                              static_cast<size_t>(tile_n);
+    const size_t tile_index = strata::kernels::exl3::trellis_tile_index(matrix.tile_order, tile_k, tile_n,
+                                                                         matrix.k / kTileSide, tiles_n);
     const uint16_t* packed = matrix.trellis + tile_index * packed_size;
     for (int state = 0; state < kTileValues; ++state) {
         const int b0 = state * Bits + Bits - 16 + 256 * Bits;
@@ -346,8 +346,8 @@ EXL3_TARGET_AVX2 void decode_tile_f32_hot_bits_avx2_cb2(const MatrixView& matrix
                                                         int64_t tile_n, float* values) {
     const int64_t tiles_n = matrix.n / kTileSide;
     const size_t packed_size = static_cast<size_t>(16 * Bits);
-    const size_t tile_index = static_cast<size_t>(tile_k) * static_cast<size_t>(tiles_n) +
-                              static_cast<size_t>(tile_n);
+    const size_t tile_index = strata::kernels::exl3::trellis_tile_index(matrix.tile_order, tile_k, tile_n,
+                                                                         matrix.k / kTileSide, tiles_n);
     const uint16_t* packed = matrix.trellis + tile_index * packed_size;
     const size_t words32_count = static_cast<size_t>(Bits) * 8;
     alignas(32) uint32_t staged[64 + 3];
@@ -610,7 +610,8 @@ Status decode_tile(const MatrixView& matrix, int64_t tile_k, int64_t tile_n, uin
     const int64_t tiles_n = matrix.n / kTileSide;
     if (tile_k < 0 || tile_k >= tiles_k || tile_n < 0 || tile_n >= tiles_n) return Status::invalid_argument;
     const size_t packed_size = static_cast<size_t>(16 * matrix.bits);
-    size_t tile_index = static_cast<size_t>(tile_k) * static_cast<size_t>(tiles_n) + static_cast<size_t>(tile_n);
+    const size_t tile_index = strata::kernels::exl3::trellis_tile_index(matrix.tile_order, tile_k, tile_n, tiles_k,
+                                                                         tiles_n);
     const uint16_t* packed = matrix.trellis + tile_index * packed_size;
     std::array<uint16_t, kTileValues> states{};
     const Status state_status = unpack_trellis_states(packed, matrix.bits, states.data(), states.size());

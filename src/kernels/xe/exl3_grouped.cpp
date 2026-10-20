@@ -369,6 +369,9 @@ inline ProjectionView matrix_from_layout(const ExpertProjectionLayout& p, const 
     view.n = p.n;
     view.bits = p.bits;
     view.codebook = p.codebook;
+    // The device blob is the canonical one: the CPU block order never reaches
+    // the device, so the tile order stays the format's own.
+    view.tile_order = TileOrder::canonical;
     return ProjectionView(view);
 }
 

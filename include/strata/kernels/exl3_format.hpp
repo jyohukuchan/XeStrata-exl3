@@ -5,9 +5,40 @@
 // EXL3 packed tiles follow exllamav3's MIT-licensed trellis storage rules.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 namespace strata::kernels::exl3 {
+
+/// The order of the compressed 16x16 tiles inside a packed projection's trellis.
+///
+/// `canonical` is the format's own order: the tile (tile_k, tile_n) sits at
+/// `tile_k * n_tiles + tile_n`.  It is the only order the device kernels read.
+///
+/// `cpu_block` reorders whole tiles so that the tiles of one 128-output block
+/// are adjacent: the tile (tile_k, tile_n) sits at
+/// `(n_tile / B) * k_tiles * B + tile_k * B + n_tile % B` with B = 128 / 16.
+/// Only the order of whole tiles changes; the packed bits inside a tile, the
+/// scales, the bias and the arithmetic do not.  The CPU reads this order, and a
+/// blob that carries it is identified by the descriptor, never by guessing.
+enum class TileOrder : uint8_t {
+    canonical = 0,
+    cpu_block = 1,
+};
+
+/// The number of 16-wide tiles one 128-output block covers.  128 outputs are
+/// the unit of the H128 transform, so a task never covers less than one block.
+constexpr int64_t kTileBlock = 128 / 16;
+
+/// The index of the tile (tile_k, tile_n) inside a trellis of the given order.
+/// `tiles_k` and `tiles_n` are the tile counts of the projection.
+constexpr size_t trellis_tile_index(TileOrder order, int64_t tile_k, int64_t tile_n, int64_t tiles_k,
+                                    int64_t tiles_n) {
+    if (order == TileOrder::cpu_block)
+        return static_cast<size_t>((tile_n / kTileBlock) * tiles_k * kTileBlock + tile_k * kTileBlock +
+                                    tile_n % kTileBlock);
+    return static_cast<size_t>(tile_k * tiles_n + tile_n);
+}
 
 /// All half-valued buffers contain IEEE binary16 bits. The pointers may refer to
 /// host memory (CPU routines) or device memory (SYCL routines), respectively.
@@ -21,6 +52,9 @@ struct MatrixView {
     int64_t n = 0;
     int bits = 0;
     int codebook = 0;  // 0: legacy/default, 1: mcg, 2: mul1
+    /// The order of the compressed tiles in `trellis`.  The device kernels
+    /// accept the canonical order only; the CPU kernels read either.
+    TileOrder tile_order = TileOrder::canonical;
 };
 
 /// Matrix offset inside a 16x16 tile for one of its 256 trellis states.

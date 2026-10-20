@@ -50,11 +50,13 @@ std::vector<uint8_t> u32(uint32_t v) {
             static_cast<uint8_t>(v >> 24)};
 }
 
-void add_linear(std::vector<Tensor>& tensors, const std::string& name, int bits, int codebook) {
-    tensors.emplace_back(name + ".trellis", "I16", std::vector<uint64_t>{8, 8, static_cast<uint64_t>(16 * bits)},
-                         words(static_cast<size_t>(8 * 8 * 16 * bits), static_cast<uint16_t>(bits * 19)));
-    tensors.emplace_back(name + ".suh", "F16", std::vector<uint64_t>{128}, words(128, 0x3c00));
-    tensors.emplace_back(name + ".svh", "F16", std::vector<uint64_t>{128}, words(128, 0x3c00));
+void add_linear(std::vector<Tensor>& tensors, const std::string& name, int bits, int codebook, uint64_t tiles_k = 8,
+                uint64_t tiles_n = 8) {
+    tensors.emplace_back(name + ".trellis", "I16",
+                         std::vector<uint64_t>{tiles_k, tiles_n, static_cast<uint64_t>(16 * bits)},
+                         words(static_cast<size_t>(tiles_k * tiles_n * 16 * bits), static_cast<uint16_t>(bits * 19)));
+    tensors.emplace_back(name + ".suh", "F16", std::vector<uint64_t>{tiles_k * 16}, words(tiles_k * 16, 0x3c00));
+    tensors.emplace_back(name + ".svh", "F16", std::vector<uint64_t>{tiles_n * 16}, words(tiles_n * 16, 0x3c00));
     if (codebook == 1) tensors.emplace_back(name + ".mcg", "U32", std::vector<uint64_t>{}, u32(0xCBAC1FEDu));
     if (codebook == 2) tensors.emplace_back(name + ".mul1", "I32", std::vector<uint64_t>{1}, u32(0x83DCD12Du));
 }
@@ -71,9 +73,14 @@ void write_archive(const std::filesystem::path& root,
             const int bits = 2 + ((layer * 2 + expert) % 4);
             // Each selected resident expert has its own shard; both CPU-miss experts share the third shard.
             auto& shard = shards[expert == 0 ? layer : 2];
-            add_linear(shard, base + ".gate", bits, layer % 3);
-            add_linear(shard, base + ".up", 2 + ((bits + 1) % 4), (layer + expert + 1) % 3);
-            add_linear(shard, base + ".down", 2 + ((bits + 2) % 4), (layer + expert + 2) % 3);
+            // The resident experts and one CPU-miss expert are MUL1 in all three projections, and their output
+            // width covers two 128-column blocks: the host cache keeps the CPU block tile order for them, and
+            // the device keeps the format's own order.  The last expert keeps the mixed codebooks.
+            const bool mul1 = expert == 0 || (layer == 0 && expert == 1);
+            add_linear(shard, base + ".gate", bits, mul1 ? 2 : layer % 3, 8, mul1 ? 16 : 8);
+            add_linear(shard, base + ".up", 2 + ((bits + 1) % 4), mul1 ? 2 : (layer + expert + 1) % 3, 8, mul1 ? 16 : 8);
+            add_linear(shard, base + ".down", 2 + ((bits + 2) % 4), mul1 ? 2 : (layer + expert + 2) % 3, mul1 ? 16 : 8,
+                       8);
         }
     Json index;
     index["weight_map"] = Json::object();

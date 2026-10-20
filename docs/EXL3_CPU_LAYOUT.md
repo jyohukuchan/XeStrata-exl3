@@ -3,7 +3,7 @@
 
 # EXL3 CPU optimization candidates
 
-Design notes from investigating the CPU path during hybrid CPU/GPU execution. The weight-layout change below is a diagnostic prototype; it is not integrated into the normal runtime. GPU kernels, the on-disk EXL3 format, and quantization precision stay the same.
+Design notes from investigating the CPU path during hybrid CPU/GPU execution. The weight-layout change below is integrated into the normal runtime's CPU-side cache. GPU kernels, the on-disk EXL3 format, and quantization precision stay the same.
 
 ## Packed weight layout
 
@@ -34,7 +34,7 @@ See the repository's `LOCAL.md` for the environment and model locations. Measure
 
 The layout change reduced CPU48 sweep time by about 39%. All 200 experts' outputs were finite and bit-identical to canonical. Choosing workers using only a repeated single layer can reverse the trend seen in a sweep. Worker counts also need reevaluation after changing layout.
 
-This difference demonstrates room to improve cache behavior and access order. It does not establish whether pure DRAM bandwidth or arithmetic instructions are the ultimate limit.
+This difference demonstrates room to improve cache behavior and access order. It does not establish whether pure DRAM bandwidth or arithmetic instructions are the ultimate limit. This table is kept as the prototype's record; the measurement after the integration is in "CPU-only measurement after the integration".
 
 ## Hybrid decode check
 
@@ -63,6 +63,34 @@ The prototype supports only the CPU CB2 integer dot path and explicitly stops if
 - Compare logits and speed in hybrid decode with the same expert placement, beyond standalone CPU equality.
 
 The prototype's standalone speed therefore does not describe an improvement already available in the normal runtime.
+
+## Integration into the normal runtime
+
+The layout is identified by a `TileOrder` enumeration. `canonical` is EXL3's own order, `cpu_block` is the CPU order above. The CPU kernels read either; the GPU kernels accept `canonical` only and throw otherwise. The value is a property of a host blob: it appears neither in the on-disk format nor in the format descriptor handed to the device.
+
+- It applies to an expert whose three projections are all MUL1 (codebook 2) packed trellis with an output width that is a multiple of 128. CB0/1, raw projections, mixed formats and widths outside that range keep `canonical` and the existing path.
+- With the integer dot disabled, and with a non-finite or tiny input that sends the work back to the exact path, the same tiles are read, following that blob's `TileOrder`. Only the order of the tiles differs, so the results stay bit identical.
+- The CPU cache holds `cpu_block`. What the GPU receives is the byte sequence in the canonical order, so the device reads the order it always read. The admission of a GPU-resident expert into the cache and a re-layout out of the cache both go through that path.
+- The order is a property of the blob and does not change across cache eviction, re-materialization, multiple tokens or multiple stages. A re-materialized expert gets the same order.
+- The condition that 128 outputs are the unit of the Hadamard transform is unchanged. A task is never split below 128 outputs.
+- `STRATA_EXL3_CPU_BLOCK_ORDER=0` restores the previous order. Switching the order does not change any result.
+
+## CPU-only measurement after the integration
+
+The same weights (H=2048, FF=512, rows=1, five experts per batch), a sweep of 40 layers of five experts, two warmup passes and 20 measured passes; the value is the median time per layer, over five repeats. The host was shared with other work.
+
+| Condition | Workers | Canonical µs | CPU layout µs | Difference |
+| --- | ---: | ---: | ---: | ---: |
+| Integer dot on | 24 | 335.1 | 244.2 | -27.1% |
+| Integer dot on | 48 | 320.6 | 256.4 | -20.0% |
+| Integer dot off (exact path) | 24 | 2360.5 | 2301.8 | -2.5% |
+| Integer dot off (exact path) | 48 | 1667.7 | 1467.3 | -12.0% |
+
+The 48-worker measurements carry the host's noise. Nine repeats of the exact path with 48 workers give 1310.9 to 1754.0µs for canonical and 1263.8 to 1600.1µs for the CPU order; comparing the best cases only, the difference is 3.6%, close to the 2.5% of 24 workers. The integer dot with 48 workers falls from 298.4µs to 220.4µs at the best cases, likewise about 26%.
+
+The layout change helps the integer dot path much and the exact path little. The exact path decodes each tile to F32 and adds in FP64, so arithmetic rather than memory layout dominates there. Materializing 200 experts (355MB) took 336.1ms in canonical order and 349.6ms in the CPU order: the reordering costs about 68µs per expert (about 4%).
+
+The measurement was CPU only. The maintainer runs the GPU decode measurements.
 
 ## Capacity checks and worker settings
 

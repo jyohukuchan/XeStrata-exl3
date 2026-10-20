@@ -82,6 +82,10 @@ public:
     bool transient(int64_t layer, int64_t expert) const override;
     bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst) override;
     const strata::kernels::exl3::ExpertBlobLayout* exl3_layout(int64_t layer, int64_t expert) const override;
+    /// The order of the compressed tiles in the host cache's blobs.  The CPU
+    /// kernels need it to read the right tiles; the device never sees it,
+    /// because copy_blob() hands out the canonical order.
+    strata::kernels::exl3::TileOrder exl3_tile_order(int64_t layer, int64_t expert) const override;
     void begin_layer(int64_t layer, const int32_t* ids, int64_t k) override;
     int64_t reads() const override { return reads_.load(std::memory_order_relaxed); }
     CacheStats cache_stats() const;
