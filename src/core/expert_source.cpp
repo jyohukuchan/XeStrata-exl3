@@ -2210,7 +2210,8 @@ void dispatch_exl3_cpu(ExpertDispatch& d, const float* x, const int32_t* ids, in
         for (int64_t previous = 0; previous < i; ++previous) seen |= ids[previous] == expert;
         distinct += !seen;
         ExpertJobExl3& job = d.jobs_exl3[(size_t) i];
-        job.view = strata::kernels::exl3::expert_view(*d.src->exl3_layout(d.layers, expert), blob);
+        job.view = strata::kernels::exl3::expert_view(*d.src->exl3_layout(d.layers, expert), blob,
+                                                        d.src->exl3_tile_order(d.layers, expert));
         job.rows = 1;
         job.x = x + (size_t) (i / k) * (size_t) width;
         job.ldx = width;

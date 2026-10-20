@@ -33,6 +33,11 @@ inline int cb2_byte_sum_dp4a(uint32_t x) {
 
 inline void check_view(const MatrixView& view, const char* who) {
     if (view.trellis == nullptr) throw std::invalid_argument(std::string(who) + ": trellis is null");
+    // The device reads the format's own tile order only.  The CPU block order
+    // is a host-side arrangement, so a view that carries it must never reach
+    // a device kernel.
+    if (view.tile_order != TileOrder::canonical)
+        throw std::invalid_argument(std::string(who) + ": the device reads the canonical tile order only");
     if (view.k <= 0 || view.n <= 0) throw std::invalid_argument(std::string(who) + ": dimensions must be positive");
     if (view.k % 16 != 0 || view.n % 16 != 0)
         throw std::invalid_argument(std::string(who) + ": k and n must be multiples of 16");

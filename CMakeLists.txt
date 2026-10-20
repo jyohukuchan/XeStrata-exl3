@@ -1055,6 +1055,19 @@ if(STRATA_BUILD_TESTS)
     add_test(NAME exl3_cpu_parity COMMAND exl3_cpu_parity ${_strata_exl3_fixture})
     set_tests_properties(exl3_cpu_parity PROPERTIES TIMEOUT 120)
   endif()
+  # The CPU block tile order against the format's own order: the same bytes,
+  # bit identical results.  The second entry runs the integer dot as well.
+  add_executable(exl3_cpu_layout_parity src/kernels/cpu/exl3_layout_parity.cpp)
+  target_link_libraries(exl3_cpu_layout_parity PRIVATE strata_kernels_cpu strata_exl3_expert_artifact strata_warnings)
+  target_compile_options(exl3_cpu_layout_parity PRIVATE -fno-fast-math -ffp-contract=off)
+  add_test(NAME exl3_cpu_layout_parity COMMAND exl3_cpu_layout_parity)
+  set_tests_properties(exl3_cpu_layout_parity PROPERTIES TIMEOUT 120)
+  add_executable(exl3_cpu_layout_intdot_parity src/kernels/cpu/exl3_layout_parity.cpp)
+  target_link_libraries(exl3_cpu_layout_intdot_parity PRIVATE strata_kernels_cpu strata_exl3_expert_artifact
+                        strata_warnings)
+  target_compile_options(exl3_cpu_layout_intdot_parity PRIVATE -fno-fast-math -ffp-contract=off)
+  add_test(NAME exl3_cpu_layout_intdot_parity COMMAND exl3_cpu_layout_intdot_parity)
+  set_tests_properties(exl3_cpu_layout_intdot_parity PROPERTIES ENVIRONMENT "STRATA_EXL3_CPU_INTDOT=1" TIMEOUT 120)
 endif()
 # Plan v0.3 P6: only the kernel files get the AVX-512 / AVX2 flags; the pool and the probe run on any x86-64,
 # and the engine picks the kernels at run time (cpu_avx512_ok).

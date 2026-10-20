@@ -212,6 +212,12 @@ public:
     virtual const strata::kernels::exl3::ExpertBlobLayout* exl3_layout(int64_t layer, int64_t expert) const {
         (void) layer; (void) expert; return nullptr;
     }
+    /// The order of the compressed tiles in an EXL3 source's host blobs.  The
+    /// CPU kernels need it to read the right tiles; a source without a packed
+    /// trellis answers the format's own (canonical) order.
+    virtual strata::kernels::exl3::TileOrder exl3_tile_order(int64_t layer, int64_t expert) const {
+        (void) layer; (void) expert; return strata::kernels::exl3::TileOrder::canonical;
+    }
     /// Asks the OS for these pairs' bytes ahead of the `blob` calls that read them.  False (nothing asked) by default.
     virtual bool advise_pairs(const std::pair<int32_t, int32_t>* pairs, int64_t n) const {
         (void) pairs; (void) n; return false;

@@ -48,11 +48,13 @@ std::vector<uint8_t> u32(uint32_t v) {
     return {static_cast<uint8_t>(v), static_cast<uint8_t>(v >> 8), static_cast<uint8_t>(v >> 16), static_cast<uint8_t>(v >> 24)};
 }
 
-void add_linear(std::vector<Tensor>& tensors, const std::string& name, int bits, int codebook) {
-    tensors.emplace_back(name + ".trellis", "I16", std::vector<uint64_t>{8, 8, static_cast<uint64_t>(16 * bits)},
-                         words(static_cast<size_t>(8 * 8 * 16 * bits), static_cast<uint16_t>(bits * 19)));
-    tensors.emplace_back(name + ".suh", "F16", std::vector<uint64_t>{128}, words(128, 0x3c00));  // codespell:ignore suh
-    tensors.emplace_back(name + ".svh", "F16", std::vector<uint64_t>{128}, words(128, 0x3c00));
+void add_linear(std::vector<Tensor>& tensors, const std::string& name, int bits, int codebook, uint64_t tiles_k = 8,
+                uint64_t tiles_n = 8) {
+    tensors.emplace_back(name + ".trellis", "I16",
+                         std::vector<uint64_t>{tiles_k, tiles_n, static_cast<uint64_t>(16 * bits)},
+                         words(static_cast<size_t>(tiles_k * tiles_n * 16 * bits), static_cast<uint16_t>(bits * 19)));
+    tensors.emplace_back(name + ".suh", "F16", std::vector<uint64_t>{tiles_k * 16}, words(tiles_k * 16, 0x3c00));  // codespell:ignore suh
+    tensors.emplace_back(name + ".svh", "F16", std::vector<uint64_t>{tiles_n * 16}, words(tiles_n * 16, 0x3c00));
     if (codebook == 1) tensors.emplace_back(name + ".mcg", "U32", std::vector<uint64_t>{}, u32(0xCBAC1FEDu));
     if (codebook == 2) tensors.emplace_back(name + ".mul1", "I32", std::vector<uint64_t>{1}, u32(0x83DCD12Du));
 }
@@ -66,12 +68,18 @@ void write_archive(const std::filesystem::path& root, std::vector<strata::artifa
             const std::string base = "layers." + std::to_string(layer) + ".experts." + std::to_string(expert);
             names.push_back({base + ".gate", base + ".up", base + ".down"});
             const int bits = 2 + ((layer * 2 + expert) % 4);
+            // One expert is MUL1 in all three projections, and its output width
+            // covers two 128-column blocks: the CPU block tile order applies to
+            // it, and to no other.
+            const bool mul1 = layer == 1 && expert == 0;
             if (layer == 1 && expert == 1)
                 tensors.emplace_back(base + ".gate.weight", "BF16", std::vector<uint64_t>{128, 128},
                                      words(128 * 128, 0x3f80));
-            else add_linear(tensors, base + ".gate", bits, layer % 3);
-            add_linear(tensors, base + ".up", 2 + ((bits + 1) % 4), (layer + expert + 1) % 3);
-            add_linear(tensors, base + ".down", 2 + ((bits + 2) % 4), (layer + expert + 2) % 3);
+            else add_linear(tensors, base + ".gate", bits, mul1 ? 2 : layer % 3, 8, mul1 ? 16 : 8);
+            add_linear(tensors, base + ".up", 2 + ((bits + 1) % 4), mul1 ? 2 : (layer + expert + 1) % 3, 8,
+                       mul1 ? 16 : 8);
+            add_linear(tensors, base + ".down", 2 + ((bits + 2) % 4), mul1 ? 2 : (layer + expert + 2) % 3, mul1 ? 16 : 8,
+                       8);
         }
     Json header = Json::object();
     uint64_t offset = 0;
@@ -131,6 +139,58 @@ int main() {
           "failed payload read leaves the window unpublished after file recovery");
     source.begin_layer(1, ids, 2);
     check(source.blob(1, 0) != nullptr && source.blob(1, 1) != nullptr, "second layer materializes independently");
+
+    // The CPU block tile order: the host cache keeps it, the device's copy
+    // keeps the format's own order, and the CPU's results do not change.
+    {
+        using TileOrder = strata::kernels::exl3::TileOrder;
+        check(source.exl3_tile_order(1, 0) == TileOrder::cpu_block && source.exl3_tile_order(0, 0) == TileOrder::canonical &&
+                  source.exl3_tile_order(1, 1) == TileOrder::canonical,
+              "only an all-MUL1 expert uses the CPU block order");
+        const auto* ordered_layout = source.exl3_layout(1, 0);
+        const uint8_t* resident = source.blob(1, 0);
+        strata::artifact::exl3::ExpertBlob canonical_blob;
+        std::string materialize_error;
+        const bool materialized = strata::artifact::exl3::materialize_expert(
+            *archive, names[2], canonical_blob, materialize_error, 8, TileOrder::canonical);
+        std::vector<uint8_t> copied(static_cast<size_t>(ordered_layout->total_bytes));
+        const bool copied_ok = source.copy_blob(1, 0, copied.data());
+        check(materialized && copied_ok && canonical_blob.bytes() == copied.size() &&
+                  std::memcmp(canonical_blob.data(), copied.data(), copied.size()) == 0,
+              "copy_blob hands out the canonical bytes of a CPU-ordered expert");
+        bool trellis_differs = false;
+        bool other_bytes_equal = true;
+        for (const auto* projection : {&ordered_layout->gate, &ordered_layout->up, &ordered_layout->down}) {
+            if (resident == nullptr) break;
+            if (std::memcmp(resident + projection->trellis.offset, canonical_blob.data() + projection->trellis.offset,
+                            static_cast<size_t>(projection->trellis.bytes)) != 0)
+                trellis_differs = true;
+            for (const auto& component : {&projection->suh, &projection->svh, &projection->bias}) {
+                if (component->bytes == 0) continue;
+                if (std::memcmp(resident + component->offset, canonical_blob.data() + component->offset,
+                                static_cast<size_t>(component->bytes)) != 0)
+                    other_bytes_equal = false;
+            }
+        }
+        check(resident != nullptr && trellis_differs && other_bytes_equal,
+              "the host cache holds the CPU block order and the same other bytes");
+        // The CPU reads its own order and gets the same result as the
+        // canonical order.
+        const auto canonical_view = strata::kernels::exl3::expert_view(*ordered_layout, canonical_blob.data(),
+                                                                       TileOrder::canonical);
+        const auto ordered_view = strata::kernels::exl3::expert_view(*ordered_layout, resident, TileOrder::cpu_block);
+        std::vector<float> input(128);
+        for (size_t i = 0; i < input.size(); ++i) input[i] = 0.03125f * static_cast<float>(static_cast<int>(i % 23) - 11);
+        std::vector<float> canonical_output(128), ordered_output(128);
+        const auto canonical_status = strata::kernels::cpu::exl3::expert(canonical_view, input.data(), 128,
+                                                                          canonical_output.data(), 128, 1);
+        const auto ordered_status = strata::kernels::cpu::exl3::expert(ordered_view, input.data(), 128,
+                                                                        ordered_output.data(), 128, 1);
+        check(canonical_status == strata::kernels::cpu::exl3::Status::ok &&
+                  ordered_status == strata::kernels::cpu::exl3::Status::ok &&
+                  std::memcmp(canonical_output.data(), ordered_output.data(), canonical_output.size() * sizeof(float)) == 0,
+              "the CPU block order gives the same expert output");
+    }
     std::string err;
     auto bad_names = names;
     bad_names.pop_back();
@@ -396,6 +456,40 @@ int main() {
           "actual EXL3 dispatch advances layer and counters");
     check(std::memcmp(dispatch_expected.data(), dispatch_actual.data(), dispatch_actual.size() * sizeof(float)) == 0,
           "actual EXL3 dispatch matches standalone rows");
+
+    // The same boundary with a CPU-ordered expert: the dispatch reads the host
+    // cache's order, and the result is the canonical one.
+    {
+        const auto* ordered_layout = source.exl3_layout(1, 0);
+        std::vector<uint8_t> ordered_copy(static_cast<size_t>(ordered_layout->total_bytes));
+        const bool copied = source.copy_blob(1, 0, ordered_copy.data());
+        const auto canonical_view = strata::kernels::exl3::expert_view(
+            *ordered_layout, ordered_copy.data(), strata::kernels::exl3::TileOrder::canonical);
+        const int32_t ordered_ids[] = {0, 0};
+        std::vector<float> ordered_expected(2 * dispatch_hidden, -1234.0f);
+        std::vector<float> ordered_actual(2 * dispatch_hidden, -1234.0f);
+        bool ordered_ok = copied;
+        for (int64_t entry = 0; entry < 2 && ordered_ok; ++entry)
+            ordered_ok = strata::kernels::cpu::exl3::expert(canonical_view, dispatch_input.data(), dispatch_ldx,
+                                                            ordered_expected.data() + entry * dispatch_hidden,
+                                                            dispatch_hidden, 1) ==
+                         strata::kernels::cpu::exl3::Status::ok;
+        strata::core::ExpertDispatch ordered_dispatch;
+        strata::kernels::cpu::ExpertPool ordered_pool(1, false, false);
+        // The CPU-ordered expert's feed-forward width is 256.
+        const bool ordered_prepared =
+            ordered_pool.prepare_exl3(1, dispatch_hidden, 256) == strata::kernels::cpu::exl3::Status::ok;
+        ordered_dispatch.pool = &ordered_pool;
+        ordered_dispatch.src = &source;
+        ordered_dispatch.n_expert = 2;
+        ordered_dispatch.layers = 1;
+        strata::core::expert_pool_dispatch_multi(ordered_dispatch, dispatch_input.data(), ordered_ids, 1, 2,
+                                                 ordered_actual.data());
+        check(ordered_ok && ordered_prepared && !ordered_dispatch.failed &&
+                  std::memcmp(ordered_expected.data(), ordered_actual.data(),
+                              ordered_actual.size() * sizeof(float)) == 0,
+              "the dispatch of a CPU-ordered expert matches the canonical rows");
+    }
 
     strata::core::ExpertDispatch invalid_dispatch;
     invalid_dispatch.pool = &dispatch_pool;
