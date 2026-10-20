@@ -15,6 +15,7 @@
 #include <mutex>
 #include <shared_mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace strata::core {
@@ -64,6 +65,15 @@ public:
         uint64_t admission_bytes = 0;
     };
 
+    /// The files the capacity check reads: the host's RAM, its cgroup list and the cgroup tree.  The
+    /// defaults are the real ones; a test points them at a fixture, the way host_available_memory's own
+    /// parameters do.
+    struct CapacityFiles {
+        std::string meminfo = "/proc/meminfo";
+        std::string self_cgroup = "/proc/self/cgroup";
+        std::string cgroup_root = "/sys/fs/cgroup";
+    };
+
     Exl3ExpertSource() = default;
     Exl3ExpertSource(std::shared_ptr<const strata::artifact::exl3::Archive> archive, int64_t n_layers,
                      int64_t n_expert, Names names);
@@ -82,6 +92,10 @@ public:
     bool transient(int64_t layer, int64_t expert) const override;
     bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst) override;
     const strata::kernels::exl3::ExpertBlobLayout* exl3_layout(int64_t layer, int64_t expert) const override;
+    /// The order of the compressed tiles in the host cache's blobs.  The CPU
+    /// kernels need it to read the right tiles; the device never sees it,
+    /// because copy_blob() hands out the canonical order.
+    strata::kernels::exl3::TileOrder exl3_tile_order(int64_t layer, int64_t expert) const override;
     void begin_layer(int64_t layer, const int32_t* ids, int64_t k) override;
     int64_t reads() const override { return reads_.load(std::memory_order_relaxed); }
     CacheStats cache_stats() const;
@@ -94,6 +108,9 @@ public:
     /// memory pressure/I/O failure), and explains why; no active window changes.
     /// STRATA_EXL3_SOURCE_PREWARM=0 disables the optional preload.
     bool prewarm_cpu(const std::vector<uint8_t>& excluded, PrewarmResult& result, std::string& why);
+
+    /// Point the capacity check at other files.  Set it before open(), which reads the host's room.
+    void set_capacity_files(CapacityFiles files) { capacity_files_ = std::move(files); }
 
     const std::string& last_error() const { return failure_; }
     int64_t n_layers() const { return n_layers_; }
@@ -124,6 +141,11 @@ private:
     void unlink_locked(size_t at);
     bool evict_one_locked();
     void refresh_capacity_locked(bool evict = true);
+    /// The bytes the source may still admit: the slack of the budget the last reading of the host's room
+    /// gave.  Zero when the room could not be read: the source then admits nothing.
+    uint64_t admission_headroom_locked() const {
+        return stats_.admission_bytes > stats_.resident_bytes ? stats_.admission_bytes - stats_.resident_bytes : 0;
+    }
 
     std::shared_ptr<const strata::artifact::exl3::Archive> archive_;
     int64_t n_layers_ = 0;
@@ -143,6 +165,15 @@ private:
     CacheStats stats_;
     uint64_t maximum_blob_bytes_ = 0;
     uint64_t startup_capacity_bytes_ = 0;
+    /// True when the room was read again for the shortage at hand: a reading that did not give the room is
+    /// not repeated for every blob that does not fit.
+    bool room_reread_ = false;
+    /// The layer of the last window, and whether there was one.  The layers are visited in order, so a
+    /// layer that is not the successor of the last one starts a new pass over them.
+    int64_t last_layer_ = -1;
+    bool layer_known_ = false;
+    /// The files the capacity check reads.
+    CapacityFiles capacity_files_;
     size_t newest_ = kNone;
     size_t oldest_ = kNone;
     int64_t active_layer_ = -1;

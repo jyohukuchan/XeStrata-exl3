@@ -477,6 +477,7 @@ if(STRATA_ENABLE_XE)
   # ---- strata_engine (P2.S5): the composed layer, the session loop, the expert sources and caches, the
   # verify window and the MTP drafter.  Host code over strata_core's GPU operations (strata/core/gpu.hpp).
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp
+                                   src/core/host_memory_probe.cpp
                                    src/core/remote_experts.cpp src/core/expert_cache.cpp src/core/native_head.cpp
                                    src/core/native_dense.cpp src/core/exl3_dense.cpp
                                    src/core/exl3_weight_set.cpp src/core/exl3_ple.cpp
@@ -536,6 +537,16 @@ if(STRATA_ENABLE_XE)
     add_executable(file_expert_source_test tests/core/file_expert_source_test.cpp)
     target_link_libraries(file_expert_source_test PRIVATE strata_engine)
     add_test(NAME file_expert_source_test COMMAND file_expert_source_test)
+    # the host's RAM and cgroup capacity, read through the handles that stay open (CPU only)
+    add_executable(host_memory_probe_test tests/core/host_memory_probe_test.cpp)
+    target_link_libraries(host_memory_probe_test PRIVATE strata_engine)
+    add_test(NAME host_memory_probe_test COMMAND host_memory_probe_test)
+    # the EXL3 source's capacity guard: it fails closed, it evicts, and it reads the room when it must (CPU only)
+    add_executable(exl3_source_capacity_test tests/core/exl3_source_capacity_test.cpp)
+    target_link_libraries(exl3_source_capacity_test PRIVATE strata_engine)
+    target_include_directories(exl3_source_capacity_test SYSTEM PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/third_party/main/nlohmann-json)
+    add_test(NAME exl3_source_capacity_test COMMAND exl3_source_capacity_test)
     # STRATA_EXCHANGE_ROTATE's ownership table (CPU) and its integration with the source (a GPU)
     add_executable(exchange_storage_test tests/core/exchange_storage_test.cpp)
     target_include_directories(exchange_storage_test PRIVATE include)
@@ -727,11 +738,26 @@ if(STRATA_ENABLE_XE)
     add_executable(exl3_bench src/kernels/exl3_bench.cpp)
     target_link_libraries(exl3_bench PRIVATE strata_engine)
     target_compile_options(exl3_bench PRIVATE -fno-fast-math -ffp-contract=off)
+    # the codebook 2 decode's two byte-sum forms, timed against each other: a micro benchmark of the decode
+    add_executable(exl3_cb2_bench src/kernels/exl3_cb2_bench.cpp)
+    target_link_libraries(exl3_cb2_bench PRIVATE strata_kernels)
+    target_compile_options(exl3_cb2_bench PRIVATE -fno-fast-math -ffp-contract=off)
     add_executable(exl3_wide_parity src/kernels/exl3_wide_parity.cpp)
     target_link_libraries(exl3_wide_parity PRIVATE strata_engine)
     target_compile_options(exl3_wide_parity PRIVATE -fno-fast-math -ffp-contract=off)
     add_test(NAME exl3_wide_parity COMMAND exl3_wide_parity)
     set_tests_properties(exl3_wide_parity PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    # the codebook 2 decode's two forms: every byte sum and every 16-bit state, on the device
+    add_executable(exl3_cb2_parity src/kernels/exl3_cb2_parity.cpp)
+    target_link_libraries(exl3_cb2_parity PRIVATE strata_kernels)
+    target_compile_options(exl3_cb2_parity PRIVATE -fno-fast-math -ffp-contract=off)
+    if(TARGET strata_exl3_fixture)
+      add_dependencies(exl3_cb2_parity strata_exl3_fixture)
+      add_test(NAME exl3_cb2_parity COMMAND exl3_cb2_parity --fixture ${_strata_exl3_fixture})
+    else()
+      add_test(NAME exl3_cb2_parity COMMAND exl3_cb2_parity)
+    endif()
+    set_tests_properties(exl3_cb2_parity PROPERTIES TIMEOUT 300)
     add_executable(exl3_grouped_parity src/kernels/exl3_grouped_parity.cpp)
     target_link_libraries(exl3_grouped_parity PRIVATE strata_engine)
     target_compile_options(exl3_grouped_parity PRIVATE -fno-fast-math -ffp-contract=off)
@@ -1055,6 +1081,19 @@ if(STRATA_BUILD_TESTS)
     add_test(NAME exl3_cpu_parity COMMAND exl3_cpu_parity ${_strata_exl3_fixture})
     set_tests_properties(exl3_cpu_parity PROPERTIES TIMEOUT 120)
   endif()
+  # The CPU block tile order against the format's own order: the same bytes,
+  # bit identical results.  The second entry runs the integer dot as well.
+  add_executable(exl3_cpu_layout_parity src/kernels/cpu/exl3_layout_parity.cpp)
+  target_link_libraries(exl3_cpu_layout_parity PRIVATE strata_kernels_cpu strata_exl3_expert_artifact strata_warnings)
+  target_compile_options(exl3_cpu_layout_parity PRIVATE -fno-fast-math -ffp-contract=off)
+  add_test(NAME exl3_cpu_layout_parity COMMAND exl3_cpu_layout_parity)
+  set_tests_properties(exl3_cpu_layout_parity PROPERTIES TIMEOUT 120)
+  add_executable(exl3_cpu_layout_intdot_parity src/kernels/cpu/exl3_layout_parity.cpp)
+  target_link_libraries(exl3_cpu_layout_intdot_parity PRIVATE strata_kernels_cpu strata_exl3_expert_artifact
+                        strata_warnings)
+  target_compile_options(exl3_cpu_layout_intdot_parity PRIVATE -fno-fast-math -ffp-contract=off)
+  add_test(NAME exl3_cpu_layout_intdot_parity COMMAND exl3_cpu_layout_intdot_parity)
+  set_tests_properties(exl3_cpu_layout_intdot_parity PROPERTIES ENVIRONMENT "STRATA_EXL3_CPU_INTDOT=1" TIMEOUT 120)
 endif()
 # Plan v0.3 P6: only the kernel files get the AVX-512 / AVX2 flags; the pool and the probe run on any x86-64,
 # and the engine picks the kernels at run time (cpu_avx512_ok).

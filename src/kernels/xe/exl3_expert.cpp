@@ -26,6 +26,9 @@ uint64_t max_float_elements() {
 
 void check_projection(const MatrixView& view, const char* name) {
     if (view.trellis == nullptr) throw std::invalid_argument(std::string(name) + ": trellis is null");
+    // The device reads the format's own tile order only.
+    if (view.tile_order != TileOrder::canonical)
+        throw std::invalid_argument(std::string(name) + ": the device reads the canonical tile order only");
     if (view.k <= 0 || view.n <= 0 || view.k % 16 != 0 || view.n % 16 != 0)
         throw std::invalid_argument(std::string(name) + ": dimensions must be positive multiples of 16");
     if (view.bits < 1 || view.bits > 8)

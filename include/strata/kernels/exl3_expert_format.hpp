@@ -44,13 +44,17 @@ struct ProjectionView {
     int64_t n = 0;
     int bits = 0;
     int codebook = 0;
+    /// The order of the compressed tiles in `trellis`.  The device kernels
+    /// accept the canonical order only.
+    TileOrder tile_order = TileOrder::canonical;
     RawProjectionView raw{};
 
     ProjectionView() = default;
 
     explicit ProjectionView(const MatrixView& matrix)
         : storage(ProjectionStorage::packed_trellis), trellis(matrix.trellis), suh(matrix.suh), svh(matrix.svh),
-          bias(matrix.bias), k(matrix.k), n(matrix.n), bits(matrix.bits), codebook(matrix.codebook), raw{} {}
+          bias(matrix.bias), k(matrix.k), n(matrix.n), bits(matrix.bits), codebook(matrix.codebook),
+          tile_order(matrix.tile_order), raw{} {}
 
     ProjectionView& operator=(const MatrixView& matrix) {
         *this = ProjectionView(matrix);
@@ -73,7 +77,7 @@ struct ProjectionView {
     /// returns an empty descriptor rather than pretending to be a trellis.
     MatrixView packed_matrix() const {
         if (!is_packed()) return {};
-        return {trellis, suh, svh, bias, k, n, bits, codebook};
+        return {trellis, suh, svh, bias, k, n, bits, codebook, tile_order};
     }
 };
 

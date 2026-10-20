@@ -80,6 +80,21 @@ once. The wave count does not change any logical partition's accumulation or the
 Enabled by default. Set `STRATA_EXL3_DENSE_SCHEDULE=0` to restore the previous wave layout. This does not apply to
 the wide scalar path.
 
+## Codebook 2 decode
+
+The codebook 2 (mul1) decode returns (887 * B - 452608) * 2^-17 for a byte sum B.
+The value is a multiple of 2^-17 with an absolute value below 2^19, so F32 represents it exactly: the
+portable form computes it in F32 and rounds it once to F16.
+The half form is the reference decoder's fused multiply add in F16, hfma16(F16(1024 + B), 0x1EEE, 0xC931),
+and rounds the same exact value once.
+A device that reports FP16 arithmetic runs the half form; a device that does not runs the portable form.
+Both forms return the same value bit for bit.
+
+Enabled by default.  Set `STRATA_EXL3_CB2_HALF_FMA=0` to force the portable form; the same binary then runs
+both forms.  The dense, routed expert, wide output and n-gram decodes use the same choice.
+The F16 RNE boundary, the FP32 accumulation order, the Hadamard transforms, the bias, the weight storage
+format and the bpw are unchanged.
+
 ## Raw projections
 
 Raw F16/BF16/F32 projections use dtype-specific kernels and unrolled K loads. When independent outputs do not

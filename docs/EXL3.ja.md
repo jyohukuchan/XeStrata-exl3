@@ -48,6 +48,15 @@ CPU は三つの codebook の全 state に対する復号表を一度だけ作�
 AVX2 対応 CPU では mul1 の packed tile を register permutation と小さい復号表で処理する。
 `STRATA_NO_EXL3_AVX2=1` は汎用経路へ戻す。
 
+GPU 側の codebook 2 (mul1) の decode は、byte sum B に対して (887 * B - 452608) * 2^-17 を返す。
+この値は 2^-17 の倍数で絶対値が 2^19 未満なので、F32 で厳密に表せる。
+GPU は同じ数値を返す2つの形を使う。portable な形は F32 で厳密な値を作って F16 へ一度だけ丸める。
+half の形は参照実装と同じ F16 の fused multiply add (hfma16(F16(1024 + B), 0x1EEE, 0xC931)) で行う。
+どちらも同じ厳密値を一度だけ F16 へ丸めるので、bit 単位で一致する。
+device が FP16 の演算を報告するときは half の形を使い、報告しない device では portable な形を使う。
+`STRATA_EXL3_CB2_HALF_FMA=0` は portable な形を強制する。
+F16 の RNE 境界、FP32 の加算順、Hadamard 変換、bias、重みの保存形式と bpw はどちらの形でも変わらない。
+
 `STRATA_EXL3_CPU_ROWPARALLEL=1` は CPU miss を Hpre、gate/up の出力 block、SiLU と down Hpre、
 down の出力 block の4段階に分け、既存 pool で処理する。raw projection と準備容量を超える batch は
 expert 単位の経路を使う。worker 数は既存の設定で選び、コア数を増やした効果は実モデルで確認する。
@@ -63,7 +72,8 @@ CPU・GPU 併用時の decode 計測が必要になる。
 `Exl3ExpertSource` は layer/expert ごとの明示的な名前表を受け取り、要求された expert の圧縮 blob だけを
 読み込む。blob の pointer は layer/window 中は安定し、`copy_blob()` は別の layer の圧縮成分もコピーできる。
 圧縮 blob は層をまたぐ LRU cache で再利用し、展開した重みは保持しない。容量は圧縮 payload 量と
-現在の利用可能 host memory から決め、各 window で再確認する。`STRATA_EXL3_SOURCE_CACHE_MIB` は追加の
+現在の利用可能 host memory から決め、層を一巡するごとと、既知の容量を超えて blob を保持しようとした
+ときに再確認する。`STRATA_EXL3_SOURCE_CACHE_MIB` は追加の
 上限で、0 は window ごとの一時読み込みへ戻す。要求された全 expert を eviction 前に pin し、容量不足では
 window 中だけ保持する。GPU preload の cold `copy_blob()` は CPU cache に追加しない。
 終了時の source 統計は cache hit/miss、materialization 回数・時間と payload bytes を示す。payload bytes は
@@ -121,9 +131,15 @@ NumPy のある環境で tests を有効にしてビルドすると、独立し�
 ```sh
 cmake --build build/free --target exl3_artifact_test exl3_cpu_parity exl3_parity \
     exl3_cpu_expert_parity exl3_expert_parity exl3_cpu_ngram_parity exl3_ngram_parity \
+    exl3_cb2_parity \
     exl3_pool_test exl3_expert_source_test exl3_expert_formats_test expert_cache_buckets_test
 ctest --test-dir build/free -R '^exl3_' --output-on-failure
 ```
+
+`exl3_cb2_parity` は codebook 2 の decode の2つの形を device 上で照合する。
+全ての byte sum (0〜1020) と全ての16 bit state (0〜65535) について、half の形と portable な形の F16 の
+bitが一致することを、独立に定義から計算した値とも照合する。
+加えて、codebook 2 の射影を2つの形で実行した結果が bit 単位で一致することも確かめる。
 
 実 checkpoint の一行列について、archive、CPU/GPU の復号と積和、engine の weight owner をまとめて
 照合する probe もある。診断用の復号だけは選択した一行列を展開する。

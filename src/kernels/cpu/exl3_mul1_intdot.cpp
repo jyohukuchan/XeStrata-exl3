@@ -193,7 +193,10 @@ EXL3_INTDOT_AVX2 void dot_range(const MatrixView& matrix, const Mul1Input& input
     for (size_t tile_n = first_tile; tile_n < first_tile + tile_count; ++tile_n) {
         __m256i acc_lo = _mm256_setzero_si256(), acc_hi = _mm256_setzero_si256();
         for (size_t tile_k = 0; tile_k < tiles_k; ++tile_k) {
-            const uint16_t* tile = matrix.trellis + (tile_k * tiles_n + tile_n) * packed_words;
+            const size_t tile_index = strata::kernels::exl3::trellis_tile_index(
+                matrix.tile_order, static_cast<int64_t>(tile_k), static_cast<int64_t>(tile_n),
+                static_cast<int64_t>(tiles_k), static_cast<int64_t>(tiles_n));
+            const uint16_t* tile = matrix.trellis + tile_index * packed_words;
             __m256i registers[Bits];
             for (int i = 0; i < Bits; ++i)
                 registers[i] = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(tile + i * 16));

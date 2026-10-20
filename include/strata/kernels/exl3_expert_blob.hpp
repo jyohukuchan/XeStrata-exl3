@@ -51,7 +51,27 @@ static_assert(std::is_standard_layout_v<ExpertComponentLayout>);
 static_assert(std::is_standard_layout_v<ExpertProjectionLayout>);
 static_assert(std::is_standard_layout_v<ExpertBlobLayout>);
 
-inline MatrixView expert_matrix_view(const ExpertProjectionLayout& projection, const uint8_t* base) {
+/// Whether the CPU block tile order applies to this expert.
+///
+/// The order groups the compressed tiles of one 128-output block, so it needs a
+/// packed MUL1 trellis whose output width is a multiple of that block.  A raw
+/// projection, another codebook, a mixed expert or a width outside the range
+/// keeps the format's own (canonical) order.
+inline bool cpu_tile_order_applies(const ExpertBlobLayout& layout) {
+    const ExpertProjectionLayout* projections[3] = {&layout.gate, &layout.up, &layout.down};
+    for (const ExpertProjectionLayout* projection : projections) {
+        if (projection->storage != ProjectionStorage::packed_trellis) return false;
+        if (projection->codebook != 2) return false;
+        if (projection->bits < 1 || projection->bits > 8) return false;
+        if (projection->k <= 0 || projection->k % 16 != 0) return false;
+        if (projection->n <= 0 || projection->n % (kTileBlock * 16) != 0) return false;
+        if (projection->trellis.bytes == 0) return false;
+    }
+    return true;
+}
+
+inline MatrixView expert_matrix_view(const ExpertProjectionLayout& projection, const uint8_t* base,
+                                      TileOrder order = TileOrder::canonical) {
     MatrixView result;
     result.trellis = projection.trellis.bytes == 0 ? nullptr : reinterpret_cast<const uint16_t*>(base + projection.trellis.offset);
     result.suh = projection.suh.bytes == 0 ? nullptr : reinterpret_cast<const uint16_t*>(base + projection.suh.offset);  // codespell:ignore suh
@@ -61,13 +81,15 @@ inline MatrixView expert_matrix_view(const ExpertProjectionLayout& projection, c
     result.n = projection.n;
     result.bits = projection.bits;
     result.codebook = projection.codebook;
+    result.tile_order = order;
     return result;
 }
 
-inline ExpertView expert_view(const ExpertBlobLayout& layout, const uint8_t* base) {
-    const auto projection_view = [base](const ExpertProjectionLayout& projection) {
+inline ExpertView expert_view(const ExpertBlobLayout& layout, const uint8_t* base,
+                               TileOrder order = TileOrder::canonical) {
+    const auto projection_view = [base, order](const ExpertProjectionLayout& projection) {
         if (projection.storage == ProjectionStorage::packed_trellis)
-            return ProjectionView(expert_matrix_view(projection, base));
+            return ProjectionView(expert_matrix_view(projection, base, order));
         RawProjectionView raw_view;
         raw_view.data = projection.raw_weights.bytes == 0 ? nullptr : base + projection.raw_weights.offset;
         raw_view.bias = projection.raw_bias.bytes == 0 ? nullptr : base + projection.raw_bias.offset;

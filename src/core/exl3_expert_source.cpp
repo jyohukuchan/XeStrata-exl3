@@ -58,6 +58,37 @@ uint64_t environment_cap() {
     return mib << 20;
 }
 
+/// The device's copy of a host blob: the same bytes in the canonical tile
+/// order.  A resident blob may hold the CPU block order, and the device
+/// kernels read the canonical one only.
+void copy_blob_canonical(const strata::artifact::exl3::ExpertBlob& blob, uint8_t* dst) {
+    std::memcpy(dst, blob.data(), blob.bytes());
+    if (blob.tile_order != strata::kernels::exl3::TileOrder::cpu_block) return;
+    const strata::kernels::exl3::ExpertProjectionLayout* projections[3] = {&blob.layout.gate, &blob.layout.up,
+                                                                           &blob.layout.down};
+    for (const auto* projection : projections) {
+        if (projection->storage != strata::kernels::exl3::ProjectionStorage::packed_trellis) continue;
+        if (projection->trellis.bytes == 0) continue;
+        const auto* source = reinterpret_cast<const uint16_t*>(blob.data() + projection->trellis.offset);
+        auto* destination = reinterpret_cast<uint16_t*>(dst + projection->trellis.offset);
+        strata::artifact::exl3::copy_packed_tiles(source, destination, projection->k, projection->n, projection->bits,
+                                                  strata::kernels::exl3::TileOrder::cpu_block,
+                                                  strata::kernels::exl3::TileOrder::canonical);
+    }
+}
+
+/// Whether the host cache keeps the CPU block tile order.  The switch is a
+/// diagnostic knob: with it off the host cache holds the format's own order,
+/// and every result is the same.  The order of a resident blob and the order
+/// the CPU kernels read always agree.
+bool cpu_block_order_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("STRATA_EXL3_CPU_BLOCK_ORDER");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
 }  // namespace
 
 Exl3ExpertSource::Exl3ExpertSource(std::shared_ptr<const strata::artifact::exl3::Archive> archive,
@@ -95,6 +126,9 @@ void Exl3ExpertSource::clear_locked() {
     newest_ = oldest_ = kNone;
     active_layer_ = -1;
     maximum_blob_bytes_ = startup_capacity_bytes_ = 0;
+    room_reread_ = false;
+    last_layer_ = -1;
+    layer_known_ = false;
     stats_ = {};
     failure_.clear();
     reads_.store(0, std::memory_order_relaxed);
@@ -219,7 +253,10 @@ void Exl3ExpertSource::refresh_capacity_locked(bool evict) {
     auto* profile = detail::active_exl3_prepare_detail();
     const auto guard_begin = profile != nullptr ? detail::Exl3DetailClock::now()
                                                 : detail::Exl3DetailClock::time_point{};
-    const bool available = startup_capacity_bytes_ != 0 && detail::host_available_memory(memory);
+    const bool available = startup_capacity_bytes_ != 0 &&
+                           detail::host_available_memory(memory, capacity_files_.meminfo,
+                                                         capacity_files_.self_cgroup,
+                                                         capacity_files_.cgroup_root);
     if (profile != nullptr && startup_capacity_bytes_ != 0) {
         profile->guard_ns += detail::exl3_detail_ns(guard_begin, detail::Exl3DetailClock::now());
         ++profile->guard_calls;
@@ -234,6 +271,8 @@ void Exl3ExpertSource::refresh_capacity_locked(bool evict) {
         room = subtract_floor(room, 256ull << 20);
         room = subtract_floor(room, stats_.transient_bytes);
     }
+    // The budget the source may hold: the room the host had, and never more than the cache the policy
+    // allows.  A room that could not be read leaves no budget at all: the source then admits nothing.
     stats_.admission_bytes = std::min(startup_capacity_bytes_, room);
     if (evict)
         while (stats_.resident_bytes > stats_.admission_bytes && evict_one_locked()) {}
@@ -274,11 +313,16 @@ bool Exl3ExpertSource::prewarm_cpu(const std::vector<uint8_t>& excluded, Prewarm
     const auto fits = [&] {
         // A refused preload must not throw away an already warm cache. Unlike
         // begin_layer, this check only samples/clamps; it performs no eviction.
-        refresh_capacity_locked(false);
+        // The room is read again only when the payload that is left does not fit the budget the last
+        // reading gave: the loading itself is what the budget accounts for.
+        if (missing > admission_headroom_locked() && !room_reread_) {
+            refresh_capacity_locked(false);
+            room_reread_ = missing > admission_headroom_locked();
+        }
         result.admission_bytes = stats_.admission_bytes;
         return result.requested_bytes <= stats_.admission_bytes &&
                stats_.resident_bytes <= stats_.admission_bytes &&
-               missing <= stats_.admission_bytes - stats_.resident_bytes;
+               missing <= admission_headroom_locked();
     };
     if (!fits()) {
         why = "all owned CPU payloads do not fit the current source cache budget";
@@ -337,7 +381,11 @@ bool Exl3ExpertSource::materialize(size_t at, std::unique_ptr<strata::artifact::
     bool ok = false;
     try {
         blob = std::make_unique<strata::artifact::exl3::ExpertBlob>();
-        ok = strata::artifact::exl3::materialize_expert(*archive_, names_[at], *blob, err);
+        // The host cache keeps the CPU block order; a copy for the device keeps
+        // the format's own order, which is the one the device kernels read.
+        const auto order = (copy || !cpu_block_order_enabled()) ? strata::kernels::exl3::TileOrder::canonical
+                                                                 : strata::kernels::exl3::TileOrder::cpu_block;
+        ok = strata::artifact::exl3::materialize_expert(*archive_, names_[at], *blob, err, 8, order);
         if (ok && blob->layout.total_bytes != layouts_[at].total_bytes) {
             err = "materialized blob layout changed after metadata discovery";
             ok = false;
@@ -371,9 +419,17 @@ bool Exl3ExpertSource::ensure_materialized_locked(size_t at, std::unique_lock<st
     }
     if (!e.counted_window) { ++stats_.misses; e.counted_window = true; }
     const uint64_t bytes = layouts_[at].total_bytes;
+    // The guard: the host's RAM and cgroup capacity are read again when this blob would grow the
+    // resident set past the budget the last reading gave.  A budget of zero admits nothing at all, so
+    // there is nothing to read for; a window that serves its requests from the resident blobs admits
+    // nothing, and reads nothing.
+    if (bytes > admission_headroom_locked() && stats_.admission_bytes > 0 && !room_reread_) {
+        refresh_capacity_locked();
+        room_reread_ = bytes > admission_headroom_locked();
+    }
     while (bytes <= stats_.admission_bytes && stats_.resident_bytes > stats_.admission_bytes - bytes &&
            evict_one_locked()) {}
-    e.persistent = bytes <= stats_.admission_bytes && stats_.resident_bytes <= stats_.admission_bytes - bytes;
+    e.persistent = bytes <= admission_headroom_locked() && stats_.resident_bytes <= stats_.admission_bytes - bytes;
     if (e.persistent) {
         stats_.resident_bytes += bytes;
         stats_.peak_resident_bytes = std::max(stats_.peak_resident_bytes, stats_.resident_bytes);
@@ -439,7 +495,15 @@ void Exl3ExpertSource::begin_layer(int64_t layer, const int32_t* ids, int64_t k)
         entries_[at].window_pin = true;
         active_indices_.push_back(at);
     }
-    refresh_capacity_locked();
+    // The guard: the host's RAM and cgroup capacity.  The layers are visited in order, so a layer that is
+    // not the successor of the last one starts a new pass over them: the room is read again there, and
+    // the blobs the source admits in between are held to the budget that reading gave.
+    if (!layer_known_ || layer != last_layer_ + 1) {
+        refresh_capacity_locked();
+        room_reread_ = false;
+    }
+    last_layer_ = layer;
+    layer_known_ = true;
     active_layer_ = layer;
     for (const size_t at : active_indices_)
         if (!ensure_materialized_locked(at, lock)) {
@@ -467,6 +531,15 @@ bool Exl3ExpertSource::transient(int64_t layer, int64_t expert) const {
     return valid_pair(layer, expert);
 }
 
+strata::kernels::exl3::TileOrder Exl3ExpertSource::exl3_tile_order(int64_t layer, int64_t expert) const {
+    std::shared_lock<std::shared_mutex> lifecycle(lifecycle_);
+    if (!valid_pair(layer, expert)) return strata::kernels::exl3::TileOrder::canonical;
+    const auto& layout = layouts_[index(layer, expert)];
+    if (!cpu_block_order_enabled()) return strata::kernels::exl3::TileOrder::canonical;
+    return strata::kernels::exl3::cpu_tile_order_applies(layout) ? strata::kernels::exl3::TileOrder::cpu_block
+                                                                 : strata::kernels::exl3::TileOrder::canonical;
+}
+
 bool Exl3ExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
     std::shared_lock<std::shared_mutex> lifecycle(lifecycle_);
     if (dst == nullptr || !valid_pair(layer, expert)) return false;
@@ -476,7 +549,7 @@ bool Exl3ExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
         ready_.wait(lock, [&] { return entries_[at].state != State::loading; });
         Entry& e = entries_[at];
         if (e.state == State::ready) {
-            std::memcpy(dst, e.blob->data(), e.blob->bytes());
+            copy_blob_canonical(*e.blob, dst);
             if (e.persistent) touch_locked(at);
             ++stats_.copy_hits;
             return true;
