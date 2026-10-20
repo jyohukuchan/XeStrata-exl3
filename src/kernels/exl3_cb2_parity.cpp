@@ -213,6 +213,47 @@ bool check_states(sycl::queue& queue, strata::parity::Device& device, bool half_
     return bad == 0;
 }
 
+// The product form of the decode, for every 16-bit state: the half form takes the F16 operand's bias
+// from the byte dot product's accumulator, the portable form needs the plain byte sum, and both must
+// return the bits the definition gives.
+bool check_product_forms(sycl::queue& queue, strata::parity::Device& device) {
+    constexpr size_t count = 65536;
+    uint16_t* d_half_bits = device.alloc<uint16_t>(count);
+    uint16_t* d_portable_bits = device.alloc<uint16_t>(count);
+    float* d_half_values = device.alloc<float>(count);
+    float* d_portable_values = device.alloc<float>(count);
+    queue.submit([&](sycl::handler& h) {
+        h.parallel_for(sycl::range<1>(count), [=](sycl::id<1> id) {
+            const uint32_t product = (uint32_t) (uint16_t) id[0] * kMul1;
+            d_half_bits[id[0]] = strata::kernels::exl3::cb2_product_value_bits<true>(product);
+            d_portable_bits[id[0]] = strata::kernels::exl3::cb2_product_value_bits<false>(product);
+            d_half_values[id[0]] = strata::kernels::exl3::cb2_product_value_f32<true>(product);
+            d_portable_values[id[0]] = strata::kernels::exl3::cb2_product_value_f32<false>(product);
+        });
+    }).wait_and_throw();
+    std::vector<uint16_t> half_bits(count), portable_bits(count);
+    std::vector<float> half_values(count), portable_values(count);
+    strata::parity::copy_out(half_bits.data(), d_half_bits, count);
+    strata::parity::copy_out(portable_bits.data(), d_portable_bits, count);
+    strata::parity::copy_out(half_values.data(), d_half_values, count);
+    strata::parity::copy_out(portable_values.data(), d_portable_values, count);
+
+    size_t bad = 0;
+    for (size_t i = 0; i < count; ++i) {
+        const uint16_t want = oracle_bits(host_byte_sum((uint16_t) i));
+        const bool ok = half_bits[i] == want && portable_bits[i] == want &&
+                        float_bits(half_values[i]) == float_bits(portable_values[i]);
+        if (!ok) {
+            if (bad < 8)
+                std::printf("state %5zu: half %04x portable %04x oracle %04x\n", i, half_bits[i], portable_bits[i],
+                            want);
+            ++bad;
+        }
+    }
+    std::printf("product forms (65536 states): %s (%zu of %zu bad)\n", bad == 0 ? "OK" : "FAIL", bad, count);
+    return bad == 0;
+}
+
 struct FixtureCase {
     uint32_t bits = 0;
     uint32_t codebook = 0;
@@ -353,6 +394,7 @@ int main(int argc, char** argv) {
     if (!check_byte_sums(queue, device, half_available)) ++failures;
     if (!check_byte_sum_forms(queue, device)) ++failures;
     if (!check_states(queue, device, half_available)) ++failures;
+    if (!check_product_forms(queue, device)) ++failures;
 
     // The switch: "0" forces the portable form, anything else leaves the choice to the device.
     setenv("STRATA_EXL3_CB2_HALF_FMA", "0", 1);
