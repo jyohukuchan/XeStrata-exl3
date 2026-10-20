@@ -10,6 +10,7 @@
 
 #include "strata/kernels/f16_bits.hpp"
 #include "cuda_intrinsics.hpp"
+#include "exl3_cb2.hpp"
 #include "exl3_word_tile.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_exl3
 #include "strata/kernels/device_arch_tag.hpp"
@@ -27,11 +28,6 @@ constexpr float kHadamardScale = 0.08838834764831845f;  // 1 / sqrt(128), as in 
 // The number of 16x16 K tiles one physical wave of the packed path reads.  A wave that covers more
 // of the K span reads its tiles one after the other and cannot overlap the loads.
 constexpr uint64_t kWaveTileSpan = 16;
-// Codebook 2 uses the unsigned byte sum of state * 0x83DCD12D.  dp4a is signed-byte, so flip the sign bit
-// and add 512; this is exactly sum(u_i - 128) + 512 = sum(u_i), with no change to the following F16-RNE formula.
-inline int cb2_byte_sum_dp4a(uint32_t x) {
-    return strata::kernels::xe::dp4a(sycl::bit_cast<int32_t>(x ^ 0x80808080u), 0x01010101, 512);
-}
 // gitleaks:allow -- public EXL3 codebook multipliers and bit masks, never credentials.
 
 inline void check_view(const MatrixView& view, const char* who) {
@@ -108,18 +104,14 @@ inline uint16_t extract_state(const uint16_t* packed, int bits, int state) {
     return static_cast<uint16_t>(strata::kernels::xe::funnel_right_u32(hi, lo, static_cast<unsigned>(shift)));
 }
 
-// The codebook 2 value of a byte sum is (887 * byte_sum - 452608) * 2^-17.  887 * 2^-17 and
-// 452608 * 2^-17 are exact in F32, and for every byte sum in [0, 1020] the product and the
-// difference are exact as well, so one fused multiply add returns the same value as the integer
-// numerator did, whether the multiply and the add are contracted or not.
-inline float cb2_value_f32(int byte_sum) {
-    return sycl::fma(static_cast<float>(byte_sum), 887.0f * 0x1.0p-17f, -452608.0f * 0x1.0p-17f);
-}
-
 inline uint32_t lop3_6a(uint32_t value) {
     return ((~value & 0x3B603B60u) | (value & (0x8FFF8FFFu ^ 0x3B603B60u)));
 }
 
+// The codebook 2 decode has two forms, the portable one and the half fused multiply add of the reference
+// decoder; they return the same F16 bits (exl3_cb2.hpp).  HalfFma selects the form at compile time, so the
+// kernels carry no runtime branch in the decode.
+template <bool HalfFma>
 inline uint16_t decode_state(uint16_t state, int codebook) {
     uint32_t x = state;
     if (codebook == 0) {
@@ -133,19 +125,18 @@ inline uint16_t decode_state(uint16_t state, int codebook) {
         return f16_from_f32(f32_from_f16((uint16_t) x) + f32_from_f16((uint16_t) (x >> 16)));
     }
     x = x * 0x83DCD12Du;
-    const int byte_sum = cb2_byte_sum_dp4a(x);
-    // The same value the portable path rounds to: (1024 + byte_sum) * 0x1EEE + 0xC931 is exactly
-    // (887 * byte_sum - 452608) * 2^-17, so the fused form returns the same F16 bits.
-    return f16_from_f32(cb2_value_f32(byte_sum));
+    const int byte_sum = cb2_byte_sum(x);
+    return cb2_value_bits<HalfFma>(byte_sum);
 }
 
+template <bool HalfFma>
 inline float decoded_weight(const MatrixView& view, int64_t row, int64_t col) {
     const int tile_row = (int) (row >> 4);
     const int tile_col = (int) (col >> 4);
     const size_t tile_index = (size_t) tile_row * (size_t) (view.n >> 4) + (size_t) tile_col;
     const uint16_t* tile = view.trellis + tile_index * (size_t) (16 * view.bits);
     const int state = tile_state_for_element((int) ((row & 15) * 16 + (col & 15)));
-    return f32_from_f16(decode_state(extract_state(tile, view.bits, state), view.codebook));
+    return f32_from_f16(decode_state<HalfFma>(extract_state(tile, view.bits, state), view.codebook));
 }
 
 // The packed-dot path assigns one output tile to a subgroup. Bits and codebook are template parameters at the launch
@@ -163,9 +154,11 @@ inline uint16_t packed_decode_codebook(uint16_t state) {
         x = lop3_6a(x);
         return f16_from_f32(f32_from_f16((uint16_t) x) + f32_from_f16((uint16_t) (x >> 16)));
     } else {
+        // The packed path decodes codebook 2 through scalar_decode_codebook_f32, which has both forms.
+        // This branch is the portable one.
         x = x * 0x83DCD12Du;
-        const int byte_sum = cb2_byte_sum_dp4a(x);
-        return f16_from_f32(cb2_value_f32(byte_sum));
+        const int byte_sum = cb2_byte_sum(x);
+        return cb2_portable_bits(byte_sum);
     }
 }
 
@@ -184,26 +177,18 @@ inline uint16_t packed_extract_state(const uint16_t* tile, int state) {
 
 // Scalar fallback specialization: it keeps one output column per work item and avoids the subgroup requirement.
 // Codebook 2 has a proven normal-range closed form, so it never enters the software half conversion path.
-template <int Codebook>
+template <int Codebook, bool HalfFma>
 inline float scalar_decode_codebook_f32(uint16_t state) {
     if constexpr (Codebook == 2) {
         uint32_t x = state * 0x83DCD12Du;
-        const int byte_sum = cb2_byte_sum_dp4a(x);
-        const float value = cb2_value_f32(byte_sum);
-        uint32_t u = 0;
-        std::memcpy(&u, &value, sizeof(u));
-        // All byte sums 0..1020 have abs(value) >= 238 * 2^-17, inside the finite F16 normal range.
-        // The closed form is pre-rounded: preserve the exact F16 RNE boundary before widening to F32.
-        u = (u + 0xfffu + ((u >> 13) & 1u)) & 0xffffe000u;
-        float rounded = 0.0f;
-        std::memcpy(&rounded, &u, sizeof(rounded));
-        return rounded;
+        const int byte_sum = cb2_byte_sum(x);
+        return cb2_value_f32<HalfFma>(byte_sum);
     } else {
         return f32_from_f16(packed_decode_codebook<Codebook>(state));
     }
 }
 
-template <int Bits, int Codebook>
+template <int Bits, int Codebook, bool HalfFma>
 inline float scalar_decoded_weight(const MatrixView& view, int64_t row, int64_t col) {
     const int64_t n_tiles = view.n / 16;
     const size_t tile_index = static_cast<size_t>(row / 16) * static_cast<size_t>(n_tiles) +
@@ -220,10 +205,10 @@ inline float scalar_decoded_weight(const MatrixView& view, int64_t row, int64_t 
     const uint32_t lo = load_word32(tile, i1, word_count);
     const uint16_t packed_state =
         static_cast<uint16_t>(strata::kernels::xe::funnel_right_u32(hi, lo, static_cast<unsigned>(shift)));
-    return scalar_decode_codebook_f32<Codebook>(packed_state);
+    return scalar_decode_codebook_f32<Codebook, HalfFma>(packed_state);
 }
 
-template <int Bits, int Codebook>
+template <int Bits, int Codebook, bool HalfFma>
 sycl::event submit_scalar_dot_template(sycl::queue& queue, const MatrixView& view, const float* x, int64_t ldx,
                                        float* y, int64_t ldy, int64_t rows,
                                        const std::vector<sycl::event>& deps, bool add_bias) {
@@ -237,19 +222,34 @@ sycl::event submit_scalar_dot_template(sycl::queue& queue, const MatrixView& vie
             float* output = y + row_out * ldy;
             float sum = 0.0f;
             for (int64_t row = 0; row < view.k; ++row)
-                sum += input[row] * scalar_decoded_weight<Bits, Codebook>(view, row, col);
+                sum += input[row] * scalar_decoded_weight<Bits, Codebook, HalfFma>(view, row, col);
             if (add_bias && view.bias != nullptr) sum += f32_from_f16(view.bias[col]);
             output[col] = sum;
         });
     });
 }
 
+// The codebook 2 decode runs in its half form on the devices that report fp16 arithmetic, and in its
+// portable form otherwise.  The form is a template parameter, so the kernel carries no runtime branch:
+// only the codebook 2 instantiations have a second form.
+template <int Bits, int Codebook>
+sycl::event submit_scalar_dot_form(sycl::queue& queue, const MatrixView& view, const float* x, int64_t ldx,
+                                   float* y, int64_t ldy, int64_t rows, const std::vector<sycl::event>& deps,
+                                   bool add_bias, bool half_fma) {
+    if constexpr (Codebook == 2) {
+        if (half_fma)
+            return submit_scalar_dot_template<Bits, Codebook, true>(queue, view, x, ldx, y, ldy, rows, deps, add_bias);
+    }
+    return submit_scalar_dot_template<Bits, Codebook, false>(queue, view, x, ldx, y, ldy, rows, deps, add_bias);
+}
+
 bool submit_scalar_dot_dispatch(sycl::queue& queue, const MatrixView& view, const float* x, int64_t ldx, float* y,
                                 int64_t ldy, int64_t rows, const std::vector<sycl::event>& deps, bool add_bias,
                                 sycl::event& result) {
+    const bool half_fma = cb2_half_fma_enabled(queue);
     #define EXL3_SCALAR_DOT(B, C) \
         do { \
-            result = submit_scalar_dot_template<B, C>(queue, view, x, ldx, y, ldy, rows, deps, add_bias); \
+            result = submit_scalar_dot_form<B, C>(queue, view, x, ldx, y, ldy, rows, deps, add_bias, half_fma); \
             return true; \
         } while (false)
     switch (view.bits) {
@@ -289,7 +289,7 @@ bool submit_scalar_dot_dispatch(sycl::queue& queue, const MatrixView& view, cons
     #undef EXL3_SCALAR_DOT
 }
 
-template <int Bits, int Codebook>
+template <int Bits, int Codebook, bool HalfFma>
 sycl::event submit_packed_dot(sycl::queue& queue, const MatrixView& view, const float* x, int64_t ldx, float* y,
                               int64_t ldy, int64_t rows, const std::vector<sycl::event>& deps, bool add_bias,
                               int split_k, int subgroup_size, int waves_per_group) {
@@ -324,7 +324,7 @@ sycl::event submit_packed_dot(sycl::queue& queue, const MatrixView& view, const 
                     const int r = 2 * rr + row_parity;
                     const int state = tile_state_for_element(r * 16 + col_in_tile);
                     const uint16_t packed_state = packed_extract_state<Bits>(source, state);
-                    sum += input[k_tile * 16 + r] * scalar_decode_codebook_f32<Codebook>(packed_state);
+                    sum += input[k_tile * 16 + r] * scalar_decode_codebook_f32<Codebook, HalfFma>(packed_state);
                 }
                 accum += sum + sycl::select_from_group(subgroup, sum, lane ^ 16);
             }
@@ -350,18 +350,18 @@ bool word_tile_preload_enabled() {
 
 // RR is compile-time so bank masks remain constants, not an additional runtime mask table lookup.
 // Recursion retains exactly the baseline rr0..rr7 FP32 addition order under strict FP.
-template <int Bits, int RR = 0>
+template <int Bits, int RR = 0, bool HalfFma = false>
 inline void accumulate_word_tile(const word_cache::DistributedTile<Bits>& words, const sycl::sub_group& subgroup,
                                   int lane, const float* input, int64_t k_tile, float& sum) {
     static_assert(RR >= 0 && RR < 8);
     const int r = 2 * RR + (lane >> 4);
     const uint16_t packed_state = words.template state<RR>(subgroup, lane);
-    sum += input[k_tile * 16 + r] * scalar_decode_codebook_f32<2>(packed_state);
+    sum += input[k_tile * 16 + r] * scalar_decode_codebook_f32<2, HalfFma>(packed_state);
     if constexpr (RR + 1 < 8)
-        accumulate_word_tile<Bits, RR + 1>(words, subgroup, lane, input, k_tile, sum);
+        accumulate_word_tile<Bits, RR + 1, HalfFma>(words, subgroup, lane, input, k_tile, sum);
 }
 
-template <int Bits>
+template <int Bits, bool HalfFma>
 sycl::event submit_packed_dot_word_cache(sycl::queue& queue, const MatrixView& view, const float* x, int64_t ldx,
                                          float* y, int64_t ldy, int64_t rows,
                                          const std::vector<sycl::event>& deps, bool add_bias,
@@ -396,7 +396,7 @@ sycl::event submit_packed_dot_word_cache(sycl::queue& queue, const MatrixView& v
                     if constexpr (Bits > 4)
                         if (lane + 32 < Bits * 8) words.bank1 = load_word32(source, lane + 32, Bits * 8);
                     float sum = 0.0f;
-                    accumulate_word_tile<Bits>(words, subgroup, lane, input, k_tile, sum);
+                    accumulate_word_tile<Bits, 0, HalfFma>(words, subgroup, lane, input, k_tile, sum);
                     accum += sum + sycl::select_from_group(subgroup, sum, lane ^ 16);
                 }
                 if (lane < 16) partial[static_cast<size_t>(logical) * 16 + static_cast<size_t>(lane)] = accum;
@@ -416,18 +416,18 @@ sycl::event submit_packed_dot_word_cache(sycl::queue& queue, const MatrixView& v
 
 // Wide outputs have enough independent tiles to use a single subgroup per tile. Exchange each
 // adjacent product pair so the lower sixteen lanes retain scalar K=0..k-1 FP32 addition order.
-template <int Bits, int RR = 0>
+template <int Bits, int RR = 0, bool HalfFma = false>
 inline void accumulate_wide_tile(const word_cache::DistributedTile<Bits>& words,
                                  const sycl::sub_group& subgroup, int lane, const float* input,
                                  int64_t k_tile, float& sum) {
     const int r = 2 * RR + (lane >> 4);
-    const float product = input[k_tile * 16 + r] * scalar_decode_codebook_f32<2>(words.template state<RR>(subgroup, lane));
+    const float product = input[k_tile * 16 + r] * scalar_decode_codebook_f32<2, HalfFma>(words.template state<RR>(subgroup, lane));
     const float other = sycl::select_from_group(subgroup, product, lane ^ 16);
     if (lane < 16) { sum += product; sum += other; }
-    if constexpr (RR < 7) accumulate_wide_tile<Bits, RR + 1>(words, subgroup, lane, input, k_tile, sum);
+    if constexpr (RR < 7) accumulate_wide_tile<Bits, RR + 1, HalfFma>(words, subgroup, lane, input, k_tile, sum);
 }
 
-template <int Bits>
+template <int Bits, bool HalfFma>
 sycl::event submit_wide_word_dot(sycl::queue& queue, const MatrixView& view, const float* x, int64_t ldx,
                                  float* y, int64_t ldy, int64_t rows,
                                  const std::vector<sycl::event>& deps, bool add_bias) {
@@ -452,7 +452,7 @@ sycl::event submit_wide_word_dot(sycl::queue& queue, const MatrixView& view, con
                 if (lane < Bits * 8) words.bank0 = load_word32(source, lane, Bits * 8);
                 if constexpr (Bits > 4)
                     if (lane + 32 < Bits * 8) words.bank1 = load_word32(source, lane + 32, Bits * 8);
-                accumulate_wide_tile<Bits>(words, subgroup, lane, input, kt, sum);
+                accumulate_wide_tile<Bits, 0, HalfFma>(words, subgroup, lane, input, kt, sum);
             }
             if (lane < 16) {
                 const int64_t col = tile_n * 16 + lane;
@@ -500,9 +500,47 @@ bool packed_dot_capability(const sycl::queue& queue, const MatrixView& view, int
     return split_k >= 1;
 }
 
+// The wide word dot path is the codebook 2 path for wide outputs.  It has the same two decode forms as
+// the packed path.
+template <int Bits>
+sycl::event submit_wide_word_form(sycl::queue& queue, const MatrixView& view, const float* x, int64_t ldx, float* y,
+                                  int64_t ldy, int64_t rows, const std::vector<sycl::event>& deps, bool add_bias,
+                                  bool half_fma) {
+    if (half_fma)
+        return submit_wide_word_dot<Bits, true>(queue, view, x, ldx, y, ldy, rows, deps, add_bias);
+    return submit_wide_word_dot<Bits, false>(queue, view, x, ldx, y, ldy, rows, deps, add_bias);
+}
+
+// The codebook 2 decode runs in its half form on the devices that report fp16 arithmetic, and in its
+// portable form otherwise.  The form is a template parameter, so the kernels carry no runtime branch:
+// only the codebook 2 instantiations have a second form.
+template <int Bits, int Codebook>
+sycl::event submit_packed_dot_form(sycl::queue& queue, const MatrixView& view, const float* x, int64_t ldx, float* y,
+                                   int64_t ldy, int64_t rows, const std::vector<sycl::event>& deps, bool add_bias,
+                                   int split_k, int subgroup_size, int waves_per_group, int physical_waves,
+                                   bool half_fma) {
+    if constexpr (Codebook == 2) {
+        if (half_fma) {
+            if (word_tile_preload_enabled())
+                return submit_packed_dot_word_cache<Bits, true>(queue, view, x, ldx, y, ldy, rows, deps, add_bias,
+                                                               split_k, subgroup_size, physical_waves);
+            return submit_packed_dot<Bits, Codebook, true>(queue, view, x, ldx, y, ldy, rows, deps, add_bias, split_k,
+                                                          subgroup_size, waves_per_group);
+        }
+        if (word_tile_preload_enabled())
+            return submit_packed_dot_word_cache<Bits, false>(queue, view, x, ldx, y, ldy, rows, deps, add_bias,
+                                                            split_k, subgroup_size, physical_waves);
+        return submit_packed_dot<Bits, Codebook, false>(queue, view, x, ldx, y, ldy, rows, deps, add_bias, split_k,
+                                                       subgroup_size, waves_per_group);
+    }
+    return submit_packed_dot<Bits, Codebook, false>(queue, view, x, ldx, y, ldy, rows, deps, add_bias, split_k,
+                                                   subgroup_size, waves_per_group);
+}
+
 bool submit_packed_dot_dispatch(sycl::queue& queue, const MatrixView& view, const float* x, int64_t ldx, float* y,
                                 int64_t ldy, int64_t rows, const std::vector<sycl::event>& deps, bool add_bias,
                                 sycl::event& result) {
+    const bool half_fma = cb2_half_fma_enabled(queue);
     int subgroup_size = 0, split_k = 0, waves_per_group = 0;
     if (!packed_dot_capability(queue, view, rows, subgroup_size, split_k, waves_per_group)) {
         if (view.codebook != 2 || !wide_word_enabled() || view.k % 16 != 0 || view.n % 16 != 0 || rows <= 0)
@@ -512,7 +550,7 @@ bool submit_packed_dot_dispatch(sycl::queue& queue, const MatrixView& view, cons
             queue.get_device().get_info<sycl::info::device::max_work_group_size>() < 32) return false;
         switch (view.bits) {
 #define EXL3_WIDE_WORD_CASE(B) \
-            case B: result = submit_wide_word_dot<B>(queue, view, x, ldx, y, ldy, rows, deps, add_bias); return true
+            case B: result = submit_wide_word_form<B>(queue, view, x, ldx, y, ldy, rows, deps, add_bias, half_fma); return true
             EXL3_WIDE_WORD_CASE(1);
             EXL3_WIDE_WORD_CASE(2);
             EXL3_WIDE_WORD_CASE(3);
@@ -548,13 +586,7 @@ bool submit_packed_dot_dispatch(sycl::queue& queue, const MatrixView& view, cons
     }
     #define EXL3_PACKED_DOT(B, C) \
         do { \
-            if constexpr (C == 2) { \
-                if (word_tile_preload_enabled()) \
-                    result = submit_packed_dot_word_cache<B>(queue, view, x, ldx, y, ldy, rows, deps, add_bias, split_k, subgroup_size, physical_waves); \
-                else \
-                    result = submit_packed_dot<B, C>(queue, view, x, ldx, y, ldy, rows, deps, add_bias, split_k, subgroup_size, waves_per_group); \
-            } else \
-                result = submit_packed_dot<B, C>(queue, view, x, ldx, y, ldy, rows, deps, add_bias, split_k, subgroup_size, waves_per_group); \
+            result = submit_packed_dot_form<B, C>(queue, view, x, ldx, y, ldy, rows, deps, add_bias, split_k, subgroup_size, waves_per_group, physical_waves, half_fma); \
             return true; \
         } while (false)
     switch (view.bits) {
@@ -622,6 +654,7 @@ sycl::event submit_input_hadamard_scalar(sycl::queue& queue, const MatrixView& v
     });
 }
 
+template <bool HalfFma>
 sycl::event submit_dot(sycl::queue& queue, const MatrixView& view, const float* x, float* y,
                        const std::vector<sycl::event>& deps, bool add_bias) {
     return queue.submit([&](sycl::handler& h) {
@@ -629,7 +662,7 @@ sycl::event submit_dot(sycl::queue& queue, const MatrixView& view, const float* 
         h.parallel_for(sycl::range<1>((size_t) view.n), [=](sycl::id<1> id) {
             const int64_t col = (int64_t) id[0];
             float sum = 0.0f;
-            for (int64_t row = 0; row < view.k; ++row) sum += x[row] * decoded_weight(view, row, col);
+            for (int64_t row = 0; row < view.k; ++row) sum += x[row] * decoded_weight<HalfFma>(view, row, col);
             if (add_bias && view.bias != nullptr) sum += f32_from_f16(view.bias[col]);
             y[col] = sum;
         });
@@ -676,6 +709,7 @@ sycl::event submit_input_hadamard_rows_scalar(sycl::queue& queue, const MatrixVi
     });
 }
 
+template <bool HalfFma>
 sycl::event submit_dot_rows(sycl::queue& queue, const MatrixView& view, const float* x, int64_t ldx, float* y,
                             int64_t ldy, int64_t rows, const std::vector<sycl::event>& deps, bool add_bias) {
     return queue.submit([&](sycl::handler& h) {
@@ -687,7 +721,7 @@ sycl::event submit_dot_rows(sycl::queue& queue, const MatrixView& view, const fl
             const float* xr = x + r * ldx;
             float* yr = y + r * ldy;
             float sum = 0.0f;
-            for (int64_t row = 0; row < view.k; ++row) sum += xr[row] * decoded_weight(view, row, col);
+            for (int64_t row = 0; row < view.k; ++row) sum += xr[row] * decoded_weight<HalfFma>(view, row, col);
             if (add_bias && view.bias != nullptr) sum += f32_from_f16(view.bias[col]);
             yr[col] = sum;
         });
@@ -862,8 +896,11 @@ size_t exl3_gemm_scratch_elements(const MatrixView& view, int64_t rows, GemvOpti
     return per_row * (size_t) rows;
 }
 
-sycl::event exl3_reconstruct(sycl::queue& queue, const MatrixView& view, uint16_t* out,
-                             const std::vector<sycl::event>& deps) {
+namespace {
+
+template <bool HalfFma>
+sycl::event submit_reconstruct(sycl::queue& queue, const MatrixView& view, uint16_t* out,
+                                const std::vector<sycl::event>& deps) {
     check_view(view, "exl3_reconstruct");
     if (out == nullptr) throw std::invalid_argument("exl3_reconstruct: out is null");
     return queue.submit([&](sycl::handler& h) {
@@ -877,10 +914,12 @@ sycl::event exl3_reconstruct(sycl::queue& queue, const MatrixView& view, uint16_
             const size_t tile_index = (size_t) tile_row * (size_t) (view.n >> 4) + (size_t) tile_col;
             const uint16_t* tile = view.trellis + tile_index * (size_t) (16 * view.bits);
             const int state = tile_state_for_element((int) ((row & 15) * 16 + (col & 15)));
-            out[flat] = decode_state(extract_state(tile, view.bits, state), view.codebook);
+            out[flat] = decode_state<HalfFma>(extract_state(tile, view.bits, state), view.codebook);
         });
     });
 }
+
+}  // namespace
 
 sycl::event exl3_gemv_fp32(sycl::queue& queue, const MatrixView& view, const float* x, float* y, float* scratch,
                            size_t scratch_elements, GemvOptions options, const std::vector<sycl::event>& deps,
@@ -904,8 +943,12 @@ sycl::event exl3_gemv_fp32(sycl::queue& queue, const MatrixView& view, const flo
     if (!submit_packed_dot_dispatch(queue, view, dot_input, view.k, dot_output, view.n, 1, dot_deps, dot_add_bias,
                                     dot_event))
         if (!submit_scalar_dot_dispatch(queue, view, dot_input, view.k, dot_output, view.n, 1, dot_deps,
-                                        dot_add_bias, dot_event))
-            dot_event = submit_dot(queue, view, dot_input, dot_output, dot_deps, dot_add_bias);
+                                        dot_add_bias, dot_event)) {
+            if (cb2_half_fma_enabled(queue))
+                dot_event = submit_dot<true>(queue, view, dot_input, dot_output, dot_deps, dot_add_bias);
+            else
+                dot_event = submit_dot<false>(queue, view, dot_input, dot_output, dot_deps, dot_add_bias);
+        }
     if (profile != nullptr) profile->dot = dot_event;
     if (use_output) {
         const sycl::event output_event = submit_output_hadamard(queue, view, dot_output, y, {dot_event}, options.add_bias);
@@ -939,8 +982,14 @@ sycl::event exl3_gemm_fp32(sycl::queue& queue, const MatrixView& view, const flo
     if (!submit_packed_dot_dispatch(queue, view, dot_input, dot_ldx, dot_output, dot_ldy, rows, dot_deps, dot_add_bias,
                                     dot_event))
         if (!submit_scalar_dot_dispatch(queue, view, dot_input, dot_ldx, dot_output, dot_ldy, rows, dot_deps,
-                                        dot_add_bias, dot_event))
-            dot_event = submit_dot_rows(queue, view, dot_input, dot_ldx, dot_output, dot_ldy, rows, dot_deps, dot_add_bias);
+                                        dot_add_bias, dot_event)) {
+            if (cb2_half_fma_enabled(queue))
+                dot_event = submit_dot_rows<true>(queue, view, dot_input, dot_ldx, dot_output, dot_ldy, rows, dot_deps,
+                                                  dot_add_bias);
+            else
+                dot_event = submit_dot_rows<false>(queue, view, dot_input, dot_ldx, dot_output, dot_ldy, rows, dot_deps,
+                                                   dot_add_bias);
+        }
     if (profile != nullptr) profile->dot = dot_event;
     if (use_output) {
         const sycl::event output_event =
@@ -949,6 +998,13 @@ sycl::event exl3_gemm_fp32(sycl::queue& queue, const MatrixView& view, const flo
         return output_event;
     }
     return dot_event;
+}
+
+sycl::event exl3_reconstruct(sycl::queue& queue, const MatrixView& view, uint16_t* out,
+                             const std::vector<sycl::event>& deps) {
+    if (cb2_half_fma_enabled(queue))
+        return submit_reconstruct<true>(queue, view, out, deps);
+    return submit_reconstruct<false>(queue, view, out, deps);
 }
 
 }  // namespace strata::kernels::exl3

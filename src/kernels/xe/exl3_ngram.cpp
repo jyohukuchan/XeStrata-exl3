@@ -6,6 +6,7 @@
 #include "strata/kernels/exl3_ngram.hpp"
 
 #include "strata/kernels/f16_bits.hpp"
+#include "exl3_cb2.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_exl3_ngram
 #include "strata/kernels/device_arch_tag.hpp"
 
@@ -41,12 +42,10 @@ void check_view(const View& view, const int32_t* explicit_head_ids, float* out, 
         throw std::invalid_argument("exl3_ngram_dequant: output span exceeds host address range");
 }
 
-}  // namespace
-
-sycl::event exl3_ngram_dequant(sycl::queue& queue, const View& view, const int32_t* explicit_head_ids, float* out,
-                               int64_t ldy,
-                               const std::vector<sycl::event>& deps) {
-    check_view(view, explicit_head_ids, out, ldy);
+template <bool HalfFma>
+sycl::event submit_ngram_dequant(sycl::queue& queue, const View& view, const int32_t* explicit_head_ids, float* out,
+                                  int64_t ldy,
+                                  const std::vector<sycl::event>& deps) {
     return queue.submit([&](sycl::handler& h) {
         if (!deps.empty()) h.depends_on(deps);
         h.parallel_for(sycl::range<1>((size_t) view.row_count * kNgramRowDim), [=](sycl::id<1> id) {
@@ -70,14 +69,26 @@ sycl::event exl3_ngram_dequant(sycl::queue& queue, const View& view, const int32
             const uint32_t product = state * kMul1;
             const uint32_t byte_sum = (product & 0xFFu) + ((product >> 8) & 0xFFu) +
                                       ((product >> 16) & 0xFFu) + ((product >> 24) & 0xFFu);
-            const float hvalue = f32_from_f16((uint16_t) (0x6400u + byte_sum));
-            const float inverse = f32_from_f16(0x1EEEu);
-            const float codebook = f32_from_f16(f16_from_f32(hvalue * inverse + f32_from_f16(0xC931u)));
+            // The codebook 2 value, in the same form the other EXL3 kernels use: the half fused multiply add
+            // where the device reports fp16 arithmetic, the portable form otherwise.  Both forms return the
+            // same F16-rounded value.
+            const float codebook = strata::kernels::exl3::cb2_value_f32<HalfFma>((int) byte_sum);
             const float scale = f32_from_f16(packed[0]);
             const float bias = f32_from_f16(view.head_bias[(size_t) head * kNgramRowDim + i]);
             out[row * ldy + i] = codebook * scale + bias;
         });
     });
+}
+
+}  // namespace
+
+sycl::event exl3_ngram_dequant(sycl::queue& queue, const View& view, const int32_t* explicit_head_ids, float* out,
+                               int64_t ldy,
+                               const std::vector<sycl::event>& deps) {
+    check_view(view, explicit_head_ids, out, ldy);
+    if (strata::kernels::exl3::cb2_half_fma_enabled(queue))
+        return submit_ngram_dequant<true>(queue, view, explicit_head_ids, out, ldy, deps);
+    return submit_ngram_dequant<false>(queue, view, explicit_head_ids, out, ldy, deps);
 }
 
 }  // namespace strata::kernels::exl3_ngram
