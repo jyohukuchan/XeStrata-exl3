@@ -100,6 +100,14 @@ inline uint16_t extract_state(const uint16_t* packed, int bits, int state) {
     return static_cast<uint16_t>(strata::kernels::xe::funnel_right_u32(hi, lo, static_cast<unsigned>(shift)));
 }
 
+// The codebook 2 value of a byte sum is (887 * byte_sum - 452608) * 2^-17.  887 * 2^-17 and
+// 452608 * 2^-17 are exact in F32, and for every byte sum in [0, 1020] the product and the
+// difference are exact as well, so one fused multiply add returns the same value as the integer
+// numerator did, whether the multiply and the add are contracted or not.
+inline float cb2_value_f32(int byte_sum) {
+    return sycl::fma(static_cast<float>(byte_sum), 887.0f * 0x1.0p-17f, -452608.0f * 0x1.0p-17f);
+}
+
 inline uint32_t lop3_6a(uint32_t value) {
     return ((~value & 0x3B603B60u) | (value & (0x8FFF8FFFu ^ 0x3B603B60u)));
 }
@@ -118,10 +126,9 @@ inline uint16_t decode_state(uint16_t state, int codebook) {
     }
     x = x * 0x83DCD12Du;
     const int byte_sum = cb2_byte_sum_dp4a(x);
-    const uint16_t h = (uint16_t) (0x6400u + byte_sum);
-    // The native mul1 path performs a half FMA.  The operands are half-valued and the portable path deliberately
-    // rounds once at the same boundary, matching the scalar EXL3 reference used by the parity fixture.
-    return f16_from_f32(f32_from_f16(h) * f32_from_f16(0x1EEEu) + f32_from_f16(0xC931u));
+    // The same value the portable path rounds to: (1024 + byte_sum) * 0x1EEE + 0xC931 is exactly
+    // (887 * byte_sum - 452608) * 2^-17, so the fused form returns the same F16 bits.
+    return f16_from_f32(cb2_value_f32(byte_sum));
 }
 
 inline float decoded_weight(const MatrixView& view, int64_t row, int64_t col) {
@@ -150,8 +157,7 @@ inline uint16_t packed_decode_codebook(uint16_t state) {
     } else {
         x = x * 0x83DCD12Du;
         const int byte_sum = cb2_byte_sum_dp4a(x);
-        const int32_t numerator = 887 * static_cast<int32_t>(byte_sum) - 452608;
-        return f16_from_f32(static_cast<float>(numerator) * 0x1.0p-17f);
+        return f16_from_f32(cb2_value_f32(byte_sum));
     }
 }
 
@@ -175,8 +181,7 @@ inline float scalar_decode_codebook_f32(uint16_t state) {
     if constexpr (Codebook == 2) {
         uint32_t x = state * 0x83DCD12Du;
         const int byte_sum = cb2_byte_sum_dp4a(x);
-        const int32_t numerator = 887 * static_cast<int32_t>(byte_sum) - 452608;
-        const float value = static_cast<float>(numerator) * 0x1.0p-17f;
+        const float value = cb2_value_f32(byte_sum);
         uint32_t u = 0;
         std::memcpy(&u, &value, sizeof(u));
         // All byte sums 0..1020 have abs(value) >= 238 * 2^-17, inside the finite F16 normal range.
