@@ -27,6 +27,7 @@
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/exchange_storage.hpp"
 #include "strata/core/hit_hook.hpp"
+#include "strata/core/host_memory_probe.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 
 #include <algorithm>
@@ -60,35 +61,6 @@ namespace detail {
 
 /// Sentinel used by the pure complement planner for a blob that remains in the mmap fallback.
 inline constexpr uint64_t kNoCacheComplement = ~uint64_t{0};
-
-/// Required cgroup-v2 usage counters for the conservative cache-reclaim allowance.
-struct CgroupMemoryStat {
-    uint64_t current = 0;
-    uint64_t inactive_file = 0;
-    uint64_t file_dirty = 0;
-    uint64_t file_writeback = 0;
-    bool valid = false;
-};
-
-/// Calculate additional bytes under a finite cgroup limit after reclaiming only clean inactive file cache.
-/// Returns false when the required memory.stat counters were unavailable.
-bool cgroup_available_bytes(uint64_t limit, const CgroupMemoryStat& stat, uint64_t& bytes);
-
-/// #633: the RAM this process can get.  `available`: MemAvailable, lowered
-/// to the room under the tightest cgroup limit; `cgroup_limit`: that tightest limit itself (v2 memory.max of the group
-/// and its ancestors, or v1 memory.limit_in_bytes), ~0 when there is none - what a container can never exceed.
-struct HostMemory {
-    uint64_t available = 0;
-    uint64_t cgroup_limit = ~uint64_t{0};
-};
-
-/// Linux reads `meminfo`, `self_cgroup` and the cgroup tree under `cgroup_root` (the parameters are for tests; the
-/// defaults are the real files).  cgroup v2 as before (an unreadable limit of a group that has one fails); cgroup v1's
-/// memory controller (`<root>/memory/<path>`: memory.limit_in_bytes - memory.usage_in_bytes); no cgroup line at all is
-/// MemAvailable alone.  False when the RAM cannot be determined.
-bool host_available_memory(HostMemory& m, const std::string& meminfo = "/proc/meminfo",
-                           const std::string& self_cgroup = "/proc/self/cgroup",
-                           const std::string& cgroup_root = "/sys/fs/cgroup");
 
 /// #11: whether a RAM copy of `copy` bytes is page-locked.  Page-locked host memory belongs to the GPU driver (Linux
 /// xe: a buffer object it maps), and when the RAM beside it cannot hold what the run keeps reading from the model's
