@@ -258,9 +258,9 @@ bool materialize_expert(const Archive& archive, const ExpertTensorNames& names, 
                         size_t alignment, strata::kernels::exl3::TileOrder order) {
     strata::kernels::exl3::ExpertBlobLayout metadata;
     if (!describe_expert(archive, names, metadata, err, alignment)) return false;
-    // The CPU block order is applied only where it is defined; every other
+    // A CPU tile order is applied only where it is defined; every other
     // expert keeps the format's own order.
-    const bool cpu_order = order == strata::kernels::exl3::TileOrder::cpu_block &&
+    const bool cpu_order = strata::kernels::exl3::tile_order_is_cpu(order) &&
                            strata::kernels::exl3::cpu_tile_order_applies(metadata);
     try {
         ResolvedProjection resolved[3];
@@ -271,8 +271,7 @@ bool materialize_expert(const Archive& archive, const ExpertTensorNames& names, 
 
         ExpertBlob result;
         result.layout = metadata;
-        result.tile_order = cpu_order ? strata::kernels::exl3::TileOrder::cpu_block
-                                      : strata::kernels::exl3::TileOrder::canonical;
+        result.tile_order = cpu_order ? order : strata::kernels::exl3::TileOrder::canonical;
         size_t words = 0;
         if (!checked_storage_words(metadata.total_bytes, words))
             throw std::runtime_error("expert blob size cannot be represented by aligned storage");
@@ -288,13 +287,13 @@ bool materialize_expert(const Archive& archive, const ExpertTensorNames& names, 
                     matrix.bias.size() * sizeof(uint16_t) != layouts[i]->bias.bytes)
                     throw std::runtime_error("materialized packed component size differs from metadata layout");
                 if (cpu_order) {
-                    // The same bytes, in the CPU block order: the tiles of one
-                    // 128-output block become adjacent.
+                    // The same bytes, in the CPU tile order: only the order of
+                    // the whole 16x16 tiles changes.
                     auto* base = reinterpret_cast<uint8_t*>(result.storage.data());
                     copy_packed_tiles(matrix.trellis.data(),
                                       reinterpret_cast<uint16_t*>(base + layouts[i]->trellis.offset), layouts[i]->k,
                                       layouts[i]->n, layouts[i]->bits, strata::kernels::exl3::TileOrder::canonical,
-                                      strata::kernels::exl3::TileOrder::cpu_block);
+                                      order);
                 } else {
                     copy_bytes(result.storage, layouts[i]->trellis, matrix.trellis.data(), layouts[i]->trellis.bytes);
                 }

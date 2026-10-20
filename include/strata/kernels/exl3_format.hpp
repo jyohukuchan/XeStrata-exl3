@@ -18,16 +18,31 @@ namespace strata::kernels::exl3 {
 /// `cpu_block` reorders whole tiles so that the tiles of one 128-output block
 /// are adjacent: the tile (tile_k, tile_n) sits at
 /// `(n_tile / B) * k_tiles * B + tile_k * B + n_tile % B` with B = 128 / 16.
+/// The CPU walks the K tiles of one N tile with a stride of B tiles, so the
+/// eight N tiles of a block are eight interleaved streams.
+///
+/// `cpu_nmajor` puts the K tiles of one N tile next to each other: the tile
+/// (tile_k, tile_n) sits at `n_tile * k_tiles + tile_k`.  The CPU's walk of
+/// the K tiles is then one sequential run, and the N tiles of a 128-output
+/// block follow one another, so a task reads one contiguous stretch.
+///
 /// Only the order of whole tiles changes; the packed bits inside a tile, the
-/// scales, the bias and the arithmetic do not.  The CPU reads this order, and a
-/// blob that carries it is identified by the descriptor, never by guessing.
+/// scales, the bias and the arithmetic do not.  The CPU reads the two CPU
+/// orders, and a blob that carries one is identified by the descriptor, never
+/// by guessing.
 enum class TileOrder : uint8_t {
     canonical = 0,
     cpu_block = 1,
+    cpu_nmajor = 2,
 };
+
+/// Whether the order is one of the CPU's own orders, and not the format's.
+constexpr bool tile_order_is_cpu(TileOrder order) { return order != TileOrder::canonical; }
 
 /// The number of 16-wide tiles one 128-output block covers.  128 outputs are
 /// the unit of the H128 transform, so a task never covers less than one block.
+/// This is the unit of the transform and of the task, not of the tile order:
+/// the two are separate, and an order may group any number of tiles.
 constexpr int64_t kTileBlock = 128 / 16;
 
 /// The index of the tile (tile_k, tile_n) inside a trellis of the given order.
@@ -37,6 +52,7 @@ constexpr size_t trellis_tile_index(TileOrder order, int64_t tile_k, int64_t til
     if (order == TileOrder::cpu_block)
         return static_cast<size_t>((tile_n / kTileBlock) * tiles_k * kTileBlock + tile_k * kTileBlock +
                                     tile_n % kTileBlock);
+    if (order == TileOrder::cpu_nmajor) return static_cast<size_t>(tile_n * tiles_k + tile_k);
     return static_cast<size_t>(tile_k * tiles_n + tile_n);
 }
 

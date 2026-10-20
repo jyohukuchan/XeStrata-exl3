@@ -81,8 +81,8 @@ bool describe_expert(const Archive& archive, const ExpertTensorNames& names,
 /// Materialize only the three projections named by `names`. Packed components
 /// retain their exact binary16 bits; raw F16/BF16/F32 components retain their
 /// source bytes and dtype metadata. No full decoded matrix is created.
-/// `order` asks for the CPU block tile order; it is applied only when the
-/// expert supports it, and the resulting order is reported in the blob.
+/// `order` asks for a CPU tile order; it is applied only when the expert
+/// supports it, and the resulting order is reported in the blob.
 bool materialize_expert(const Archive& archive, const ExpertTensorNames& names, ExpertBlob& output, std::string& err,
                         size_t alignment = 8,
                         strata::kernels::exl3::TileOrder order = strata::kernels::exl3::TileOrder::canonical);

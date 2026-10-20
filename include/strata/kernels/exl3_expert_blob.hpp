@@ -51,12 +51,12 @@ static_assert(std::is_standard_layout_v<ExpertComponentLayout>);
 static_assert(std::is_standard_layout_v<ExpertProjectionLayout>);
 static_assert(std::is_standard_layout_v<ExpertBlobLayout>);
 
-/// Whether the CPU block tile order applies to this expert.
+/// Whether a CPU tile order applies to this expert.
 ///
-/// The order groups the compressed tiles of one 128-output block, so it needs a
-/// packed MUL1 trellis whose output width is a multiple of that block.  A raw
-/// projection, another codebook, a mixed expert or a width outside the range
-/// keeps the format's own (canonical) order.
+/// The CPU orders group the compressed tiles of one 128-output block, so they
+/// need a packed MUL1 trellis whose output width is a multiple of that block.
+/// A raw projection, another codebook, a mixed expert or a width outside the
+/// range keeps the format's own (canonical) order.
 inline bool cpu_tile_order_applies(const ExpertBlobLayout& layout) {
     const ExpertProjectionLayout* projections[3] = {&layout.gate, &layout.up, &layout.down};
     for (const ExpertProjectionLayout* projection : projections) {

@@ -59,6 +59,22 @@ void add_linear(std::vector<Tensor>& tensors, const std::string& name, int bits,
     if (codebook == 2) tensors.emplace_back(name + ".mul1", "I32", std::vector<uint64_t>{1}, u32(0x83DCD12Du));
 }
 
+/// The tile order the source's switch selects, read the same way the source
+/// reads it.  The test runs with each of the three orders.
+strata::kernels::exl3::TileOrder selected_tile_order() {
+    using TileOrder = strata::kernels::exl3::TileOrder;
+    const char* value = std::getenv("STRATA_EXL3_CPU_TILE_ORDER");
+    if (value == nullptr) {
+        const char* older = std::getenv("STRATA_EXL3_CPU_BLOCK_ORDER");
+        if (older == nullptr) return TileOrder::cpu_nmajor;
+        return older[0] == '0' ? TileOrder::canonical : TileOrder::cpu_block;
+    }
+    const long code = std::strtol(value, nullptr, 10);
+    if (code == 0) return TileOrder::canonical;
+    if (code == 1) return TileOrder::cpu_block;
+    return TileOrder::cpu_nmajor;
+}
+
 void write_archive(const std::filesystem::path& root, std::vector<strata::artifact::exl3::ExpertTensorNames>& names) {
     std::filesystem::create_directories(root);
     std::ofstream(root / "config.json") << R"({"model_type":"synthetic-exl3-source"})";
@@ -140,13 +156,18 @@ int main() {
     source.begin_layer(1, ids, 2);
     check(source.blob(1, 0) != nullptr && source.blob(1, 1) != nullptr, "second layer materializes independently");
 
-    // The CPU block tile order: the host cache keeps it, the device's copy
-    // keeps the format's own order, and the CPU's results do not change.
+    // The CPU tile orders: the host cache keeps the one the switch selects,
+    // the device's copy keeps the format's own order, and the CPU's results
+    // do not change.
     {
         using TileOrder = strata::kernels::exl3::TileOrder;
-        check(source.exl3_tile_order(1, 0) == TileOrder::cpu_block && source.exl3_tile_order(0, 0) == TileOrder::canonical &&
+        const TileOrder wanted = selected_tile_order();
+        const TileOrder resident_order = source.exl3_tile_order(1, 0);
+        const bool wanted_is_cpu = strata::kernels::exl3::tile_order_is_cpu(wanted);
+        check(resident_order == (wanted_is_cpu ? wanted : TileOrder::canonical) &&
+                  source.exl3_tile_order(0, 0) == TileOrder::canonical &&
                   source.exl3_tile_order(1, 1) == TileOrder::canonical,
-              "only an all-MUL1 expert uses the CPU block order");
+              "only an all-MUL1 expert uses the selected CPU tile order");
         const auto* ordered_layout = source.exl3_layout(1, 0);
         const uint8_t* resident = source.blob(1, 0);
         strata::artifact::exl3::ExpertBlob canonical_blob;
@@ -172,13 +193,13 @@ int main() {
                     other_bytes_equal = false;
             }
         }
-        check(resident != nullptr && trellis_differs && other_bytes_equal,
-              "the host cache holds the CPU block order and the same other bytes");
+        check(resident != nullptr && trellis_differs == wanted_is_cpu && other_bytes_equal,
+              "the host cache holds the selected tile order and the same other bytes");
         // The CPU reads its own order and gets the same result as the
-        // canonical order.
+        // canonical order.  Every CPU order gives the same result.
         const auto canonical_view = strata::kernels::exl3::expert_view(*ordered_layout, canonical_blob.data(),
                                                                        TileOrder::canonical);
-        const auto ordered_view = strata::kernels::exl3::expert_view(*ordered_layout, resident, TileOrder::cpu_block);
+        const auto ordered_view = strata::kernels::exl3::expert_view(*ordered_layout, resident, resident_order);
         std::vector<float> input(128);
         for (size_t i = 0; i < input.size(); ++i) input[i] = 0.03125f * static_cast<float>(static_cast<int>(i % 23) - 11);
         std::vector<float> canonical_output(128), ordered_output(128);
@@ -189,7 +210,25 @@ int main() {
         check(canonical_status == strata::kernels::cpu::exl3::Status::ok &&
                   ordered_status == strata::kernels::cpu::exl3::Status::ok &&
                   std::memcmp(canonical_output.data(), ordered_output.data(), canonical_output.size() * sizeof(float)) == 0,
-              "the CPU block order gives the same expert output");
+              "the selected tile order gives the same expert output");
+        for (const TileOrder order : {TileOrder::cpu_block, TileOrder::cpu_nmajor}) {
+            strata::artifact::exl3::ExpertBlob ordered_blob;
+            std::string order_error;
+            const bool ordered_ok = strata::artifact::exl3::materialize_expert(
+                *archive, names[2], ordered_blob, order_error, 8, order);
+            check(ordered_ok && ordered_blob.tile_order == order, std::string("an expert keeps the ") +
+                                                                        (order == TileOrder::cpu_block ? "block" : "N-major") +
+                                                                        " order it was given");
+            const auto other_view =
+                strata::kernels::exl3::expert_view(*ordered_layout, ordered_blob.data(), order);
+            std::vector<float> other_output(128);
+            const auto other_status = strata::kernels::cpu::exl3::expert(other_view, input.data(), 128,
+                                                                         other_output.data(), 128, 1);
+            check(other_status == strata::kernels::cpu::exl3::Status::ok &&
+                      std::memcmp(canonical_output.data(), other_output.data(), canonical_output.size() * sizeof(float)) == 0,
+                  std::string("the ") + (order == TileOrder::cpu_block ? "block" : "N-major") +
+                      " order gives the same expert output");
+        }
     }
     std::string err;
     auto bad_names = names;

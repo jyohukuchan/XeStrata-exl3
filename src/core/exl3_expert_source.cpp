@@ -59,11 +59,11 @@ uint64_t environment_cap() {
 }
 
 /// The device's copy of a host blob: the same bytes in the canonical tile
-/// order.  A resident blob may hold the CPU block order, and the device
-/// kernels read the canonical one only.
+/// order.  A resident blob may hold a CPU tile order, and the device kernels
+/// read the canonical one only.
 void copy_blob_canonical(const strata::artifact::exl3::ExpertBlob& blob, uint8_t* dst) {
     std::memcpy(dst, blob.data(), blob.bytes());
-    if (blob.tile_order != strata::kernels::exl3::TileOrder::cpu_block) return;
+    if (!strata::kernels::exl3::tile_order_is_cpu(blob.tile_order)) return;
     const strata::kernels::exl3::ExpertProjectionLayout* projections[3] = {&blob.layout.gate, &blob.layout.up,
                                                                            &blob.layout.down};
     for (const auto* projection : projections) {
@@ -72,21 +72,37 @@ void copy_blob_canonical(const strata::artifact::exl3::ExpertBlob& blob, uint8_t
         const auto* source = reinterpret_cast<const uint16_t*>(blob.data() + projection->trellis.offset);
         auto* destination = reinterpret_cast<uint16_t*>(dst + projection->trellis.offset);
         strata::artifact::exl3::copy_packed_tiles(source, destination, projection->k, projection->n, projection->bits,
-                                                  strata::kernels::exl3::TileOrder::cpu_block,
-                                                  strata::kernels::exl3::TileOrder::canonical);
+                                                  blob.tile_order, strata::kernels::exl3::TileOrder::canonical);
     }
 }
 
-/// Whether the host cache keeps the CPU block tile order.  The switch is a
-/// diagnostic knob: with it off the host cache holds the format's own order,
-/// and every result is the same.  The order of a resident blob and the order
-/// the CPU kernels read always agree.
-bool cpu_block_order_enabled() {
-    static const bool enabled = [] {
-        const char* value = std::getenv("STRATA_EXL3_CPU_BLOCK_ORDER");
-        return value == nullptr || value[0] != '0';
+/// The tile order the host cache keeps.
+///
+/// The switch is a diagnostic knob, and every order gives the same results:
+///   STRATA_EXL3_CPU_TILE_ORDER=0  the format's own (canonical) order
+///   STRATA_EXL3_CPU_TILE_ORDER=1  the CPU block order (K-major in a block)
+///   STRATA_EXL3_CPU_TILE_ORDER=2  the CPU N-major order (the default)
+/// STRATA_EXL3_CPU_BLOCK_ORDER, the older name, still selects 0 or 1 when
+/// STRATA_EXL3_CPU_TILE_ORDER is not set.  The order of a resident blob and
+/// the order the CPU kernels read always agree.
+strata::kernels::exl3::TileOrder cpu_tile_order() {
+    static const strata::kernels::exl3::TileOrder order = [] {
+        const char* value = std::getenv("STRATA_EXL3_CPU_TILE_ORDER");
+        if (value == nullptr) {
+            const char* older = std::getenv("STRATA_EXL3_CPU_BLOCK_ORDER");
+            if (older == nullptr) return strata::kernels::exl3::TileOrder::cpu_nmajor;
+            return older[0] == '0' ? strata::kernels::exl3::TileOrder::canonical
+                                   : strata::kernels::exl3::TileOrder::cpu_block;
+        }
+        char* end = nullptr;
+        const long code = std::strtol(value, &end, 10);
+        // A value that is not a number keeps the default order.
+        if (end == value || end == nullptr || *end != '\0') return strata::kernels::exl3::TileOrder::cpu_nmajor;
+        if (code == 0) return strata::kernels::exl3::TileOrder::canonical;
+        if (code == 1) return strata::kernels::exl3::TileOrder::cpu_block;
+        return strata::kernels::exl3::TileOrder::cpu_nmajor;
     }();
-    return enabled;
+    return order;
 }
 
 }  // namespace
@@ -381,10 +397,9 @@ bool Exl3ExpertSource::materialize(size_t at, std::unique_ptr<strata::artifact::
     bool ok = false;
     try {
         blob = std::make_unique<strata::artifact::exl3::ExpertBlob>();
-        // The host cache keeps the CPU block order; a copy for the device keeps
+        // The host cache keeps the CPU tile order; a copy for the device keeps
         // the format's own order, which is the one the device kernels read.
-        const auto order = (copy || !cpu_block_order_enabled()) ? strata::kernels::exl3::TileOrder::canonical
-                                                                 : strata::kernels::exl3::TileOrder::cpu_block;
+        const auto order = copy ? strata::kernels::exl3::TileOrder::canonical : cpu_tile_order();
         ok = strata::artifact::exl3::materialize_expert(*archive_, names_[at], *blob, err, 8, order);
         if (ok && blob->layout.total_bytes != layouts_[at].total_bytes) {
             err = "materialized blob layout changed after metadata discovery";
@@ -535,9 +550,9 @@ strata::kernels::exl3::TileOrder Exl3ExpertSource::exl3_tile_order(int64_t layer
     std::shared_lock<std::shared_mutex> lifecycle(lifecycle_);
     if (!valid_pair(layer, expert)) return strata::kernels::exl3::TileOrder::canonical;
     const auto& layout = layouts_[index(layer, expert)];
-    if (!cpu_block_order_enabled()) return strata::kernels::exl3::TileOrder::canonical;
-    return strata::kernels::exl3::cpu_tile_order_applies(layout) ? strata::kernels::exl3::TileOrder::cpu_block
-                                                                 : strata::kernels::exl3::TileOrder::canonical;
+    const auto order = cpu_tile_order();
+    if (!strata::kernels::exl3::tile_order_is_cpu(order)) return strata::kernels::exl3::TileOrder::canonical;
+    return strata::kernels::exl3::cpu_tile_order_applies(layout) ? order : strata::kernels::exl3::TileOrder::canonical;
 }
 
 bool Exl3ExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {

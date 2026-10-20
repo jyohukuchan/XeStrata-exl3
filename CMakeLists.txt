@@ -831,6 +831,14 @@ if(STRATA_ENABLE_XE)
       ${CMAKE_CURRENT_SOURCE_DIR}/third_party/main/nlohmann-json)
     target_compile_options(exl3_expert_source_test PRIVATE -fno-fast-math -ffp-contract=off)
     add_test(NAME exl3_expert_source_test COMMAND exl3_expert_source_test)
+    # The same source test with each tile order the switch selects: the
+    # format's own order, and the CPU block order beside the N-major default.
+    add_test(NAME exl3_expert_source_canonical_order COMMAND exl3_expert_source_test)
+    set_tests_properties(exl3_expert_source_canonical_order PROPERTIES
+      ENVIRONMENT "STRATA_EXL3_CPU_TILE_ORDER=0" TIMEOUT 120)
+    add_test(NAME exl3_expert_source_block_order COMMAND exl3_expert_source_test)
+    set_tests_properties(exl3_expert_source_block_order PROPERTIES
+      ENVIRONMENT "STRATA_EXL3_CPU_TILE_ORDER=1" TIMEOUT 120)
     add_executable(raw_linear_parity src/kernels/raw_linear_parity.cpp)
     target_link_libraries(raw_linear_parity PRIVATE strata_kernels strata_kernels_cpu)
     target_compile_options(raw_linear_parity PRIVATE -fno-fast-math -ffp-contract=off)
