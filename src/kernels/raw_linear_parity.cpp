@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <cstdio>
 #include <limits>
 #include <vector>
@@ -122,6 +123,32 @@ int main() {
                         bad_cpu == 0 ? "OK" : "FAIL", bad_cpu, bad_gpu == 0 ? "OK" : "FAIL", bad_gpu,
                         bad_padding == 0 ? "OK" : "FAIL", bad_padding);
             if (bad_cpu != 0 || bad_gpu != 0 || bad_padding != 0) ++failures;
+        }
+
+        if (dtype == DType::F16) {
+            // Include normal/subnormal boundaries, signed zeros and nonfinite weights in one GPU case.
+            const uint16_t edges[] = {0x0000, 0x8000, 0x0001, 0x03ff, 0x0400, 0x3c00, 0xbc00,
+                                      0x7bff, 0x7c00, 0xfc00, 0x7e00, 0x7c01};
+            constexpr size_t edge_count = sizeof(edges) / sizeof(edges[0]);
+            std::vector<uint16_t> weights(edge_count * static_cast<size_t>(k), 0);
+            std::vector<float> input(static_cast<size_t>(k), 0.0f), output(edge_count), expected(edge_count);
+            input[0] = 1.0f;
+            for (size_t i = 0; i < edge_count; ++i) { weights[i * static_cast<size_t>(k)] = edges[i]; expected[i] = f32_from_f16(edges[i]); }
+            strata::parity::Device device;
+            const LinearView v{device.upload(weights), nullptr, k, static_cast<int64_t>(edge_count), DType::F16};
+            auto* dy = device.alloc<float>(edge_count);
+            strata::kernels::raw::linear_fp32(queue, v, device.upload(input), k, dy,
+                                             static_cast<int64_t>(edge_count), 1).wait_and_throw();
+            strata::parity::copy_out(output.data(), dy, edge_count);
+            size_t bad = 0;
+            for (size_t i = 0; i < edge_count; ++i) {
+                const bool same = std::isnan(expected[i]) ? std::isnan(output[i]) :
+                    expected[i] == 0.0f ? output[i] == 0.0f :
+                    std::memcmp(&output[i], &expected[i], sizeof(float)) == 0;
+                if (!same) ++bad;
+            }
+            std::printf("F16 GPU edge weights: %s (%zu bad)\n", bad ? "FAIL" : "OK", bad);
+            if (bad) ++failures;
         }
 
         // NaN/Inf are ordinary floating-point weights: no special clamping or filtering is allowed.

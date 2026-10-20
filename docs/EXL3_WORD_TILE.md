@@ -56,3 +56,36 @@ previous computation. Mixed bit widths and projection storage in the format tabl
 No additional global scratch or decoded weight cache is allocated. The existing device plan and event dependencies
 are retained, as are Hpre, Hpost, bias and group/token/destination validation. The flag is evaluated during graph
 capture; recreate the session after changing it.
+
+## Wide output projections
+
+For wide codebook 2 matrices that do not use the existing packed path, an SG32 path shares compressed words and
+adjacent products. The lower sixteen lanes add products in ascending K order, retaining the previous scalar FP32
+addition order. It supports bit widths 1–8, bias, Hpre/Hpost, multiple rows and leading dimensions without additional
+global scratch. Devices without SG32 and other codebooks retain the previous path.
+
+Enabled by default. Set `STRATA_EXL3_WIDE_WORD_TILE=0` to restore the previous scalar path. This is independent of
+the Dense preload flag.
+
+## Dense wave scheduling
+
+With `STRATA_EXL3_WORD_TILE_PRELOAD=1`, the packed codebook 2 path selects the number of physical waves from the
+independent output tile count and the device's compute unit count and work-group capacity. Each original logical K
+partition retains its accumulation, and partials are added in the same order. A wave handling multiple logical
+partitions computes their accumulators independently, preserving FP32 addition order.
+
+Enabled by default. Set `STRATA_EXL3_DENSE_SCHEDULE=0` to restore the previous wave layout. This does not apply to
+the wide scalar path.
+
+## Raw projections
+
+Raw F16/BF16/F32 projections use dtype-specific kernels and unrolled K loads. When independent outputs do not
+provide enough parallelism, device capacity and local memory determine a work-group that stages temporary F32
+products locally, preserving the original 32-lane addition order without extra global scratch.
+On devices supporting FP16, normal
+F16 values use native conversion. Zeros, subnormals and nonfinite values retain the software conversion independently
+of the FP16 denormal mode. Inputs remain F32, and each lane's accumulation order and subgroup reduction are retained.
+Weights are not expanded into an additional copy.
+
+Enabled by default. Set `STRATA_EXL3_RAW_SPECIALIZED=0` to restore the previous dtype-generic kernel.
+Recreate sessions using captured graphs after changing any of these flags.

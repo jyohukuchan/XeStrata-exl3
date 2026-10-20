@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 
@@ -106,6 +107,100 @@ sycl::event linear_fp32_cooperative(sycl::queue& queue, const LinearView& view, 
     });
 }
 
+template <DType Type, bool NativeHalf>
+inline float raw_weight(const LinearView& view, size_t index) {
+    float weight;
+    if constexpr (Type == DType::F16) {
+        const uint16_t bits = static_cast<const uint16_t*>(view.data)[index];
+        if constexpr (NativeHalf) {
+            // Convert normal halves directly. Preserve software handling of zeros, subnormals
+            // and nonfinite values independently of the device's FP16 denormal mode.
+            const unsigned exponent = bits & 0x7c00u;
+            weight = exponent != 0 && exponent != 0x7c00u ?
+                static_cast<float>(sycl::bit_cast<sycl::half>(bits)) : f32_from_f16(bits);
+        } else weight = f32_from_f16(bits);
+    } else if constexpr (Type == DType::BF16)
+        weight = f32_from_bf16(static_cast<const uint16_t*>(view.data)[index]);
+    else
+        weight = static_cast<const float*>(view.data)[index];
+    return weight;
+}
+
+template <DType Type, bool NativeHalf = false>
+sycl::event linear_fp32_specialized(sycl::queue& queue, const LinearView& view, const float* x, int64_t ldx,
+                                    float* y, int64_t ldy, int64_t rows, const std::vector<sycl::event>& deps) {
+    constexpr size_t kSubgroup = 32;
+    const size_t groups = static_cast<size_t>(rows) * static_cast<size_t>(view.n);
+    return queue.submit([&](sycl::handler& h) {
+        if (!deps.empty()) h.depends_on(deps);
+        h.parallel_for(sycl::nd_range<1>(groups * kSubgroup, kSubgroup), [=](sycl::nd_item<1> item)
+                       [[sycl::reqd_sub_group_size(32)]] {
+            const sycl::sub_group subgroup = item.get_sub_group();
+            const size_t group = static_cast<size_t>(item.get_group_linear_id());
+            const int64_t row = static_cast<int64_t>(group / static_cast<size_t>(view.n));
+            const int64_t out = static_cast<int64_t>(group % static_cast<size_t>(view.n));
+            const int lane = static_cast<int>(subgroup.get_local_linear_id());
+            const size_t base = static_cast<size_t>(out) * static_cast<size_t>(view.k);
+            const float* xr = x + row * ldx;
+            float value = 0.0f;
+            #pragma unroll 4
+            for (int64_t in = lane; in < view.k; in += static_cast<int64_t>(kSubgroup)) {
+                const float weight = raw_weight<Type, NativeHalf>(view, base + static_cast<size_t>(in));
+                value += xr[in] * weight;
+            }
+            value = sycl::reduce_over_group(subgroup, value, sycl::plus<float>());
+            if (lane == 0) y[row * ldy + out] = value + (view.bias == nullptr ? 0.0f : view.bias[out]);
+        });
+    });
+}
+
+// For a small number of outputs, parallelize product loads without changing the original
+// 32-lane accumulation streams. Products are ephemeral local memory, never expanded weights.
+template <DType Type, bool NativeHalf>
+sycl::event linear_fp32_products(sycl::queue& queue, const LinearView& view, const float* x, int64_t ldx,
+                                 float* y, int64_t ldy, int64_t rows, size_t threads,
+                                 const std::vector<sycl::event>& deps) {
+    const size_t groups = static_cast<size_t>(rows) * static_cast<size_t>(view.n);
+    return queue.submit([&](sycl::handler& h) {
+        if (!deps.empty()) h.depends_on(deps);
+        sycl::local_accessor<float, 1> products(sycl::range<1>(static_cast<size_t>(view.k)), h);
+        h.parallel_for(sycl::nd_range<1>(groups * threads, threads), [=](sycl::nd_item<1> item)
+                       [[sycl::reqd_sub_group_size(32)]] {
+            const size_t group = item.get_group_linear_id();
+            const int64_t row = static_cast<int64_t>(group / static_cast<size_t>(view.n));
+            const int64_t out = static_cast<int64_t>(group % static_cast<size_t>(view.n));
+            const int64_t t = static_cast<int64_t>(item.get_local_id(0));
+            const float* xr = x + row * ldx;
+            const size_t base = static_cast<size_t>(out) * static_cast<size_t>(view.k);
+            for (int64_t in = t; in < view.k; in += static_cast<int64_t>(threads))
+                products[static_cast<size_t>(in)] = xr[in] * raw_weight<Type, NativeHalf>(view, base + static_cast<size_t>(in));
+            item.barrier(sycl::access::fence_space::local_space);
+            if (t < 32) {
+                float value = 0.0f;
+                for (int64_t in = t; in < view.k; in += 32) value += products[static_cast<size_t>(in)];
+                value = sycl::reduce_over_group(item.get_sub_group(), value, sycl::plus<float>());
+                if (t == 0) y[row * ldy + out] = value + (view.bias == nullptr ? 0.0f : view.bias[out]);
+            }
+        });
+    });
+}
+
+template <DType Type, bool NativeHalf = false>
+sycl::event select_raw_kernel(sycl::queue& queue, const LinearView& view, const float* x, int64_t ldx,
+                              float* y, int64_t ldy, int64_t rows, const std::vector<sycl::event>& deps) {
+    const auto device = queue.get_device();
+    const uint64_t max_waves = std::min<uint64_t>(device.get_info<sycl::info::device::max_work_group_size>() / 32,
+                                                 device.get_info<sycl::info::device::max_num_sub_groups>());
+    const uint64_t capacity = static_cast<uint64_t>(device.get_info<sycl::info::device::max_compute_units>()) * max_waves;
+    const uint64_t groups = static_cast<uint64_t>(rows) * static_cast<uint64_t>(view.n);
+    const uint64_t required = capacity / groups + (capacity % groups != 0 ? 1 : 0);
+    const uint64_t useful = static_cast<uint64_t>(view.k / 32 + (view.k % 32 != 0 ? 1 : 0));
+    const size_t waves = static_cast<size_t>(std::min({max_waves, required, useful}));
+    if (waves > 1 && static_cast<uint64_t>(view.k) <= device.get_info<sycl::info::device::local_mem_size>() / sizeof(float))
+        return linear_fp32_products<Type, NativeHalf>(queue, view, x, ldx, y, ldy, rows, waves * 32, deps);
+    return linear_fp32_specialized<Type, NativeHalf>(queue, view, x, ldx, y, ldy, rows, deps);
+}
+
 }  // namespace
 
 sycl::event linear_fp32(sycl::queue& queue, const LinearView& view, const float* x, int64_t ldx, float* y,
@@ -114,7 +209,17 @@ sycl::event linear_fp32(sycl::queue& queue, const LinearView& view, const float*
     const uint64_t groups = static_cast<uint64_t>(rows) * static_cast<uint64_t>(view.n);
     if (groups > std::numeric_limits<size_t>::max() / 32 || !cooperative_capable(queue))
         return linear_fp32_scalar(queue, view, x, ldx, y, ldy, rows, deps);
-    return linear_fp32_cooperative(queue, view, x, ldx, y, ldy, rows, deps);
+    const char* text = std::getenv("STRATA_EXL3_RAW_SPECIALIZED");
+    if (text != nullptr && text[0] == '0' && text[1] == '\0')
+        return linear_fp32_cooperative(queue, view, x, ldx, y, ldy, rows, deps);
+    switch (view.dtype) {
+        case DType::F16:
+            if (queue.get_device().has(sycl::aspect::fp16))
+                return select_raw_kernel<DType::F16, true>(queue, view, x, ldx, y, ldy, rows, deps);
+            return select_raw_kernel<DType::F16>(queue, view, x, ldx, y, ldy, rows, deps);
+        case DType::BF16: return select_raw_kernel<DType::BF16>(queue, view, x, ldx, y, ldy, rows, deps);
+        default: return select_raw_kernel<DType::F32>(queue, view, x, ldx, y, ldy, rows, deps);
+    }
 }
 
 void validate_embedding(const void* table, DType dtype, size_t row_bytes, const int32_t* tokens, int64_t n_tok,

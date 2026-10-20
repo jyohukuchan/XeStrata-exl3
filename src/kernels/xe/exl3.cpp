@@ -356,7 +356,7 @@ sycl::event submit_packed_dot_word_cache(sycl::queue& queue, const MatrixView& v
     const int64_t n_tiles = view.n / 16, k_tiles = view.k / 16;
     const size_t groups = static_cast<size_t>(rows) * static_cast<size_t>(n_tiles);
     const size_t local_size = static_cast<size_t>(waves_per_group * subgroup_size);
-    const size_t local_reduce_words = static_cast<size_t>(waves_per_group) * 16;
+    const size_t local_reduce_words = static_cast<size_t>(split_k) * 16;
     return queue.submit([&](sycl::handler& h) {
         if (!deps.empty()) h.depends_on(deps);
         sycl::local_accessor<float, 1> partial(sycl::range<1>(local_reduce_words), h);
@@ -369,23 +369,25 @@ sycl::event submit_packed_dot_word_cache(sycl::queue& queue, const MatrixView& v
             const size_t group = static_cast<size_t>(item.get_group_linear_id());
             const int64_t row = static_cast<int64_t>(group / static_cast<size_t>(n_tiles));
             const int64_t tile_n = static_cast<int64_t>(group % static_cast<size_t>(n_tiles));
-            const int64_t kb_begin = (k_tiles * wave) / split_k, kb_end = (k_tiles * (wave + 1)) / split_k;
             const float* input = x + row * ldx;
-            float accum = 0.0f;
-            for (int64_t k_tile = kb_begin; k_tile < kb_end; ++k_tile) {
-                const uint16_t* source = view.trellis +
-                    (static_cast<size_t>(k_tile) * static_cast<size_t>(n_tiles) + static_cast<size_t>(tile_n)) *
-                    static_cast<size_t>(16 * Bits);
-                // Assemble logical words with the existing uint16 loads: no uint32 pointer cast or halo.
-                word_cache::DistributedTile<Bits> words{0, 0};
-                if (lane < Bits * 8) words.bank0 = load_word32(source, lane, Bits * 8);
-                if constexpr (Bits > 4)
-                    if (lane + 32 < Bits * 8) words.bank1 = load_word32(source, lane + 32, Bits * 8);
-                float sum = 0.0f;
-                accumulate_word_tile<Bits>(words, subgroup, lane, input, k_tile, sum);
-                accum += sum + sycl::select_from_group(subgroup, sum, lane ^ 16);
+            for (int logical = wave; logical < split_k; logical += waves_per_group) {
+                const int64_t kb_begin = (k_tiles * logical) / split_k, kb_end = (k_tiles * (logical + 1)) / split_k;
+                float accum = 0.0f;
+                for (int64_t k_tile = kb_begin; k_tile < kb_end; ++k_tile) {
+                    const uint16_t* source = view.trellis +
+                        (static_cast<size_t>(k_tile) * static_cast<size_t>(n_tiles) + static_cast<size_t>(tile_n)) *
+                        static_cast<size_t>(16 * Bits);
+                    // Assemble logical words with the existing uint16 loads: no uint32 pointer cast or halo.
+                    word_cache::DistributedTile<Bits> words{0, 0};
+                    if (lane < Bits * 8) words.bank0 = load_word32(source, lane, Bits * 8);
+                    if constexpr (Bits > 4)
+                        if (lane + 32 < Bits * 8) words.bank1 = load_word32(source, lane + 32, Bits * 8);
+                    float sum = 0.0f;
+                    accumulate_word_tile<Bits>(words, subgroup, lane, input, k_tile, sum);
+                    accum += sum + sycl::select_from_group(subgroup, sum, lane ^ 16);
+                }
+                if (lane < 16) partial[static_cast<size_t>(logical) * 16 + static_cast<size_t>(lane)] = accum;
             }
-            if (lane < 16) partial[static_cast<size_t>(wave) * 16 + static_cast<size_t>(lane)] = accum;
             item.barrier();
             if (wave == 0 && lane < 16) {
                 float sum = 0.0f;
@@ -397,6 +399,60 @@ sycl::event submit_packed_dot_word_cache(sycl::queue& queue, const MatrixView& v
             }
         });
     });
+}
+
+// Wide outputs have enough independent tiles to use a single subgroup per tile. Exchange each
+// adjacent product pair so the lower sixteen lanes retain scalar K=0..k-1 FP32 addition order.
+template <int Bits, int RR = 0>
+inline void accumulate_wide_tile(const word_cache::DistributedTile<Bits>& words,
+                                 const sycl::sub_group& subgroup, int lane, const float* input,
+                                 int64_t k_tile, float& sum) {
+    const int r = 2 * RR + (lane >> 4);
+    const float product = input[k_tile * 16 + r] * scalar_decode_codebook_f32<2>(words.template state<RR>(subgroup, lane));
+    const float other = sycl::select_from_group(subgroup, product, lane ^ 16);
+    if (lane < 16) { sum += product; sum += other; }
+    if constexpr (RR < 7) accumulate_wide_tile<Bits, RR + 1>(words, subgroup, lane, input, k_tile, sum);
+}
+
+template <int Bits>
+sycl::event submit_wide_word_dot(sycl::queue& queue, const MatrixView& view, const float* x, int64_t ldx,
+                                 float* y, int64_t ldy, int64_t rows,
+                                 const std::vector<sycl::event>& deps, bool add_bias) {
+    const int64_t n_tiles = view.n / 16, k_tiles = view.k / 16;
+    const size_t groups = static_cast<size_t>(rows) * static_cast<size_t>(n_tiles);
+    return queue.submit([&](sycl::handler& h) {
+        if (!deps.empty()) h.depends_on(deps);
+        h.parallel_for(sycl::nd_range<1>(groups * 32, 32), [=](sycl::nd_item<1> item)
+                       [[sycl::reqd_sub_group_size(32)]] {
+            const auto subgroup = item.get_sub_group();
+            const int lane = static_cast<int>(subgroup.get_local_id()[0]) & 31;
+            const size_t group = item.get_group_linear_id();
+            const int64_t row = static_cast<int64_t>(group / static_cast<size_t>(n_tiles));
+            const int64_t tile_n = static_cast<int64_t>(group % static_cast<size_t>(n_tiles));
+            const float* input = x + row * ldx;
+            float sum = 0.0f;
+            for (int64_t kt = 0; kt < k_tiles; ++kt) {
+                const uint16_t* source = view.trellis +
+                    (static_cast<size_t>(kt) * static_cast<size_t>(n_tiles) + static_cast<size_t>(tile_n)) *
+                    static_cast<size_t>(16 * Bits);
+                word_cache::DistributedTile<Bits> words{0, 0};
+                if (lane < Bits * 8) words.bank0 = load_word32(source, lane, Bits * 8);
+                if constexpr (Bits > 4)
+                    if (lane + 32 < Bits * 8) words.bank1 = load_word32(source, lane + 32, Bits * 8);
+                accumulate_wide_tile<Bits>(words, subgroup, lane, input, kt, sum);
+            }
+            if (lane < 16) {
+                const int64_t col = tile_n * 16 + lane;
+                if (add_bias && view.bias != nullptr) sum += f32_from_f16(view.bias[col]);
+                y[row * ldy + col] = sum;
+            }
+        });
+    });
+}
+
+bool wide_word_enabled() {
+    const char* text = std::getenv("STRATA_EXL3_WIDE_WORD_TILE");
+    return text == nullptr || !(text[0] == '0' && text[1] == '\0');
 }
 
 bool packed_dot_capability(const sycl::queue& queue, const MatrixView& view, int64_t rows,
@@ -435,12 +491,44 @@ bool submit_packed_dot_dispatch(sycl::queue& queue, const MatrixView& view, cons
                                 int64_t ldy, int64_t rows, const std::vector<sycl::event>& deps, bool add_bias,
                                 sycl::event& result) {
     int subgroup_size = 0, split_k = 0, waves_per_group = 0;
-    if (!packed_dot_capability(queue, view, rows, subgroup_size, split_k, waves_per_group)) return false;
+    if (!packed_dot_capability(queue, view, rows, subgroup_size, split_k, waves_per_group)) {
+        if (view.codebook != 2 || !wide_word_enabled() || view.k % 16 != 0 || view.n % 16 != 0 || rows <= 0)
+            return false;
+        const auto sizes = queue.get_device().get_info<sycl::info::device::sub_group_sizes>();
+        if (std::find(sizes.begin(), sizes.end(), size_t(32)) == sizes.end() ||
+            queue.get_device().get_info<sycl::info::device::max_work_group_size>() < 32) return false;
+        switch (view.bits) {
+#define EXL3_WIDE_WORD_CASE(B) \
+            case B: result = submit_wide_word_dot<B>(queue, view, x, ldx, y, ldy, rows, deps, add_bias); return true
+            EXL3_WIDE_WORD_CASE(1);
+            EXL3_WIDE_WORD_CASE(2);
+            EXL3_WIDE_WORD_CASE(3);
+            EXL3_WIDE_WORD_CASE(4);
+            EXL3_WIDE_WORD_CASE(5);
+            EXL3_WIDE_WORD_CASE(6);
+            EXL3_WIDE_WORD_CASE(7);
+            EXL3_WIDE_WORD_CASE(8);
+#undef EXL3_WIDE_WORD_CASE
+            default: return false;
+        }
+    }
+    // Preserve all logical K partitions and their reduction order, but use fewer physical waves
+    // when independent output tiles already cover the device's reported work-group wave capacity.
+    const char* schedule = std::getenv("STRATA_EXL3_DENSE_SCHEDULE");
+    const bool reschedule = schedule == nullptr || !(schedule[0] == '0' && schedule[1] == '\0');
+    int physical_waves = waves_per_group;
+    if (reschedule && view.codebook == 2 && word_tile_preload_enabled()) {
+        const uint64_t capacity = static_cast<uint64_t>(queue.get_device().get_info<sycl::info::device::max_compute_units>()) *
+                                  static_cast<uint64_t>(waves_per_group);
+        const uint64_t groups = static_cast<uint64_t>(rows) * static_cast<uint64_t>(view.n / 16);
+        const uint64_t waves = capacity / groups + (capacity % groups != 0 ? 1 : 0);
+        physical_waves = static_cast<int>(std::max<uint64_t>(1, std::min<uint64_t>(waves_per_group, waves)));
+    }
     #define EXL3_PACKED_DOT(B, C) \
         do { \
             if constexpr (C == 2) { \
                 if (word_tile_preload_enabled()) \
-                    result = submit_packed_dot_word_cache<B>(queue, view, x, ldx, y, ldy, rows, deps, add_bias, split_k, subgroup_size, waves_per_group); \
+                    result = submit_packed_dot_word_cache<B>(queue, view, x, ldx, y, ldy, rows, deps, add_bias, split_k, subgroup_size, physical_waves); \
                 else \
                     result = submit_packed_dot<B, C>(queue, view, x, ldx, y, ldy, rows, deps, add_bias, split_k, subgroup_size, waves_per_group); \
             } else \

@@ -56,3 +56,32 @@ format table内でbit幅やprojection形式が混在する場合も、各project
 追加のglobal scratchや展開済みweightを保持しない。既存のdevice上のplanとevent依存関係を使い、
 Hpre・Hpost・biasとgroup/token/destinationの検証は変わらない。
 flagはgraph capture時に評価するため、変更した場合はsessionを作り直す。
+
+## 出力幅の大きい射影
+
+既存packed経路で処理しない出力幅の大きいcodebook 2の行列には、SG32内で圧縮wordと隣接する積を共有する経路を使う。
+下位16 laneはK=0から順番に積を加算し、従来のscalar経路のFP32加算順を保つ。
+bit幅1〜8、bias、Hpre/Hpostと複数行・leading dimensionに対応し、追加global scratchを要求しない。
+SG32非対応deviceと他のcodebookは従来の経路を使う。
+
+既定で有効。`STRATA_EXL3_WIDE_WORD_TILE=0` で従来のscalar経路へ戻る。Denseの先読みflagとは独立している。
+
+## Denseのwave配置
+
+`STRATA_EXL3_WORD_TILE_PRELOAD=1` のpacked codebook 2経路では、独立した出力tile数とdeviceのcompute unit数・workgroup容量から、
+実際に実行するwave数を選ぶ。従来の論理K分割ごとの積和を保持し、同じ順序でpartialを加算する。
+論理分割を複数担当するwaveも、分割ごとの累積値を独立して計算するため、FP32加算順は変わらない。
+
+既定で有効。`STRATA_EXL3_DENSE_SCHEDULE=0` で従来のwave配置へ戻る。出力幅の大きいscalar経路には適用しない。
+
+## Raw射影
+
+F16/BF16/F32のraw射影ではdtypeごとのkernelを使い、K方向のloadを展開する。
+独立した出力が少なくK方向の並列性を増やせる場合は、device能力とlocal memory容量からworkgroupを選び、
+一時的なF32の積をlocal memoryへ置く。従来の32 laneの加算順を保ち、global scratchは増やさない。
+FP16に対応するdeviceでは、F16の正規数の変換にnative conversionを使う。
+ゼロ・非正規数・非有限値は従来のsoftware変換を使い、FP16 denormal modeに依存しない。
+入力はF32のままで、各laneの積和順とsubgroup reductionを保つ。重みの追加展開は行わない。
+
+既定で有効。`STRATA_EXL3_RAW_SPECIALIZED=0` で従来のdtype共通kernelへ戻る。
+各flagの変更後は、capture済みのgraphを使うsessionを作り直す。
