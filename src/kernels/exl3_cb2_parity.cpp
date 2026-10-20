@@ -8,7 +8,9 @@
 // The half fused multiply add of the reference decoder and the portable form return the same F16 bits
 // for every byte sum; this program checks that on the device, for every byte sum (0..1020) and for
 // every 16-bit state (0..65535), and checks that the projections themselves return the same values
-// with the half form and with the portable form.
+// with the half form and with the portable form.  It checks the two byte-sum forms as well: the
+// unsigned dot product and the signed one with the sign bits flipped must return the same sum, and
+// the host's reference must agree with both, for every byte sum and for every state.
 #include "strata/kernels/exl3.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "xe/exl3_cb2.hpp"
@@ -47,11 +49,15 @@ uint16_t oracle_bits(int byte_sum) {
     return strata::kernels::f16_from_f32(narrowed);
 }
 
-// The byte sum of a state, on the host: the four bytes of state * 0x83DCD12D.
-int host_byte_sum(uint16_t state) {
-    const uint32_t product = (uint32_t) state * kMul1;
+// The byte sum of a product, on the host: the four bytes of the product.
+int host_byte_sum_of_product(uint32_t product) {
     return (int) ((product & 0xFFu) + ((product >> 8) & 0xFFu) + ((product >> 16) & 0xFFu) +
                   ((product >> 24) & 0xFFu));
+}
+
+// The byte sum of a state, on the host: the four bytes of state * 0x83DCD12D.
+int host_byte_sum(uint16_t state) {
+    return host_byte_sum_of_product((uint32_t) state * kMul1);
 }
 
 uint32_t float_bits(float value) {
@@ -105,25 +111,81 @@ bool check_byte_sums(sycl::queue& queue, strata::parity::Device& device, bool ha
     return bad == 0;
 }
 
+// The two byte-sum forms, for every byte sum and for every 16-bit state: the unsigned dot product and the
+// signed one with the sign bits flipped must return the same sum, and the host's reference must agree with
+// both.  The F16 operand of the half form (0x6400 + B) must be the same number as well.
+bool check_byte_sum_forms(sycl::queue& queue, strata::parity::Device& device) {
+    constexpr size_t sum_count = (size_t) kMaxByteSum + 1;
+    constexpr size_t state_count = 65536;
+    constexpr size_t count = sum_count + state_count;
+    int* d_unsigned = device.alloc<int>(count);
+    int* d_signed = device.alloc<int>(count);
+    uint16_t* d_operands = device.alloc<uint16_t>(count);
+    int* d_native = device.alloc<int>(1);
+    queue.submit([&](sycl::handler& h) {
+        h.parallel_for(sycl::range<1>(count), [=](sycl::id<1> id) {
+            const size_t i = id[0];
+            // In the first part the product is the byte sum itself (its other three bytes are zero); in the
+            // second it is the mul1 product of a state.
+            const uint32_t product = i < sum_count ? (uint32_t) i : (uint32_t) (i - sum_count) * kMul1;
+            const int unsigned_sum = strata::kernels::exl3::cb2_byte_sum(product);
+            const int signed_sum = strata::kernels::exl3::cb2_byte_sum_signed(product);
+            d_unsigned[i] = unsigned_sum;
+            d_signed[i] = signed_sum;
+            d_operands[i] = strata::kernels::exl3::cb2_half_bits(unsigned_sum);
+        });
+    }).wait_and_throw();
+    queue.submit([&](sycl::handler& h) {
+        h.single_task([=] { d_native[0] = strata::kernels::exl3::cb2_unsigned_dot_native() ? 1 : 0; });
+    }).wait_and_throw();
+    std::vector<int> unsigned_sums(count), signed_sums(count), native(1, 0);
+    std::vector<uint16_t> operands(count);
+    strata::parity::copy_out(unsigned_sums.data(), d_unsigned, count);
+    strata::parity::copy_out(signed_sums.data(), d_signed, count);
+    strata::parity::copy_out(operands.data(), d_operands, count);
+    strata::parity::copy_out(native.data(), d_native, 1);
+
+    size_t bad = 0;
+    for (size_t i = 0; i < count; ++i) {
+        const uint32_t product = i < sum_count ? (uint32_t) i : (uint32_t) (i - sum_count) * kMul1;
+        const int want = host_byte_sum_of_product(product);
+        const bool ok = unsigned_sums[i] == want && signed_sums[i] == want &&
+                        operands[i] == (uint16_t) (0x6400u + (unsigned) want);
+        if (!ok) {
+            if (bad < 8)
+                std::printf("product %08x: unsigned %d signed %d host %d operand %04x\n", product, unsigned_sums[i],
+                            signed_sums[i], want, operands[i]);
+            ++bad;
+        }
+    }
+    std::printf("byte-sum forms (%zu byte sums, %zu states): %s (%zu of %zu bad, %s dot product)\n", sum_count,
+                state_count, bad == 0 ? "OK" : "FAIL", bad, count, native[0] ? "unsigned" : "signed");
+    return bad == 0;
+}
+
 // Every 16-bit state, decoded on the device in both forms.  The state is what the grouped path extracts
 // from a compressed tile, and its byte sum is what the decode turns into a value.
 bool check_states(sycl::queue& queue, strata::parity::Device& device, bool half_available) {
     constexpr size_t count = 65536;
     int* d_sums = device.alloc<int>(count);
+    int* d_signed_sums = device.alloc<int>(count);
     uint16_t* d_portable_bits = device.alloc<uint16_t>(count);
     uint16_t* d_half_bits = device.alloc<uint16_t>(count);
     queue.submit([&](sycl::handler& h) {
         h.parallel_for(sycl::range<1>(count), [=](sycl::id<1> id) {
             const uint16_t state = (uint16_t) id[0];
-            const int byte_sum = strata::kernels::exl3::cb2_byte_sum((uint32_t) state * kMul1);
+            const uint32_t product = (uint32_t) state * kMul1;
+            const int byte_sum = strata::kernels::exl3::cb2_byte_sum(product);
             d_sums[id[0]] = byte_sum;
+            d_signed_sums[id[0]] = strata::kernels::exl3::cb2_byte_sum_signed(product);
             d_portable_bits[id[0]] = strata::kernels::exl3::cb2_portable_bits(byte_sum);
             if (half_available) d_half_bits[id[0]] = strata::kernels::exl3::cb2_half_value_bits(byte_sum);
         });
     }).wait_and_throw();
-    std::vector<int> sums(count);
+    std::vector<int> sums(count), signed_sums(count);
     std::vector<uint16_t> portable_bits(count), half_bits(count);
     strata::parity::copy_out(sums.data(), d_sums, count);
+    strata::parity::copy_out(signed_sums.data(), d_signed_sums, count);
     strata::parity::copy_out(portable_bits.data(), d_portable_bits, count);
     strata::parity::copy_out(half_bits.data(), d_half_bits, count);
 
@@ -133,12 +195,12 @@ bool check_states(sycl::queue& queue, strata::parity::Device& device, bool half_
     for (size_t i = 0; i < count; ++i) {
         const int want_sum = host_byte_sum((uint16_t) i);
         const uint16_t want_bits = oracle_bits(want_sum);
-        bool ok = sums[i] == want_sum && portable_bits[i] == want_bits;
+        bool ok = sums[i] == want_sum && signed_sums[i] == want_sum && portable_bits[i] == want_bits;
         if (half_available) ok = ok && half_bits[i] == want_bits;
         if (!ok) {
             if (bad < 8)
-                std::printf("state %5zu: sum %d (want %d) portable %04x half %04x oracle %04x\n", i, sums[i], want_sum,
-                            portable_bits[i], half_available ? half_bits[i] : 0, want_bits);
+                std::printf("state %5zu: sum %d signed %d (want %d) portable %04x half %04x oracle %04x\n", i, sums[i],
+                            signed_sums[i], want_sum, portable_bits[i], half_available ? half_bits[i] : 0, want_bits);
             ++bad;
         }
         if (!seen[want_sum]) {
@@ -289,6 +351,7 @@ int main(int argc, char** argv) {
 
     int failures = 0;
     if (!check_byte_sums(queue, device, half_available)) ++failures;
+    if (!check_byte_sum_forms(queue, device)) ++failures;
     if (!check_states(queue, device, half_available)) ++failures;
 
     // The switch: "0" forces the portable form, anything else leaves the choice to the device.

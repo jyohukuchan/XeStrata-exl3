@@ -5,6 +5,20 @@
 // EXL3 codebook rules follow exllamav3's MIT-licensed implementation.
 // src/kernels/xe/exl3_cb2.hpp - the codebook 2 (mul1) decode, in the portable form and in half precision.
 //
+// The byte sum B of the mul1 product is the sum of its four bytes, 0..1020.  The reference decoder computes it
+// with an unsigned dot product and no sign flip: its __dp4a is the unsigned dot4 (exllamav3's hip_compat.hip.h
+// maps it to __builtin_amdgcn_udot4).  The targets that have an unsigned dot product use it here; the ones
+// that have only a signed one keep the sign bits flipped and 512 added, which gives the same sum, because
+// sum(u_i - 128) + 512 = sum(u_i).  The two forms are compared with each other, and with the host's
+// reference, for every byte sum and for every 16-bit state (src/kernels/exl3_cb2_parity.cpp).
+//
+// The choice is per device image, not per device: the AMD, the NVIDIA and the SPIR-V images are compiled
+// separately (CMakeLists.txt's -fsycl-targets) and the SYCL runtime hands a device the image that was built
+// for its architecture, so the code a device runs is the code that was compiled for that image.  A device
+// that runs the SPIR-V image (Intel's GPUs, and the AMD GPUs that have no image of their own) gets the
+// signed form: the SPIR-V unsigned dot product has no expansion for the targets that lack the instruction,
+// and that image is built for every device.  The AMD and the NVIDIA images get the unsigned one.
+//
 // The value of a byte sum B is (887 * B - 452608) * 2^-17.  The reference decoder (exllamav3's
 // codebook_rdna.hip.h, `decode_3inst` for codebook 2) computes it with one fused multiply add in half
 // precision:
@@ -37,9 +51,53 @@
 
 namespace strata::kernels::exl3 {
 
-// The unsigned byte sum of the mul1 product.  dp4a is a signed byte dot product, so the sign bit is
-// flipped and 512 is added: this is exactly sum(u_i - 128) + 512 = sum(u_i).
+// The unsigned byte dot product: the sum of the four products of the byte pairs, both operands unsigned,
+// with the accumulator c added to the sum.  Where the target has an instruction for it, one instruction does
+// the whole sum; where it has only the signed one, the sign bits are flipped and the accumulator carries the
+// 512 back, which gives the same number, because sum(u_i - 128) + 512 = sum(u_i).  The byte pairs are the
+// bytes of b taken as signed, so b is 0x01010101 for a byte sum.
+inline uint32_t udot4_bytes(uint32_t a, uint32_t b, uint32_t c) {
+#if defined(__SYCL_DEVICE_ONLY__) && defined(__AMDGCN__) && \
+    (defined(__GFX10__) || defined(__GFX11__) || defined(__GFX12__))
+    // v_dot4_u32_u8, the unsigned byte dot product of gfx10 and later (the dot7-insts feature).  gfx1010,
+    // which lacks it, is no target here either: the shared dp4a wrapper needs its dot1-insts.
+    return __builtin_amdgcn_udot4(a, b, c, false);
+#elif defined(__SYCL_DEVICE_ONLY__) && defined(__NVPTX__) && STRATA_NV_ARCH >= 610
+    // dp4a.u32.u32, the unsigned form of the instruction the shared wrapper uses in its signed form.  It
+    // needs the same architecture (sm_61 and later) and does not saturate either.
+    uint32_t r;
+    asm("dp4a.u32.u32 %0, %1, %2, %3;" : "=r"(r) : "r"(a), "r"(b), "r"(c));
+    return r;
+#else
+    // The signed dot product with the sign bits flipped: every byte counts as u_i - 128, so the sum is the
+    // unsigned sum less 512, and the accumulator adds the 512 back.
+    return (uint32_t) strata::kernels::xe::dp4a(sycl::bit_cast<int32_t>(a ^ 0x80808080u),
+                                                sycl::bit_cast<int32_t>(b), (int) (c + 512u));
+#endif
+}
+
+// Whether the byte sum of this device image uses the unsigned dot product.  The choice is made when the
+// image is compiled (the macros above), and the runtime hands a device the image that was built for it, so
+// the device's own image decides, not the device's name or model.
+inline bool cb2_unsigned_dot_native() {
+#if defined(__SYCL_DEVICE_ONLY__) && defined(__AMDGCN__) && \
+    (defined(__GFX10__) || defined(__GFX11__) || defined(__GFX12__))
+    return true;
+#elif defined(__SYCL_DEVICE_ONLY__) && defined(__NVPTX__) && STRATA_NV_ARCH >= 610
+    return true;
+#else
+    return false;
+#endif
+}
+
+// The unsigned byte sum of the mul1 product: the sum of its four bytes, 0..1020.
 inline int cb2_byte_sum(uint32_t x) {
+    return (int) udot4_bytes(x, 0x01010101u, 0u);
+}
+
+// The same sum, with the signed dot product and the sign bits flipped: this is the form the targets without
+// an unsigned dot product use, and the one the parity test compares the unsigned form with.
+inline int cb2_byte_sum_signed(uint32_t x) {
     return strata::kernels::xe::dp4a(sycl::bit_cast<int32_t>(x ^ 0x80808080u), 0x01010101, 512);
 }
 
