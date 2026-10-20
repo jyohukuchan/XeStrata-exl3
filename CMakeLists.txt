@@ -477,6 +477,7 @@ if(STRATA_ENABLE_XE)
   # ---- strata_engine (P2.S5): the composed layer, the session loop, the expert sources and caches, the
   # verify window and the MTP drafter.  Host code over strata_core's GPU operations (strata/core/gpu.hpp).
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp
+                                   src/core/host_memory_probe.cpp
                                    src/core/remote_experts.cpp src/core/expert_cache.cpp src/core/native_head.cpp
                                    src/core/native_dense.cpp src/core/exl3_dense.cpp
                                    src/core/exl3_weight_set.cpp src/core/exl3_ple.cpp
@@ -536,6 +537,16 @@ if(STRATA_ENABLE_XE)
     add_executable(file_expert_source_test tests/core/file_expert_source_test.cpp)
     target_link_libraries(file_expert_source_test PRIVATE strata_engine)
     add_test(NAME file_expert_source_test COMMAND file_expert_source_test)
+    # the host's RAM and cgroup capacity, read through the handles that stay open (CPU only)
+    add_executable(host_memory_probe_test tests/core/host_memory_probe_test.cpp)
+    target_link_libraries(host_memory_probe_test PRIVATE strata_engine)
+    add_test(NAME host_memory_probe_test COMMAND host_memory_probe_test)
+    # the EXL3 source's capacity guard: it fails closed, it evicts, and it reads the room when it must (CPU only)
+    add_executable(exl3_source_capacity_test tests/core/exl3_source_capacity_test.cpp)
+    target_link_libraries(exl3_source_capacity_test PRIVATE strata_engine)
+    target_include_directories(exl3_source_capacity_test SYSTEM PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/third_party/main/nlohmann-json)
+    add_test(NAME exl3_source_capacity_test COMMAND exl3_source_capacity_test)
     # STRATA_EXCHANGE_ROTATE's ownership table (CPU) and its integration with the source (a GPU)
     add_executable(exchange_storage_test tests/core/exchange_storage_test.cpp)
     target_include_directories(exchange_storage_test PRIVATE include)

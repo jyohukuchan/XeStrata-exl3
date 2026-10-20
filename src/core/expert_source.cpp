@@ -21,7 +21,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <charconv>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -29,7 +28,6 @@
 #include <fstream>
 #include <filesystem>
 #include <sstream>
-#include <string_view>
 #include <limits>
 #include <map>
 #include <memory>
@@ -64,21 +62,6 @@
 namespace strata::core {
 
 namespace detail {
-
-bool cgroup_available_bytes(uint64_t limit, const CgroupMemoryStat& stat, uint64_t& bytes) {
-    bytes = 0;
-    if (!stat.valid) return false;
-
-    // memory.stat's inactive_file can race memory.current, so bound it to charged usage first.
-    uint64_t reclaimable = std::min(stat.inactive_file, stat.current);
-    reclaimable = stat.file_dirty >= reclaimable ? 0 : reclaimable - stat.file_dirty;
-    reclaimable = stat.file_writeback >= reclaimable ? 0 : reclaimable - stat.file_writeback;
-
-    // Reclaiming clean file pages reduces usage; saturating subtraction also handles a transient over-limit read.
-    const uint64_t usage_after_reclaim = stat.current - reclaimable;
-    bytes = usage_after_reclaim < limit ? limit - usage_after_reclaim : 0;
-    return true;
-}
 
 bool make_cache_complement_plan(
     int64_t n_layers, int64_t n_expert, const std::vector<uint64_t>& layer_blob_bytes,
@@ -261,168 +244,9 @@ void unmap_read_only(const uint8_t* view, uint64_t bytes) { munmap((void*) view,
 void close_file(int fd) { ::close(fd); }
 #endif
 
-#if !defined(_WIN32)
-void skip_memory_space(std::string_view& text) {
-    const size_t at = text.find_first_not_of(" \t\n\v\f\r");
-    text.remove_prefix(at == std::string_view::npos ? text.size() : at);
-}
-
-std::string_view take_memory_field(std::string_view& text) {
-    skip_memory_space(text);
-    const size_t end = text.find_first_of(" \t\n\v\f\r");
-    const std::string_view field = text.substr(0, end);
-    text.remove_prefix(field.size());
-    return field;
-}
-
-bool take_memory_u64(std::string_view& text, uint64_t& value) {
-    skip_memory_space(text);
-    if (text.empty()) return false;
-    // Match unsigned stream extraction, including its optional leading sign.
-    const bool negative = text.front() == '-';
-    if (negative || text.front() == '+') text.remove_prefix(1);
-    if (text.empty()) return false;
-    uint64_t magnitude = 0;
-    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), magnitude);
-    if (parsed.ec != std::errc{}) return false;
-    text.remove_prefix(static_cast<size_t>(parsed.ptr - text.data()));
-    value = negative ? uint64_t{0} - magnitude : magnitude;
-    return true;
-}
-#endif
-
-#if defined(__linux__)
-bool read_cgroup_memory_stat(const std::filesystem::path& path, uint64_t current,
-                             detail::CgroupMemoryStat& stat) {
-    std::ifstream input(path / "memory.stat");
-    if (!input) return false;
-
-    bool inactive_file = false, file_dirty = false, file_writeback = false;
-    std::string line;
-    while (std::getline(input, line)) {
-        std::string_view fields(line);
-        const std::string_view key = take_memory_field(fields);
-        uint64_t value = 0;
-        // Unknown counters still need valid syntax, preserving the existing
-        // fail-closed behavior without allocating a stream for every line.
-        if (key.empty() || !take_memory_u64(fields, value)) return false;
-        skip_memory_space(fields);
-        if (!fields.empty()) return false;
-
-        if (key == "inactive_file") {
-            if (inactive_file) return false;
-            inactive_file = true;
-            stat.inactive_file = value;
-        } else if (key == "file_dirty") {
-            if (file_dirty) return false;
-            file_dirty = true;
-            stat.file_dirty = value;
-        } else if (key == "file_writeback") {
-            if (file_writeback) return false;
-            file_writeback = true;
-            stat.file_writeback = value;
-        }
-    }
-    if (!input.eof() || !inactive_file || !file_dirty || !file_writeback) return false;
-    stat.current = current;
-    stat.valid = true;
-    return true;
-}
-#endif
-
 }  // namespace
 
 namespace detail {
-
-bool host_available_memory(HostMemory& m, const std::string& meminfo, const std::string& self_cgroup,
-                           const std::string& cgroup_root) {
-    m = HostMemory{};
-#if defined(_WIN32)
-    (void) meminfo; (void) self_cgroup; (void) cgroup_root;
-    MEMORYSTATUSEX status{};
-    status.dwLength = sizeof(status);
-    if (!GlobalMemoryStatusEx(&status)) return false;
-    m.available = (uint64_t) status.ullAvailPhys;
-    return m.available > 0;
-#else
-    // MemAvailable includes reclaimable page cache, unlike _SC_AVPHYS_PAGES.
-    std::ifstream info(meminfo);
-    std::string line;
-    uint64_t bytes = 0;
-    while (std::getline(info, line)) {
-        std::string_view fields(line);
-        if (take_memory_field(fields) != "MemAvailable:") continue;
-        uint64_t value = 0;
-        if (take_memory_u64(fields, value) && take_memory_field(fields) == "kB" &&
-            value <= std::numeric_limits<uint64_t>::max() / 1024) bytes = value * 1024;
-    }
-    if (bytes == 0) return false;
-    // Account for the tightest cgroup ancestor limit when its normal mount is visible.
-    // This is a point-in-time guard, not a reservation against concurrent allocations.
-    std::ifstream groups(self_cgroup);
-    if (!groups) return false;
-    const std::filesystem::path root(cgroup_root);
-    bool v2 = false;
-    std::string v1_path;   // the memory controller's group (cgroup v1), when there is no v2 line
-    while (std::getline(groups, line)) {
-        if (line.rfind("0::/", 0) != 0) {
-            // v1: "N:controller[,controller]:/path"
-            const size_t c1 = line.find(':'), c2 = c1 == std::string::npos ? c1 : line.find(':', c1 + 1);
-            if (c2 == std::string::npos) continue;
-            std::istringstream ctl(line.substr(c1 + 1, c2 - c1 - 1));
-            for (std::string c; std::getline(ctl, c, ',');)
-                if (c == "memory") v1_path = line.substr(c2 + 1);
-            continue;
-        }
-        auto path = (root / line.substr(4)).lexically_normal();
-        if (path.string().rfind(root.string(), 0) != 0 || !std::filesystem::is_directory(path)) return false;
-        v2 = true;
-        while (path.string().rfind(root.string(), 0) == 0) {
-            std::ifstream limit_file(path / "memory.max"), current_file(path / "memory.current");
-            std::string limit;
-            uint64_t current = 0;
-            const bool readable = bool(limit_file >> limit) && bool(current_file >> current);
-            // The host's root cgroup has no memory.max; ordinary child groups must expose their limits.
-            if (!readable && !(path == root && !std::filesystem::exists(path / "memory.max") &&
-                               std::filesystem::exists(path / "cgroup.controllers"))) return false;
-            if (readable && limit != "max") {
-                try {
-                    size_t consumed = 0;
-                    const uint64_t cap = std::stoull(limit, &consumed);
-                    if (consumed != limit.size()) return false;
-                    CgroupMemoryStat stat;
-                    if (!read_cgroup_memory_stat(path, current, stat)) return false;
-                    uint64_t cgroup_available = 0;
-                    if (!cgroup_available_bytes(cap, stat, cgroup_available)) return false;
-                    bytes = std::min(bytes, cgroup_available);
-                    m.cgroup_limit = std::min(m.cgroup_limit, cap);
-                } catch (...) { return false; }
-            }
-            if (path == root) break;
-            path = path.parent_path();
-        }
-    }
-    if (!v2 && !v1_path.empty()) {
-        // #633: cgroup v1 (older Docker hosts, RHEL 7/8): the memory controller's group and its ancestors.  An
-        // unlimited group says a number near 2^63 (rounded to its page size); a group whose files are not
-        // visible (no mount in this namespace) is skipped - MemAvailable alone, as with no cgroup at all.
-        const std::filesystem::path mroot = root / "memory";
-        auto path = (mroot / v1_path.substr(v1_path.rfind('/', 0) == 0 ? 1 : 0)).lexically_normal();
-        while (path.string().rfind(mroot.string(), 0) == 0) {
-            std::ifstream limit_file(path / "memory.limit_in_bytes"), usage_file(path / "memory.usage_in_bytes");
-            uint64_t cap = 0, usage = 0;
-            if (limit_file >> cap && usage_file >> usage && cap < (1ull << 62)) {
-                bytes = std::min(bytes, usage < cap ? cap - usage : 0);
-                m.cgroup_limit = std::min(m.cgroup_limit, cap);
-            }
-            if (path == mroot) break;
-            path = path.parent_path();
-        }
-    }
-    m.available = bytes;
-    return true;
-#endif
-}
 
 bool resident_pin_fits(uint64_t copy, uint64_t in_place, uint64_t headroom, uint64_t available, std::string& why) {
     const double gib = 1073741824.0;

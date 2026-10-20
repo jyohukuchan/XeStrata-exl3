@@ -63,7 +63,8 @@ CPU・GPU 併用時の decode 計測が必要になる。
 `Exl3ExpertSource` は layer/expert ごとの明示的な名前表を受け取り、要求された expert の圧縮 blob だけを
 読み込む。blob の pointer は layer/window 中は安定し、`copy_blob()` は別の layer の圧縮成分もコピーできる。
 圧縮 blob は層をまたぐ LRU cache で再利用し、展開した重みは保持しない。容量は圧縮 payload 量と
-現在の利用可能 host memory から決め、各 window で再確認する。`STRATA_EXL3_SOURCE_CACHE_MIB` は追加の
+現在の利用可能 host memory から決め、層を一巡するごとと、既知の容量を超えて blob を保持しようとした
+ときに再確認する。`STRATA_EXL3_SOURCE_CACHE_MIB` は追加の
 上限で、0 は window ごとの一時読み込みへ戻す。要求された全 expert を eviction 前に pin し、容量不足では
 window 中だけ保持する。GPU preload の cold `copy_blob()` は CPU cache に追加しない。
 終了時の source 統計は cache hit/miss、materialization 回数・時間と payload bytes を示す。payload bytes は
