@@ -24,6 +24,9 @@ namespace strata::kernels::exl3 {
 namespace {
 
 constexpr float kHadamardScale = 0.08838834764831845f;  // 1 / sqrt(128), as in exllamav3's reconstruct path
+// The number of 16x16 K tiles one physical wave of the packed path reads.  A wave that covers more
+// of the K span reads its tiles one after the other and cannot overlap the loads.
+constexpr uint64_t kWaveTileSpan = 16;
 // Codebook 2 uses the unsigned byte sum of state * 0x83DCD12D.  dp4a is signed-byte, so flip the sign bit
 // and add 512; this is exactly sum(u_i - 128) + 512 = sum(u_i), with no change to the following F16-RNE formula.
 inline int cb2_byte_sum_dp4a(uint32_t x) {
@@ -528,6 +531,15 @@ bool submit_packed_dot_dispatch(sycl::queue& queue, const MatrixView& view, cons
         const uint64_t groups = static_cast<uint64_t>(rows) * static_cast<uint64_t>(view.n / 16);
         const uint64_t waves = capacity / groups + (capacity % groups != 0 ? 1 : 0);
         physical_waves = static_cast<int>(std::max<uint64_t>(1, std::min<uint64_t>(waves_per_group, waves)));
+        // One wave that covers the whole K span of its output tile reads its tiles one after the
+        // other, so the loads of a wave cannot overlap and the wave count that fills the device once
+        // leaves the memory latency exposed.  A wave that covers a bounded span of K tiles keeps
+        // several loads in flight; the bound is the number of 16x16 K tiles a wave reads (256 K
+        // elements), measured on a card with 36 compute units and re-measurable on any other.
+        const uint64_t k_tiles = static_cast<uint64_t>(view.k / 16);
+        const uint64_t pipelined = (k_tiles + kWaveTileSpan - 1) / kWaveTileSpan;
+        physical_waves = static_cast<int>(std::max<uint64_t>(static_cast<uint64_t>(physical_waves),
+                                                            std::min<uint64_t>(waves_per_group, pipelined)));
     }
     #define EXL3_PACKED_DOT(B, C) \
         do { \

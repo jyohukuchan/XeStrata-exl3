@@ -71,6 +71,8 @@ SG32非対応deviceと他のcodebookは従来の経路を使う。
 `STRATA_EXL3_WORD_TILE_PRELOAD=1` のpacked codebook 2経路では、独立した出力tile数とdeviceのcompute unit数・workgroup容量から、
 実際に実行するwave数を選ぶ。従来の論理K分割ごとの積和を保持し、同じ順序でpartialを加算する。
 論理分割を複数担当するwaveも、分割ごとの累積値を独立して計算するため、FP32加算順は変わらない。
+さらに、1つのwaveが読むK tileの数を16個（K要素256個）に制限する。waveがK全体を覆うとtileを順に読むためloadを重ねられず、
+deviceを一度だけ埋めるwave数ではmemory latencyが露出する。wave数を変えても各論理分割の累積値とpartialの加算順は変わらない。
 
 既定で有効。`STRATA_EXL3_DENSE_SCHEDULE=0` で従来のwave配置へ戻る。出力幅の大きいscalar経路には適用しない。
 
