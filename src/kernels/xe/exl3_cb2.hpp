@@ -106,6 +106,13 @@ inline uint16_t cb2_half_bits(int byte_sum) {
     return (uint16_t) (0x6400u + (unsigned) byte_sum);
 }
 
+// The byte dot product with the F16 operand's 0x6400 bias carried in the accumulator: the result is
+// 0x6400 + B, whose low half is the F16 bit pattern of 1024 + B.  The dot product's accumulator is
+// free, so the half form of the decode needs no separate add for the bias.
+inline uint32_t cb2_half_packed(uint32_t x) {
+    return udot4_bytes(x, 0x01010101u, 0x6400u);
+}
+
 // The exact value of a codebook 2 entry, in F32.  887 * 2^-17 and 452608 * 2^-17 are exact in F32, and
 // for every byte sum in [0, 1020] the product and the difference are exact as well, so the fused
 // multiply add returns the exact number whether it is contracted or not.
@@ -150,6 +157,24 @@ inline uint16_t cb2_half_value_bits(int byte_sum) {
     return sycl::bit_cast<uint16_t>(cb2_half_f16(byte_sum));
 }
 
+// The half form of a packed byte sum that already carries the 0x6400 bias.
+inline sycl::half cb2_half_f16_packed(uint32_t packed) {
+    const sycl::half operand = sycl::bit_cast<sycl::half>((uint16_t) packed);
+    const sycl::half inverse = sycl::bit_cast<sycl::half>(uint16_t(0x1EEE));
+    const sycl::half bias = sycl::bit_cast<sycl::half>(uint16_t(0xC931));
+    return sycl::fma(operand, inverse, bias);
+}
+
+// The half form of a packed byte sum that already carries the 0x6400 bias, widened to F32.
+inline float cb2_half_f32_packed(uint32_t packed) {
+    return static_cast<float>(cb2_half_f16_packed(packed));
+}
+
+// The half form's F16 bits of a packed byte sum that already carries the 0x6400 bias.
+inline uint16_t cb2_half_value_bits_packed(uint32_t packed) {
+    return sycl::bit_cast<uint16_t>(cb2_half_f16_packed(packed));
+}
+
 // The value of a codebook 2 entry, in the chosen form.  Both forms return the same number.
 template <bool HalfFma>
 inline float cb2_value_f32(int byte_sum) {
@@ -162,6 +187,22 @@ template <bool HalfFma>
 inline uint16_t cb2_value_bits(int byte_sum) {
     if constexpr (HalfFma) return cb2_half_value_bits(byte_sum);
     else return cb2_portable_bits(byte_sum);
+}
+
+// The value of a codebook 2 entry for the mul1 product, in the chosen form.  The half form takes
+// the F16 operand's 0x6400 bias from the dot product's accumulator, so it saves the separate add;
+// the portable form needs the plain byte sum.  Both forms return the same number.
+template <bool HalfFma>
+inline float cb2_product_value_f32(uint32_t product) {
+    if constexpr (HalfFma) return cb2_half_f32_packed(cb2_half_packed(product));
+    else return cb2_portable_f32(cb2_byte_sum(product));
+}
+
+// The F16 bits of a codebook 2 entry for the mul1 product, in the chosen form.
+template <bool HalfFma>
+inline uint16_t cb2_product_value_bits(uint32_t product) {
+    if constexpr (HalfFma) return cb2_half_value_bits_packed(cb2_half_packed(product));
+    else return cb2_portable_bits(cb2_byte_sum(product));
 }
 
 // Whether the device runs the half form of the codebook 2 decode.  The device reports whether it has
