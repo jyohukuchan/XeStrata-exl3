@@ -52,6 +52,16 @@ extraction while keeping the existing FP64 accumulation order.
 On AVX2 CPUs, mul1 packed tiles use register permutations and a small decode table.
 `STRATA_NO_EXL3_AVX2=1` restores the generic path.
 
+The GPU side codebook 2 (mul1) decode returns (887 * B - 452608) * 2^-17 for a byte sum B.
+The value is a multiple of 2^-17 with an absolute value below 2^19, so F32 represents it exactly.
+The GPU uses two forms that return the same number.  The portable form computes the exact value in F32 and
+rounds it once to F16.  The half form is the reference decoder's fused multiply add in F16,
+hfma16(F16(1024 + B), 0x1EEE, 0xC931).  Both round the same exact value once to F16, so they agree bit for
+bit.  A device that reports FP16 arithmetic runs the half form; a device that does not runs the portable
+form.  `STRATA_EXL3_CB2_HALF_FMA=0` forces the portable form.
+The F16 RNE boundary, the FP32 accumulation order, the Hadamard transforms, the bias, the weight storage
+format and the bpw are the same in both forms.
+
 `STRATA_EXL3_CPU_ROWPARALLEL=1` processes CPU misses through four existing-pool phases: Hpre,
 gate/up output blocks, SiLU plus down Hpre, and down output blocks. Raw projections and batches beyond
 prepared capacity use whole-expert execution. Worker count remains configurable; check scaling on the actual model.
@@ -130,9 +140,15 @@ With NumPy available and tests enabled, build and run the CTests backed by indep
 ```sh
 cmake --build build/free --target exl3_artifact_test exl3_cpu_parity exl3_parity \
     exl3_cpu_expert_parity exl3_expert_parity exl3_cpu_ngram_parity exl3_ngram_parity \
+    exl3_cb2_parity \
     exl3_pool_test exl3_expert_source_test exl3_expert_formats_test expert_cache_buckets_test
 ctest --test-dir build/free -R '^exl3_' --output-on-failure
 ```
+
+`exl3_cb2_parity` compares the two forms of the codebook 2 decode on the device.
+For every byte sum (0 to 1020) and every 16-bit state (0 to 65535) it checks that the half form and the
+portable form return the same F16 bits, and that both agree with the value computed from the definition.
+It also checks that a codebook 2 projection returns the same bits with either form.
 
 A checkpoint probe checks the archive, CPU/GPU reconstruction and linear operations, and the engine's
 weight owner together for one requested matrix. Only diagnostic reconstruction expands that selected matrix.

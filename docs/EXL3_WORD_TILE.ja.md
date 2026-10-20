@@ -76,6 +76,19 @@ deviceを一度だけ埋めるwave数ではmemory latencyが露出する。wave�
 
 既定で有効。`STRATA_EXL3_DENSE_SCHEDULE=0` で従来のwave配置へ戻る。出力幅の大きいscalar経路には適用しない。
 
+## codebook 2 の decode
+
+codebook 2 (mul1) の decode は、byte sum B に対して (887 * B - 452608) * 2^-17 を返す。
+値は 2^-17 の倍数で絶対値が 2^19 未満なので F32 で厳密に表せる。portable な形は F32 でその値を作り、
+F16 へ一度だけ丸める。half の形は参照実装と同じ F16 の fused multiply add
+(hfma16(F16(1024 + B), 0x1EEE, 0xC931)) で行い、同じ厳密値を一度だけ丸める。
+device が FP16 の演算を報告するときは half の形を使い、報告しない device では portable な形を使う。
+どちらの形も bit 単位で同じ値を返す。
+
+既定で有効。`STRATA_EXL3_CB2_HALF_FMA=0` で portable な形を強制し、同じ binary で両方を比較できる。
+Dense、routed expert、出力幅の大きい射影、n-gram の decode は同じ判定を使う。
+F16 の RNE 境界、FP32 の加算順、Hadamard 変換、bias、重みの保存形式と bpw は変わらない。
+
 ## Raw射影
 
 F16/BF16/F32のraw射影ではdtypeごとのkernelを使い、K方向のloadを展開する。
