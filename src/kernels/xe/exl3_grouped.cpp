@@ -10,6 +10,7 @@
 #include "strata/kernels/f16_bits.hpp"
 #include "cuda_intrinsics.hpp"
 #include "exl3_funnel.hpp"
+#include "exl3_word_tile.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_exl3_grouped
 #include "strata/kernels/device_arch_tag.hpp"
 
@@ -147,6 +148,95 @@ inline float decoded_weight_cb2(const MatrixView& view, int64_t row, int64_t col
     const uint16_t* tile = view.trellis + tile_index * (size_t) (16 * view.bits);
     const int state = tile_state_for_element((int) ((row & 15) * 16 + (col & 15)));
     return decode_state_f32(extract_state(tile, view.bits, state), 2);
+}
+
+// Two K lanes per output retain two independent accumulators (K mod 4), preserving the
+// previous four-lane addition order while sharing all sixteen output columns of a packed tile.
+struct GroupedPartial { float even = 0.0f; float odd = 0.0f; };
+
+template <int Bits, int RR = 0>
+inline void accumulate_grouped_tile(const word_cache::DistributedTile<Bits>& words,
+                                    const sycl::sub_group& subgroup, int lane, const float* input,
+                                    int64_t row_base, GroupedPartial& sum) {
+    const int row = 2 * RR + (lane >> 4);
+    const float weight = decode_state_f32(words.template state<RR>(subgroup, lane), 2);
+    if constexpr (RR % 2 == 0) sum.even += input[row_base + row] * weight;
+    else sum.odd += input[row_base + row] * weight;
+    if constexpr (RR < 7)
+        accumulate_grouped_tile<Bits, RR + 1>(words, subgroup, lane, input, row_base, sum);
+}
+
+template <int Bits>
+inline GroupedPartial grouped_word_dot(const MatrixView& view, const float* input, int64_t col,
+                                       int64_t row_begin, int64_t row_end,
+                                       const sycl::sub_group& subgroup, int lane) {
+    GroupedPartial sum;
+    for (int64_t row = row_begin; row < row_end; row += 16) {
+        const uint16_t* tile = view.trellis +
+            (static_cast<size_t>(row / 16) * static_cast<size_t>(view.n / 16) +
+             static_cast<size_t>(col / 16)) * static_cast<size_t>(16 * Bits);
+        word_cache::DistributedTile<Bits> words{0, 0};
+        if (lane < Bits * 8) words.bank0 = load_word32(tile, lane, Bits * 8);
+        if constexpr (Bits > 4)
+            if (lane + 32 < Bits * 8) words.bank1 = load_word32(tile, lane + 32, Bits * 8);
+        accumulate_grouped_tile<Bits>(words, subgroup, lane, input, row, sum);
+    }
+    return sum;
+}
+
+inline GroupedPartial grouped_word_dot_dispatch(const MatrixView& view, const float* input, int64_t col,
+                                                int64_t row_begin, int64_t row_end,
+                                                const sycl::sub_group& subgroup, int lane) {
+    switch (view.bits) {
+#define STRATA_GROUPED_WORD_CASE(B) \
+        case B: return grouped_word_dot<B>(view, input, col, row_begin, row_end, subgroup, lane)
+        STRATA_GROUPED_WORD_CASE(1);
+        STRATA_GROUPED_WORD_CASE(2);
+        STRATA_GROUPED_WORD_CASE(3);
+        STRATA_GROUPED_WORD_CASE(4);
+        STRATA_GROUPED_WORD_CASE(5);
+        STRATA_GROUPED_WORD_CASE(6);
+        STRATA_GROUPED_WORD_CASE(7);
+        STRATA_GROUPED_WORD_CASE(8);
+#undef STRATA_GROUPED_WORD_CASE
+        default: return {}; // A validated packed descriptor always has bits in [1, 8].
+    }
+}
+
+// Fallback for other codebooks and K partitions not aligned to a whole compressed tile.
+template <bool CB2>
+inline GroupedPartial grouped_scalar_partial_impl(const MatrixView& view, const float* input, int64_t col,
+                                             int64_t iter_begin, int64_t iter_end, int k_lane, bool paired) {
+    GroupedPartial sum;
+    for (int64_t iter = iter_begin; iter < iter_end; ++iter) {
+        const int64_t row = iter * 4 + k_lane;
+        sum.even += input[row] * (CB2 ? decoded_weight_cb2(view, row, col) : decoded_weight(view, row, col));
+        if (paired)
+            sum.odd += input[row + 2] * (CB2 ? decoded_weight_cb2(view, row + 2, col) : decoded_weight(view, row + 2, col));
+    }
+    return sum;
+}
+
+inline GroupedPartial grouped_scalar_partial(const MatrixView& view, const float* input, int64_t col,
+                                             int64_t iter_begin, int64_t iter_end, int k_lane, bool paired) {
+    if (view.codebook == 2)
+        return grouped_scalar_partial_impl<true>(view, input, col, iter_begin, iter_end, k_lane, paired);
+    return grouped_scalar_partial_impl<false>(view, input, col, iter_begin, iter_end, k_lane, paired);
+}
+
+inline float reduce_grouped_partial(const GroupedPartial& sum, const sycl::sub_group& subgroup, bool paired) {
+    if (paired) {
+        const float first = sum.even + sycl::permute_group_by_xor(subgroup, sum.even, 16);
+        const float second = sum.odd + sycl::permute_group_by_xor(subgroup, sum.odd, 16);
+        return first + second;
+    }
+    float value = sum.even + sycl::permute_group_by_xor(subgroup, sum.even, 1);
+    return value + sycl::permute_group_by_xor(subgroup, value, 2);
+}
+
+bool grouped_word_tile_enabled() {
+    const char* text = std::getenv("STRATA_EXL3_GROUPED_WORD_TILE");
+    return text == nullptr || !(text[0] == '0' && text[1] == '\0');
 }
 
 inline bool valid_raw_dtype(raw::DType dtype) {
@@ -545,7 +635,9 @@ sycl::event submit_gate_up_dot_cooperative(sycl::queue& queue, const GroupedPlan
                                            int64_t plane, GroupedOptions options,
                                            const std::vector<sycl::event>& deps) {
     const int split_k = gate_up_split_k(queue, plan);
-    const size_t tiles = (static_cast<size_t>(plan.max_ff) + 7u) / 8u;
+    const bool word_tile = grouped_word_tile_enabled();
+    const size_t columns = word_tile ? 16u : 8u;
+    const size_t tiles = (static_cast<size_t>(plan.max_ff) + columns - 1) / columns;
     const size_t groups = static_cast<size_t>(plan.max_entries) * tiles;
     const size_t local_size = static_cast<size_t>(split_k) * 32u;
     const int64_t k_iters = plan.hidden / 4;
@@ -557,12 +649,12 @@ sycl::event submit_gate_up_dot_cooperative(sycl::queue& queue, const GroupedPlan
             const sycl::sub_group subgroup = item.get_sub_group();
             const int lane = static_cast<int>(subgroup.get_local_id()[0]);
             const int wave = static_cast<int>(item.get_local_id(0)) / 32;
-            const int column_lane = lane >> 2;
-            const int k_lane = lane & 3;
+            const int column_lane = word_tile ? lane & 15 : lane >> 2;
+            const int k_lane = word_tile ? lane >> 4 : lane & 3;
             const size_t group = static_cast<size_t>(item.get_group_linear_id());
             const int32_t entry = static_cast<int32_t>(group / tiles);
             const int64_t tile = static_cast<int64_t>(group % tiles);
-            const int64_t col = tile * 8 + column_lane;
+            const int64_t col = tile * static_cast<int64_t>(columns) + column_lane;
             const ResolvedEntry resolved = resolve_entry(plan, entry, options);
             const bool active = resolved.valid && col < resolved.ff;
             const float* gate_input = active ? scratch + static_cast<size_t>(entry) * static_cast<size_t>(plane) : nullptr;
@@ -570,48 +662,38 @@ sycl::event submit_gate_up_dot_cooperative(sycl::queue& queue, const GroupedPlan
                                                    static_cast<size_t>(entry) * static_cast<size_t>(plane) : nullptr;
             const int64_t iter_begin = (k_iters * wave) / split_k;
             const int64_t iter_end = (k_iters * (wave + 1)) / split_k;
-            float gate_partial = 0.0f;
-            float up_partial = 0.0f;
+            GroupedPartial gate_partial;
+            GroupedPartial up_partial;
             if (active) {
                 if (resolved.gate.is_packed()) {
                     const MatrixView gate = resolved.gate.packed_matrix();
-                    if (gate.codebook == 2) {
-                        for (int64_t iter = iter_begin; iter < iter_end; ++iter) {
-                            const int64_t row = iter * 4 + k_lane;
-                            gate_partial += gate_input[row] * decoded_weight_cb2(gate, row, col);
-                        }
+                    if (gate.codebook == 2 && word_tile && iter_begin % 4 == 0 && iter_end % 4 == 0) {
+                        gate_partial = grouped_word_dot_dispatch(gate, gate_input, col, iter_begin * 4,
+                                                                  iter_end * 4, subgroup, lane);
                     } else {
-                        for (int64_t iter = iter_begin; iter < iter_end; ++iter) {
-                            const int64_t row = iter * 4 + k_lane;
-                            gate_partial += gate_input[row] * decoded_weight(gate, row, col);
-                        }
+                        gate_partial = grouped_scalar_partial(gate, gate_input, col, iter_begin,
+                                                            iter_end, k_lane, word_tile);
                     }
                 } else if (wave == 0 && k_lane == 0) {
                     // Preserve the existing raw/mixed projection summation order; only packed EXL3 dots are K-split.
-                    gate_partial = dot_value(resolved.gate, gate_input, col);
+                    gate_partial.even = dot_value(resolved.gate, gate_input, col);
                 }
                 if (resolved.up.is_packed()) {
                     const MatrixView up = resolved.up.packed_matrix();
-                    if (up.codebook == 2) {
-                        for (int64_t iter = iter_begin; iter < iter_end; ++iter) {
-                            const int64_t row = iter * 4 + k_lane;
-                            up_partial += up_input[row] * decoded_weight_cb2(up, row, col);
-                        }
+                    if (up.codebook == 2 && word_tile && iter_begin % 4 == 0 && iter_end % 4 == 0) {
+                        up_partial = grouped_word_dot_dispatch(up, up_input, col, iter_begin * 4,
+                                                                  iter_end * 4, subgroup, lane);
                     } else {
-                        for (int64_t iter = iter_begin; iter < iter_end; ++iter) {
-                            const int64_t row = iter * 4 + k_lane;
-                            up_partial += up_input[row] * decoded_weight(up, row, col);
-                        }
+                        up_partial = grouped_scalar_partial(up, up_input, col, iter_begin,
+                                                            iter_end, k_lane, word_tile);
                     }
                 } else if (wave == 0 && k_lane == 0) {
                     // Preserve the existing raw/mixed projection summation order; only packed EXL3 dots are K-split.
-                    up_partial = dot_value(resolved.up, up_input, col);
+                    up_partial.even = dot_value(resolved.up, up_input, col);
                 }
             }
-            float gate_reduced = gate_partial + sycl::permute_group_by_xor(subgroup, gate_partial, 1);
-            gate_reduced += sycl::permute_group_by_xor(subgroup, gate_reduced, 2);
-            float up_reduced = up_partial + sycl::permute_group_by_xor(subgroup, up_partial, 1);
-            up_reduced += sycl::permute_group_by_xor(subgroup, up_reduced, 2);
+            const float gate_reduced = reduce_grouped_partial(gate_partial, subgroup, word_tile);
+            const float up_reduced = reduce_grouped_partial(up_partial, subgroup, word_tile);
             if (active && k_lane == 0) {
                 reduce[static_cast<size_t>(wave) * 16u + static_cast<size_t>(column_lane)] = gate_reduced;
                 reduce[static_cast<size_t>(split_k) * 16u + static_cast<size_t>(wave) * 16u +
@@ -705,7 +787,9 @@ sycl::event submit_gate_up_post(sycl::queue& queue, const GroupedPlan& plan, flo
 sycl::event submit_down_dot_cooperative(sycl::queue& queue, const GroupedPlan& plan, float* scratch,
                                          int64_t plane, GroupedOptions options,
                                          const std::vector<sycl::event>& deps) {
-    const size_t tiles = (static_cast<size_t>(plan.hidden) + 7u) / 8u;
+    const bool word_tile = grouped_word_tile_enabled();
+    const size_t columns = word_tile ? 16u : 8u;
+    const size_t tiles = (static_cast<size_t>(plan.hidden) + columns - 1) / columns;
     const size_t groups = static_cast<size_t>(plan.max_entries) * tiles;
     return queue.submit([&](sycl::handler& h) {
         if (!deps.empty()) h.depends_on(deps);
@@ -713,32 +797,29 @@ sycl::event submit_down_dot_cooperative(sycl::queue& queue, const GroupedPlan& p
                        [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
             const sycl::sub_group subgroup = item.get_sub_group();
             const int lane = static_cast<int>(subgroup.get_local_id()[0]);
-            const int column_lane = lane >> 2;
-            const int k_lane = lane & 3;
+            const int column_lane = word_tile ? lane & 15 : lane >> 2;
+            const int k_lane = word_tile ? lane >> 4 : lane & 3;
             const size_t group = static_cast<size_t>(item.get_group_linear_id());
             const int32_t entry = static_cast<int32_t>(group / tiles);
             const int64_t tile = static_cast<int64_t>(group % tiles);
-            const int64_t col = tile * 8 + column_lane;
+            const int64_t col = tile * static_cast<int64_t>(columns) + column_lane;
             const ResolvedEntry resolved = resolve_entry(plan, entry, options);
             const bool active = resolved.valid && col < plan.hidden;
             const float* input = active ? scratch + static_cast<size_t>(entry) * static_cast<size_t>(plane) : nullptr;
-            float partial = 0.0f;
+            GroupedPartial partial;
             if (active) {
                 if (resolved.down.is_packed()) {
                     const MatrixView down = resolved.down.packed_matrix();
-                    if (down.codebook == 2) {
-                        for (int64_t row = k_lane; row < down.k; row += 4)
-                            partial += input[row] * decoded_weight_cb2(down, row, col);
+                    if (down.codebook == 2 && word_tile) {
+                        partial = grouped_word_dot_dispatch(down, input, col, 0, down.k, subgroup, lane);
                     } else {
-                        for (int64_t row = k_lane; row < down.k; row += 4)
-                            partial += input[row] * decoded_weight(down, row, col);
+                        partial = grouped_scalar_partial(down, input, col, 0, down.k / 4, k_lane, word_tile);
                     }
                 } else if (k_lane == 0) {
-                    partial = dot_value(resolved.down, input, col);
+                    partial.even = dot_value(resolved.down, input, col);
                 }
             }
-            float reduced = partial + sycl::permute_group_by_xor(subgroup, partial, 1);
-            reduced += sycl::permute_group_by_xor(subgroup, reduced, 2);
+            const float reduced = reduce_grouped_partial(partial, subgroup, word_tile);
             if (active && k_lane == 0) {
                 float* output = scratch + 2 * static_cast<size_t>(plan.max_entries) * static_cast<size_t>(plane) +
                                 static_cast<size_t>(entry) * static_cast<size_t>(plane);

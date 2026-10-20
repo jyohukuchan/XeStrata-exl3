@@ -35,3 +35,24 @@ subgroup and workgroup requirements. Other device/shape combinations, other code
 It preserves circular trellis layouts at bit widths 1–8 and 2-byte alignment.
 Hpre, Hpost, SVH, bias and the amount of caller-owned scratch remain unchanged.
 See [EXL3](EXL3.md) for general EXL3 settings and supported formats.
+
+## Routed experts
+
+On devices supporting SG32, routed expert packed GU and down matrix products also share compressed words for
+codebook 2. This path is enabled by default; `STRATA_EXL3_GROUPED_WORD_TILE=0` restores the previous matrix products.
+An unset variable or any value other than `0` enables it. This flag is independent of the Dense flag.
+
+```sh
+export STRATA_EXL3_GROUPED_WORD_TILE=0
+```
+
+A subgroup handles sixteen output columns and two K lanes, preloading the compressed words of a 16×16 tile
+into registers. Bit widths 1–8 have separate specializations, and words are shared within the subgroup
+to decode each state. Two accumulators per lane reconstruct the previous four-K-lane FP32 addition order and reduction tree.
+The F32 input precision and decoded weight F16 RNE boundary are retained.
+GU K partitions whose boundaries are not aligned to 16 elements, other codebooks and raw projections retain the
+previous computation. Mixed bit widths and projection storage in the format table select the path per projection.
+
+No additional global scratch or decoded weight cache is allocated. The existing device plan and event dependencies
+are retained, as are Hpre, Hpost, bias and group/token/destination validation. The flag is evaluated during graph
+capture; recreate the session after changing it.

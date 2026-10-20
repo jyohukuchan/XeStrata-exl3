@@ -383,15 +383,17 @@ bool check_rows(const std::vector<float>& got, const std::vector<float>& expecte
 
 int main(int argc, char** argv) {
     bool selftest = false;
+    bool mul1_mixed = false;
     std::string fixture_path;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--selftest") selftest = true;
+        else if (arg == "--mul1-mixed") mul1_mixed = true;
         else if (arg == "--fixture" && i + 1 < argc) fixture_path = argv[++i];
         else if (fixture_path.empty() && arg != "--fixture") fixture_path = arg;
-        else { std::fprintf(stderr, "usage: exl3_grouped_parity [--selftest] --fixture PATH\n"); return 2; }
+        else { std::fprintf(stderr, "usage: exl3_grouped_parity [--selftest] [--mul1-mixed] --fixture PATH\n"); return 2; }
     }
-    if (fixture_path.empty()) { std::fprintf(stderr, "usage: exl3_grouped_parity [--selftest] --fixture PATH\n"); return 2; }
+    if (fixture_path.empty()) { std::fprintf(stderr, "usage: exl3_grouped_parity [--selftest] [--mul1-mixed] --fixture PATH\n"); return 2; }
 
     std::vector<FixtureCase> cases;
     std::string error;
@@ -399,20 +401,20 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "exl3_grouped_parity: %s\n", error.c_str());
         return 2;
     }
-    const FixtureCase* b2_256_128 = find_case(cases, 2, 0, 256, 128);
-    const FixtureCase* b3_128_256 = find_case(cases, 3, 1, 128, 256);
-    const FixtureCase* b5_128_256 = find_case(cases, 5, 2, 128, 256);
-    if (b2_256_128 == nullptr || b3_128_256 == nullptr || b5_128_256 == nullptr) {
+    const FixtureCase* source_a = find_case(cases, 2, mul1_mixed ? 2 : 0, 256, 128);
+    const FixtureCase* source_b = find_case(cases, 3, mul1_mixed ? 2 : 1, 128, 256);
+    const FixtureCase* source_c = find_case(cases, mul1_mixed ? 4 : 5, 2, mul1_mixed ? 256 : 128, mul1_mixed ? 128 : 256);
+    if (source_a == nullptr || source_b == nullptr || source_c == nullptr) {
         std::fprintf(stderr, "exl3_grouped_parity: fixture lacks mixed-format source cases\n");
         return 2;
     }
 
-    const HostExpert expert0 = make_expert(materialize(*b2_256_128, 128, 128),
-                                           materialize(*b3_128_256, 128, 128),
-                                           materialize(*b5_128_256, 128, 128));
-    const HostExpert expert1 = make_expert(materialize(*b5_128_256, 128, 256),
-                                           materialize(*b2_256_128, 128, 256),
-                                           materialize(*b3_128_256, 256, 128));
+    const HostExpert expert0 = make_expert(materialize(*source_a, 128, 128),
+                                           materialize(*source_b, 128, 128),
+                                           materialize(*source_c, 128, 128));
+    const HostExpert expert1 = make_expert(materialize(*source_c, 128, 256),
+                                           materialize(*source_a, 128, 256),
+                                           materialize(*source_b, 256, 128));
 
     auto& queue = strata::core::Runtime::get().compute();
     strata::parity::Device device;
@@ -498,7 +500,7 @@ int main(int argc, char** argv) {
     // A separate one-entry grouped launch covers a packed 2bpw gate with raw
     // F16 up and raw BF16 down.  Raw dtype and bias spans stay in the format
     // table; no packed bits sentinel is involved.
-    const MixedHostExpert mixed = make_mixed_expert(materialize(*b2_256_128, 128, 128));
+    const MixedHostExpert mixed = make_mixed_expert(materialize(*source_a, 128, 128));
     uint8_t* d_mixed_blob = device.upload(mixed.blob);
     const std::vector<uint64_t> mixed_blob_base{(uint64_t) (uintptr_t) d_mixed_blob};
     const std::vector<int32_t> mixed_format_index{0}, mixed_starts{0, 1}, mixed_tok{0}, mixed_dst{0};
