@@ -108,16 +108,14 @@ inline uint16_t decode_state(uint16_t state, int codebook) {
         return f16_from_f32(f32_from_f16((uint16_t) x) + f32_from_f16((uint16_t) (x >> 16)));
     }
     x = x * 0x83DCD12Du;
-    const int byte_sum = cb2_byte_sum(x);
-    return cb2_value_bits<HalfFma>(byte_sum);
+    return cb2_product_value_bits<HalfFma>(x);
 }
 
 template <bool HalfFma>
 inline float decode_state_f32(uint16_t state, int codebook) {
     if (codebook != 2) return f32_from_f16(decode_state<HalfFma>(state, codebook));
     const uint32_t x = state * 0x83DCD12Du;
-    const int byte_sum = cb2_byte_sum(x);
-    return cb2_value_f32<HalfFma>(byte_sum);
+    return cb2_product_value_f32<HalfFma>(x);
 }
 
 template <bool HalfFma>
