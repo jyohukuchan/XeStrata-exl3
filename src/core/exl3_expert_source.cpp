@@ -95,6 +95,9 @@ void Exl3ExpertSource::clear_locked() {
     newest_ = oldest_ = kNone;
     active_layer_ = -1;
     maximum_blob_bytes_ = startup_capacity_bytes_ = 0;
+    room_reread_ = false;
+    last_layer_ = -1;
+    layer_known_ = false;
     stats_ = {};
     failure_.clear();
     reads_.store(0, std::memory_order_relaxed);
@@ -219,7 +222,10 @@ void Exl3ExpertSource::refresh_capacity_locked(bool evict) {
     auto* profile = detail::active_exl3_prepare_detail();
     const auto guard_begin = profile != nullptr ? detail::Exl3DetailClock::now()
                                                 : detail::Exl3DetailClock::time_point{};
-    const bool available = startup_capacity_bytes_ != 0 && detail::host_available_memory(memory);
+    const bool available = startup_capacity_bytes_ != 0 &&
+                           detail::host_available_memory(memory, capacity_files_.meminfo,
+                                                         capacity_files_.self_cgroup,
+                                                         capacity_files_.cgroup_root);
     if (profile != nullptr && startup_capacity_bytes_ != 0) {
         profile->guard_ns += detail::exl3_detail_ns(guard_begin, detail::Exl3DetailClock::now());
         ++profile->guard_calls;
@@ -234,6 +240,8 @@ void Exl3ExpertSource::refresh_capacity_locked(bool evict) {
         room = subtract_floor(room, 256ull << 20);
         room = subtract_floor(room, stats_.transient_bytes);
     }
+    // The budget the source may hold: the room the host had, and never more than the cache the policy
+    // allows.  A room that could not be read leaves no budget at all: the source then admits nothing.
     stats_.admission_bytes = std::min(startup_capacity_bytes_, room);
     if (evict)
         while (stats_.resident_bytes > stats_.admission_bytes && evict_one_locked()) {}
@@ -274,11 +282,16 @@ bool Exl3ExpertSource::prewarm_cpu(const std::vector<uint8_t>& excluded, Prewarm
     const auto fits = [&] {
         // A refused preload must not throw away an already warm cache. Unlike
         // begin_layer, this check only samples/clamps; it performs no eviction.
-        refresh_capacity_locked(false);
+        // The room is read again only when the payload that is left does not fit the budget the last
+        // reading gave: the loading itself is what the budget accounts for.
+        if (missing > admission_headroom_locked() && !room_reread_) {
+            refresh_capacity_locked(false);
+            room_reread_ = missing > admission_headroom_locked();
+        }
         result.admission_bytes = stats_.admission_bytes;
         return result.requested_bytes <= stats_.admission_bytes &&
                stats_.resident_bytes <= stats_.admission_bytes &&
-               missing <= stats_.admission_bytes - stats_.resident_bytes;
+               missing <= admission_headroom_locked();
     };
     if (!fits()) {
         why = "all owned CPU payloads do not fit the current source cache budget";
@@ -371,9 +384,17 @@ bool Exl3ExpertSource::ensure_materialized_locked(size_t at, std::unique_lock<st
     }
     if (!e.counted_window) { ++stats_.misses; e.counted_window = true; }
     const uint64_t bytes = layouts_[at].total_bytes;
+    // The guard: the host's RAM and cgroup capacity are read again when this blob would grow the
+    // resident set past the budget the last reading gave.  A budget of zero admits nothing at all, so
+    // there is nothing to read for; a window that serves its requests from the resident blobs admits
+    // nothing, and reads nothing.
+    if (bytes > admission_headroom_locked() && stats_.admission_bytes > 0 && !room_reread_) {
+        refresh_capacity_locked();
+        room_reread_ = bytes > admission_headroom_locked();
+    }
     while (bytes <= stats_.admission_bytes && stats_.resident_bytes > stats_.admission_bytes - bytes &&
            evict_one_locked()) {}
-    e.persistent = bytes <= stats_.admission_bytes && stats_.resident_bytes <= stats_.admission_bytes - bytes;
+    e.persistent = bytes <= admission_headroom_locked() && stats_.resident_bytes <= stats_.admission_bytes - bytes;
     if (e.persistent) {
         stats_.resident_bytes += bytes;
         stats_.peak_resident_bytes = std::max(stats_.peak_resident_bytes, stats_.resident_bytes);
@@ -439,7 +460,15 @@ void Exl3ExpertSource::begin_layer(int64_t layer, const int32_t* ids, int64_t k)
         entries_[at].window_pin = true;
         active_indices_.push_back(at);
     }
-    refresh_capacity_locked();
+    // The guard: the host's RAM and cgroup capacity.  The layers are visited in order, so a layer that is
+    // not the successor of the last one starts a new pass over them: the room is read again there, and
+    // the blobs the source admits in between are held to the budget that reading gave.
+    if (!layer_known_ || layer != last_layer_ + 1) {
+        refresh_capacity_locked();
+        room_reread_ = false;
+    }
+    last_layer_ = layer;
+    layer_known_ = true;
     active_layer_ = layer;
     for (const size_t at : active_indices_)
         if (!ensure_materialized_locked(at, lock)) {
