@@ -11,6 +11,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <algorithm>
 #include <cstdlib>
 #include <limits>
@@ -107,56 +108,124 @@ sycl::event linear_fp32_cooperative(sycl::queue& queue, const LinearView& view, 
     });
 }
 
-template <DType Type, bool NativeHalf>
-inline float raw_weight(const LinearView& view, size_t index) {
+/// How a half is turned into a float.
+enum class HalfMode : int {
+    Software,    ///< the value is built from the bits alone
+    Native,      ///< the device converts halves, but the tensor may hold exceptional halves
+    NativePlain, ///< the device converts halves and the tensor holds only normal halves
+};
+
+/// The exact f16 -> f32 conversion of `f32_from_f16`, without a data dependent branch.
+///
+/// A branch on the exponent of the loaded half costs the whole memory pipeline: the branch waits
+/// for its half, so the loads of the other halves of the unrolled loop cannot be in flight.  The
+/// exceptional halves (zero, subnormal, infinity, NaN) are therefore selected, not branched on.
+///
+/// `Native` and `NativePlain` use the device's conversion instruction, which is exact for a normal
+/// half; `Software` builds every value from the bits, for a device without half arithmetic.
+template <HalfMode Mode>
+inline float half_to_float(uint16_t bits) {
+    const uint32_t sign = (static_cast<uint32_t>(bits) & 0x8000u) << 16;
+    const uint32_t exponent = (static_cast<uint32_t>(bits) >> 10) & 0x1fu;
+    const uint32_t mantissa = static_cast<uint32_t>(bits) & 0x3ffu;
+    // Infinity and NaN: the exponent field is 255 and the implicit one is dropped.
+    const uint32_t infinite = sign | 0x7f800000u | (mantissa << 13);
+    // Zero and subnormal: the value is mantissa * 2^-24, which is exact as a float.
+    const float scaled = (float) mantissa * 5.9604644775390625e-08f;
+    uint32_t scaled_bits;
+    std::memcpy(&scaled_bits, &scaled, sizeof scaled_bits);
+    const uint32_t subnormal = (scaled_bits & 0x7fffffffu) | sign;
+    uint32_t value;
+    if constexpr (Mode == HalfMode::NativePlain) {
+        // The tensor holds normal halves and signed zeros only, so the device's conversion is
+        // exact for every one of them.
+        return static_cast<float>(sycl::bit_cast<sycl::half>(bits));
+    } else if constexpr (Mode == HalfMode::Native) {
+        const float hardware = static_cast<float>(sycl::bit_cast<sycl::half>(bits));
+        uint32_t converted;
+        std::memcpy(&converted, &hardware, sizeof converted);
+        value = exponent == 31u ? infinite : converted;
+        value = exponent == 0u ? subnormal : value;
+    } else {
+        // Normal: the exponent field grows by 112 and the mantissa by 13.
+        const uint32_t normal = sign | ((exponent + 112u) << 23) | (mantissa << 13);
+        value = exponent == 31u ? infinite : normal;
+        value = exponent == 0u ? subnormal : value;
+    }
+    float result;
+    std::memcpy(&result, &value, sizeof result);
+    return result;
+}
+
+template <DType Type, HalfMode Mode>
+inline float raw_weight(const void* data, size_t index) {
     float weight;
     if constexpr (Type == DType::F16) {
-        const uint16_t bits = static_cast<const uint16_t*>(view.data)[index];
-        if constexpr (NativeHalf) {
-            // Convert normal halves directly. Preserve software handling of zeros, subnormals
-            // and nonfinite values independently of the device's FP16 denormal mode.
-            const unsigned exponent = bits & 0x7c00u;
-            weight = exponent != 0 && exponent != 0x7c00u ?
-                static_cast<float>(sycl::bit_cast<sycl::half>(bits)) : f32_from_f16(bits);
-        } else weight = f32_from_f16(bits);
+        const uint16_t bits = static_cast<const uint16_t*>(data)[index];
+        weight = half_to_float<Mode>(bits);
     } else if constexpr (Type == DType::BF16)
-        weight = f32_from_bf16(static_cast<const uint16_t*>(view.data)[index]);
+        weight = f32_from_bf16(static_cast<const uint16_t*>(data)[index]);
     else
-        weight = static_cast<const float*>(view.data)[index];
+        weight = static_cast<const float*>(data)[index];
     return weight;
 }
 
-template <DType Type, bool NativeHalf = false>
-sycl::event linear_fp32_specialized(sycl::queue& queue, const LinearView& view, const float* x, int64_t ldx,
-                                    float* y, int64_t ldy, int64_t rows, const std::vector<sycl::event>& deps) {
+// Two output rows per wave.  The lanes read the input row once and keep one accumulator per row,
+// so the input is fetched once for two rows instead of once for every row.  The input of a wide
+// projection is read as often as the projection has outputs, and it is that traffic, not the
+// weights, that keeps the one-row-per-wave kernel away from the memory bound.
+//
+// The accumulation of a row is unchanged: lane l adds the products of the positions l, l+32, l+64
+// ... in that order, and the 32 lanes are then reduced over the subgroup.  The result is the same
+// float as the one-row-per-wave kernel computes.
+template <DType Type, HalfMode Mode>
+sycl::event linear_fp32_rows(sycl::queue& queue, const LinearView& view, const float* x, int64_t ldx, float* y,
+                              int64_t ldy, int64_t rows, const std::vector<sycl::event>& deps) {
     constexpr size_t kSubgroup = 32;
-    const size_t groups = static_cast<size_t>(rows) * static_cast<size_t>(view.n);
+    constexpr size_t kRows = 2;
+    const size_t per_row = (static_cast<size_t>(view.n) + kRows - 1) / kRows;
+    const size_t groups = per_row;
     return queue.submit([&](sycl::handler& h) {
         if (!deps.empty()) h.depends_on(deps);
         h.parallel_for(sycl::nd_range<1>(groups * kSubgroup, kSubgroup), [=](sycl::nd_item<1> item)
                        [[sycl::reqd_sub_group_size(32)]] {
             const sycl::sub_group subgroup = item.get_sub_group();
             const size_t group = static_cast<size_t>(item.get_group_linear_id());
-            const int64_t row = static_cast<int64_t>(group / static_cast<size_t>(view.n));
-            const int64_t out = static_cast<int64_t>(group % static_cast<size_t>(view.n));
+            const size_t first = group * kRows;
+            const size_t second = first + 1 < static_cast<size_t>(view.n) ? first + 1 : first;
             const int lane = static_cast<int>(subgroup.get_local_linear_id());
-            const size_t base = static_cast<size_t>(out) * static_cast<size_t>(view.k);
-            const float* xr = x + row * ldx;
-            float value = 0.0f;
-            #pragma unroll 4
-            for (int64_t in = lane; in < view.k; in += static_cast<int64_t>(kSubgroup)) {
-                const float weight = raw_weight<Type, NativeHalf>(view, base + static_cast<size_t>(in));
-                value += xr[in] * weight;
+            const size_t base0 = first * static_cast<size_t>(view.k);
+            const size_t base1 = second * static_cast<size_t>(view.k);
+            // The groups cover the outputs of one input row and the rows are walked here, so that
+            // the group index needs no division: a division on a GPU is a long sequence of
+            // instructions, and it would be on the path of every group.
+            for (int64_t row = 0; row < rows; ++row) {
+                const float* xr = x + row * ldx;
+                float value0 = 0.0f, value1 = 0.0f;
+                #pragma unroll 4
+                for (int64_t in = lane; in < view.k; in += static_cast<int64_t>(kSubgroup)) {
+                    const float input = xr[in];
+                    const size_t offset = static_cast<size_t>(in);
+                    value0 += input * raw_weight<Type, Mode>(view.data, base0 + offset);
+                    value1 += input * raw_weight<Type, Mode>(view.data, base1 + offset);
+                }
+                const float reduced0 = sycl::reduce_over_group(subgroup, value0, sycl::plus<float>());
+                const float reduced1 = sycl::reduce_over_group(subgroup, value1, sycl::plus<float>());
+                if (lane == 0) {
+                    y[row * ldy + static_cast<int64_t>(first)] =
+                        reduced0 + (view.bias == nullptr ? 0.0f : view.bias[static_cast<int64_t>(first)]);
+                    if (second != first)
+                        y[row * ldy + static_cast<int64_t>(second)] =
+                            reduced1 + (view.bias == nullptr ? 0.0f : view.bias[static_cast<int64_t>(second)]);
+                }
             }
-            value = sycl::reduce_over_group(subgroup, value, sycl::plus<float>());
-            if (lane == 0) y[row * ldy + out] = value + (view.bias == nullptr ? 0.0f : view.bias[out]);
         });
     });
 }
 
 // For a small number of outputs, parallelize product loads without changing the original
 // 32-lane accumulation streams. Products are ephemeral local memory, never expanded weights.
-template <DType Type, bool NativeHalf>
+template <DType Type, HalfMode Mode>
 sycl::event linear_fp32_products(sycl::queue& queue, const LinearView& view, const float* x, int64_t ldx,
                                  float* y, int64_t ldy, int64_t rows, size_t threads,
                                  const std::vector<sycl::event>& deps) {
@@ -172,8 +241,11 @@ sycl::event linear_fp32_products(sycl::queue& queue, const LinearView& view, con
             const int64_t t = static_cast<int64_t>(item.get_local_id(0));
             const float* xr = x + row * ldx;
             const size_t base = static_cast<size_t>(out) * static_cast<size_t>(view.k);
-            for (int64_t in = t; in < view.k; in += static_cast<int64_t>(threads))
-                products[static_cast<size_t>(in)] = xr[in] * raw_weight<Type, NativeHalf>(view, base + static_cast<size_t>(in));
+            for (int64_t in = t; in < view.k; in += static_cast<int64_t>(threads)) {
+                const size_t offset = static_cast<size_t>(in);
+                const float weight = raw_weight<Type, Mode>(view.data, base + offset);
+                products[offset] = xr[in] * weight;
+            }
             item.barrier(sycl::access::fence_space::local_space);
             if (t < 32) {
                 float value = 0.0f;
@@ -185,7 +257,7 @@ sycl::event linear_fp32_products(sycl::queue& queue, const LinearView& view, con
     });
 }
 
-template <DType Type, bool NativeHalf = false>
+template <DType Type, HalfMode Mode>
 sycl::event select_raw_kernel(sycl::queue& queue, const LinearView& view, const float* x, int64_t ldx,
                               float* y, int64_t ldy, int64_t rows, const std::vector<sycl::event>& deps) {
     const auto device = queue.get_device();
@@ -193,15 +265,49 @@ sycl::event select_raw_kernel(sycl::queue& queue, const LinearView& view, const 
                                                  device.get_info<sycl::info::device::max_num_sub_groups>());
     const uint64_t capacity = static_cast<uint64_t>(device.get_info<sycl::info::device::max_compute_units>()) * max_waves;
     const uint64_t groups = static_cast<uint64_t>(rows) * static_cast<uint64_t>(view.n);
+    // The two-rows-per-wave kernel needs enough output rows to keep the device busy; below that
+    // the input range is split over the waves of a work-group instead, and the products travel
+    // through local memory.
+    const uint64_t wave_groups = (groups + 1) / 2;
+    if (wave_groups * 8 >= capacity)
+        return linear_fp32_rows<Type, Mode>(queue, view, x, ldx, y, ldy, rows, deps);
     const uint64_t required = capacity / groups + (capacity % groups != 0 ? 1 : 0);
     const uint64_t useful = static_cast<uint64_t>(view.k / 32 + (view.k % 32 != 0 ? 1 : 0));
     const size_t waves = static_cast<size_t>(std::min({max_waves, required, useful}));
     if (waves > 1 && static_cast<uint64_t>(view.k) <= device.get_info<sycl::info::device::local_mem_size>() / sizeof(float))
-        return linear_fp32_products<Type, NativeHalf>(queue, view, x, ldx, y, ldy, rows, waves * 32, deps);
-    return linear_fp32_specialized<Type, NativeHalf>(queue, view, x, ldx, y, ldy, rows, deps);
+        return linear_fp32_products<Type, Mode>(queue, view, x, ldx, y, ldy, rows, waves * 32, deps);
+    return linear_fp32_rows<Type, Mode>(queue, view, x, ldx, y, ldy, rows, deps);
 }
 
 }  // namespace
+
+bool plain_f16_halves(sycl::queue& queue, const void* data, size_t bytes) {
+    const size_t count = bytes / 2;
+    if (count == 0) return true;
+    int* flag = sycl::malloc_device<int>(1, queue);
+    if (flag == nullptr) return false;
+    const uint16_t* weights = static_cast<const uint16_t*>(data);
+    bool plain = false;
+    {
+        queue.memset(flag, 0, sizeof(int)).wait();
+        queue.parallel_for(sycl::range<1>(count), [=](sycl::id<1> id) {
+            const uint16_t bits = weights[id[0]];
+            const uint32_t magnitude = static_cast<uint32_t>(bits) & 0x7fffu;
+            // A plain half is a normal half or a signed zero.  A subnormal half and an infinity
+            // or NaN are the ones the device's conversion may not reproduce exactly.
+            const bool normal = magnitude == 0u || (magnitude >= 0x0400u && magnitude <= 0x7bffu);
+            if (!normal)
+                sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                 sycl::access::address_space::global_space>(*flag)
+                    .fetch_or(1);
+        }).wait();
+        int found = 0;
+        queue.memcpy(&found, flag, sizeof(int)).wait();
+        plain = found == 0;
+    }
+    sycl::free(flag, queue.get_context());
+    return plain;
+}
 
 sycl::event linear_fp32(sycl::queue& queue, const LinearView& view, const float* x, int64_t ldx, float* y,
                         int64_t ldy, int64_t rows, const std::vector<sycl::event>& deps) {
@@ -214,11 +320,16 @@ sycl::event linear_fp32(sycl::queue& queue, const LinearView& view, const float*
         return linear_fp32_cooperative(queue, view, x, ldx, y, ldy, rows, deps);
     switch (view.dtype) {
         case DType::F16:
-            if (queue.get_device().has(sycl::aspect::fp16))
-                return select_raw_kernel<DType::F16, true>(queue, view, x, ldx, y, ldy, rows, deps);
-            return select_raw_kernel<DType::F16>(queue, view, x, ldx, y, ldy, rows, deps);
-        case DType::BF16: return select_raw_kernel<DType::BF16>(queue, view, x, ldx, y, ldy, rows, deps);
-        default: return select_raw_kernel<DType::F32>(queue, view, x, ldx, y, ldy, rows, deps);
+            if (queue.get_device().has(sycl::aspect::fp16)) {
+                if (view.plain_halves)
+                    return select_raw_kernel<DType::F16, HalfMode::NativePlain>(queue, view, x, ldx, y, ldy, rows, deps);
+                return select_raw_kernel<DType::F16, HalfMode::Native>(queue, view, x, ldx, y, ldy, rows, deps);
+            }
+            return select_raw_kernel<DType::F16, HalfMode::Software>(queue, view, x, ldx, y, ldy, rows, deps);
+        case DType::BF16:
+            return select_raw_kernel<DType::BF16, HalfMode::Software>(queue, view, x, ldx, y, ldy, rows, deps);
+        default:
+            return select_raw_kernel<DType::F32, HalfMode::Software>(queue, view, x, ldx, y, ldy, rows, deps);
     }
 }
 
