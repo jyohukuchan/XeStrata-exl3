@@ -171,6 +171,7 @@ private:
     int32_t* d_dst_ = nullptr;
     int32_t* d_ngroups_ = nullptr;
     int32_t* d_nentries_ = nullptr;
+    strata::kernels::exl3::GroupedEntryPlan* d_entry_plans_ = nullptr;  ///< [max_entries], device plan resolution
     uint64_t* d_pair_blob_base_ = nullptr;   ///< [n_layers*n_expert], immutable; zero for CPU-only pairs
     int32_t* d_pair_format_index_ = nullptr; ///< [n_layers*n_expert], immutable; -1 for CPU-only pairs
     int64_t pair_count_ = 0;

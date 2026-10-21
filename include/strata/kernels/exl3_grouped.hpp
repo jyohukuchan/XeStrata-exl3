@@ -15,6 +15,17 @@
 
 namespace strata::kernels::exl3 {
 
+/// Device-resident resolution of one routed entry.
+///
+/// The format table is device memory and may be replaced between launches, so the plan's checks run on the device:
+/// the pipeline's first kernel validates every entry and publishes the result here.  The projection kernels that
+/// follow read it instead of repeating the checks for every work item.
+struct GroupedEntryPlan {
+    uint64_t base = 0;    ///< device address of the entry's expert blob
+    int32_t format = -1;  ///< index into the plan's format table, or -1 when the entry has no usable format
+    uint32_t flags = 0;   ///< bit 0: the entry is active; bit 1: the entry's format passed the checks
+};
+
 /// Device-resident routing plan for grouped unweighted experts.
 ///
 /// The pointer fields point to device allocations, including the two scalar counts.  The capacity and geometry
@@ -37,6 +48,7 @@ struct GroupedPlan {
     int64_t output_rows = 0;  ///< immutable output row bound
     int64_t hidden = 0;       ///< constant hidden width shared by every format
     int64_t max_ff = 0;       ///< maximum format feed-forward width
+    GroupedEntryPlan* entry_plans = nullptr;  ///< [max_entries], device resolution published by the pipeline
 };
 
 /// Transform and bias behavior for each projection.  A missing suh/svh descriptor leaves that transform as identity,
