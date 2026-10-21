@@ -6,6 +6,7 @@
 
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/core/device.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -357,20 +358,40 @@ bool Exl3ExpertRuntime::open(Exl3ExpertSource& source, strata::kernels::cpu::Exp
         ++buckets[it->second].slots;
     }
     if (!buckets.empty()) {
+        // The arena is one allocation unless the device's largest allocation is smaller than it: then it is
+        // taken in pieces of that size, the way the plain model's tier does it (a cache that does not fit in
+        // one allocation is a cache that does not fit at all).
+        cache_.set_max_piece(max_alloc_bytes());
         if (!cache_.open_buckets(buckets, n_layers_, n_expert_, err)) { close(); return false; }
-        std::vector<uint8_t> blob;
+        // The fills are QUEUED and waited for once, not one synchronous copy per expert: a cache that holds
+        // thousands of experts would otherwise pay a device synchronisation per expert.  A queued copy reads the
+        // host buffer until it is done, so the buffers are a small ring and the ring is waited for before a
+        // buffer is reused.
+        constexpr size_t kFillRing = 16;
+        std::vector<std::vector<uint8_t>> ring(kFillRing);
+        size_t next = 0;
         for (const ResidentPair& pair : resident) {
             const size_t at = pair_index(pair.first, pair.second);
             const auto& layout = format_table_host_[(size_t) pair_format_index_[at]];
+            std::vector<uint8_t>& blob = ring[next];
             blob.resize(static_cast<size_t>(layout.total_bytes));
             if (!source.copy_blob(pair.first, pair.second, blob.data())) {
                 err = "exl3 runtime: resident source copy failed"; close(); return false;
             }
             const int32_t slot = cache_.admit(pair.first, pair.second, pair_formats_[at]);
-            if (slot < 0 || !cache_.fill_slot_blocking(slot, blob.data(), err, static_cast<int64_t>(blob.size()))) {
+            if (slot < 0 || !cache_.fill_slot_queued(slot, blob.data(), err, static_cast<int64_t>(blob.size()))) {
                 if (err.empty()) err = "exl3 runtime: resident cache admission failed";
                 close(); return false;
             }
+            next = (next + 1) % kFillRing;
+            if (next == 0 && !cache_.sync_queued(err)) {
+                if (err.empty()) err = "exl3 runtime: resident cache fill did not finish";
+                close(); return false;
+            }
+        }
+        if (next != 0 && !cache_.sync_queued(err)) {
+            if (err.empty()) err = "exl3 runtime: resident cache fill did not finish";
+            close(); return false;
         }
     }
     cpu_jobs_.resize(static_cast<size_t>(max_entries_));

@@ -7,6 +7,7 @@
 #include "strata/core/exl3_expert_source.hpp"
 #include "strata/core/exl3_ple.hpp"
 #include "strata/core/exl3_weight_set.hpp"
+#include "strata/core/expert_cache.hpp"
 #include "strata/core/gpu.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/native_head.hpp"
@@ -23,6 +24,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <set>
@@ -102,6 +104,247 @@ std::filesystem::path find_ple_sidecar(const Archive& archive, const std::string
 bool capacity_error(const std::string& error) {
     return error.find("cache") != std::string::npos || error.find("allocation") != std::string::npos ||
            error.find("resident") != std::string::npos || error.find("VRAM") != std::string::npos;
+}
+
+// ---- THE DEVICE CACHE ---------------------------------------------------------------------------
+//
+// **WHAT IT IS.**  The experts the GPU keeps in VRAM.  A routed expert that is resident is computed by the
+// GPU; one that is not is read from the source and computed on the CPU.  The cache therefore decides how much
+// of the model the disk and the CPU have to carry.
+//
+// **WHY IT IS SIZED HERE.**  The old code asked for EVERY (layer, expert) pair of the model: for Qwen3.8 that
+// is 48 x 512 = 24576 pairs, 45.77 GiB of compressed weights, which fits in no card the engine runs on.  The
+// runtime refused the list for capacity, the caller read that as a capacity error and reopened with an empty
+// list - the "no device cache" mode, in which the GPU computes no expert at all and every routed expert is
+// read from the disk and computed on the CPU.  The room is now what the DEVICE reports, so a card with less
+// VRAM gets a smaller cache and a card with more gets a larger one; no number in this file decides it.
+
+/// The order the resident pairs are admitted in.  The routing is per layer and data dependent, so the order
+/// decides which layers, and which experts of them, the cache covers.
+enum class CacheOrder {
+    Spread,   ///< every layer gets the same number of experts: the experts in index order, the layers in turn
+    Visited,  ///< the order the layers are visited: a layer's experts before the next layer's
+    Profile,  ///< the ranking a profile file gives: the hottest pairs first
+};
+
+const char* cache_order_name(CacheOrder order) {
+    switch (order) {
+    case CacheOrder::Spread: return "spread";
+    case CacheOrder::Visited: return "visited";
+    case CacheOrder::Profile: return "profile";
+    }
+    return "spread";
+}
+
+/// STRATA_EXL3_DEVICE_CACHE_ORDER: which order the resident pairs are admitted in.
+CacheOrder device_cache_order() {
+    const char* text = std::getenv("STRATA_EXL3_DEVICE_CACHE_ORDER");
+    if (text == nullptr || text[0] == '\0') return CacheOrder::Spread;
+    if (std::strcmp(text, "visited") == 0) return CacheOrder::Visited;
+    if (std::strcmp(text, "profile") == 0) return CacheOrder::Profile;
+    return CacheOrder::Spread;
+}
+
+/// STRATA_EXL3_DEVICE_CACHE: 0 turns the device cache off (every routed expert is computed on the CPU).
+bool device_cache_enabled() {
+    const char* text = std::getenv("STRATA_EXL3_DEVICE_CACHE");
+    if (text == nullptr || text[0] == '\0') return true;
+    return !(std::strcmp(text, "0") == 0 || std::strcmp(text, "off") == 0 || std::strcmp(text, "no") == 0 ||
+             std::strcmp(text, "n") == 0 || std::strcmp(text, "false") == 0);
+}
+
+/// STRATA_EXL3_DEVICE_CACHE_MIB: the cache's budget in MiB; negative (the default) means the room the
+/// device reports.  0 is the same as turning the cache off.
+int64_t device_cache_budget_mib() {
+    const char* text = std::getenv("STRATA_EXL3_DEVICE_CACHE_MIB");
+    if (text == nullptr || text[0] == '\0') return -1;
+    char* end = nullptr;
+    const long long value = std::strtoll(text, &end, 10);
+    if (end == text || (end != nullptr && *end != '\0') || value < 0) return -1;
+    return static_cast<int64_t>(value);
+}
+
+/// STRATA_EXL3_DEVICE_CACHE_PROFILE: the profile file the `profile` order ranks the pairs with.
+std::string device_cache_profile_path() {
+    const char* text = std::getenv("STRATA_EXL3_DEVICE_CACHE_PROFILE");
+    return text == nullptr ? std::string() : std::string(text);
+}
+
+/// The reserve the model keeps for everything but the expert cache: the driver's own use, the graph capture's
+/// and the room the runtime's plan images take.  It is a share of the card between two bounds, so a small card
+/// keeps a smaller absolute share for the experts than a large one.
+uint64_t device_cache_reserve(uint64_t total_bytes) {
+    return std::clamp<uint64_t>(total_bytes / 32, 192ull << 20, 768ull << 20);
+}
+
+/// The pairs the cache holds, and what they cost.
+struct DeviceCachePlan {
+    std::vector<Exl3ExpertRuntime::ResidentPair> resident;
+    uint64_t bytes = 0;          ///< the bytes the resident pairs take (the slots are 256-byte aligned)
+    uint64_t budget = 0;         ///< the bytes the plan was given
+    int64_t layers = 0;          ///< the layers the stage owns
+    int64_t experts = 0;         ///< the experts of a layer
+    int64_t per_layer_min = 0;   ///< the fewest experts a layer got
+    int64_t per_layer_max = 0;   ///< the most a layer got
+};
+
+/// Plans the resident pairs of one stage: the pairs that fit in `budget`, in the given order.
+///
+/// The order decides the shape of the cache, and the shape decides the hit rate:
+///   * `Spread` gives every layer the same number of experts.  A position routes a few experts in EVERY layer,
+///     so a cache that filled a few layers and left the rest empty would miss on those layers for the whole
+///     run - the same confinement the native path's per-layer admission was written against.
+///   * `Visited` fills a layer's experts before the next layer's: the order the layers are visited in.
+///   * `Profile` takes the pairs a profile file ranks first (the hottest ones), the rest in `Spread` order.
+///
+/// Each pair is charged its own layout's size: the EXL3 formats differ per layer, so the largest blob is not
+/// the size of a slot.
+DeviceCachePlan plan_device_cache(const Exl3ExpertSource& source, int64_t layer_begin, int64_t layer_end,
+                                  int64_t n_expert, uint64_t budget, CacheOrder order,
+                                  const std::vector<std::pair<int32_t, int32_t>>& ranked) {
+    DeviceCachePlan plan;
+    plan.budget = budget;
+    plan.layers = layer_end - layer_begin;
+    plan.experts = n_expert;
+    const int64_t layers = plan.layers;
+    if (layers <= 0 || n_expert <= 0) return plan;
+    const size_t pairs = static_cast<size_t>(layers) * static_cast<size_t>(n_expert);
+    std::vector<uint64_t> bytes(pairs, 0);
+    for (int64_t l = 0; l < layers; ++l)
+        for (int64_t e = 0; e < n_expert; ++e) {
+            const auto* layout = source.exl3_layout(layer_begin + l, e);
+            if (layout == nullptr) continue;
+            bytes[static_cast<size_t>(l) * static_cast<size_t>(n_expert) + static_cast<size_t>(e)] =
+                (layout->total_bytes + 255u) & ~uint64_t(255u);
+        }
+    // The order the pairs are admitted in.
+    std::vector<std::pair<int32_t, int32_t>> order_pairs;
+    order_pairs.reserve(pairs);
+    std::vector<uint8_t> taken(pairs, 0);
+    if (order == CacheOrder::Profile) {
+        for (const auto& pair : ranked) {
+            if (pair.first < layer_begin || pair.first >= layer_end) continue;
+            if (pair.second < 0 || pair.second >= n_expert) continue;
+            const size_t at = static_cast<size_t>(pair.first - layer_begin) * static_cast<size_t>(n_expert) +
+                              static_cast<size_t>(pair.second);
+            if (taken[at] != 0) continue;
+            taken[at] = 1;
+            order_pairs.emplace_back(pair.first, pair.second);
+        }
+    }
+    const bool by_layer = order == CacheOrder::Visited;
+    for (int64_t outer = 0; outer < (by_layer ? layers : n_expert); ++outer)
+        for (int64_t inner = 0; inner < (by_layer ? n_expert : layers); ++inner) {
+            const int64_t l = by_layer ? outer : inner;
+            const int64_t e = by_layer ? inner : outer;
+            const size_t at = static_cast<size_t>(l) * static_cast<size_t>(n_expert) + static_cast<size_t>(e);
+            if (taken[at] != 0) continue;
+            taken[at] = 1;
+            order_pairs.emplace_back(static_cast<int32_t>(layer_begin + l), static_cast<int32_t>(e));
+        }
+    // The pairs that fit.
+    uint64_t left = budget;
+    std::vector<int64_t> per_layer(static_cast<size_t>(layers), 0);
+    for (const auto& pair : order_pairs) {
+        const size_t at = static_cast<size_t>(pair.first - layer_begin) * static_cast<size_t>(n_expert) +
+                          static_cast<size_t>(pair.second);
+        const uint64_t cost = bytes[at];
+        if (cost == 0 || cost > left) continue;
+        left -= cost;
+        plan.bytes += cost;
+        plan.resident.push_back(pair);
+        ++per_layer[static_cast<size_t>(pair.first - layer_begin)];
+    }
+    for (const int64_t count : per_layer) {
+        plan.per_layer_min = std::min(plan.per_layer_min, count);
+        plan.per_layer_max = std::max(plan.per_layer_max, count);
+    }
+    if (plan.resident.empty()) plan.per_layer_min = 0;
+    return plan;
+}
+
+/// Opens one stage's expert runtime on a device cache sized from what the device reports.
+///
+/// The pairs that do not fit stay in the source and are computed on the CPU: that miss path is the one the
+/// engine has always had, so a card with no room for the cache still runs.  It says so when it happens,
+/// because the run's numbers depend on it (the prepare detail's miss count).
+bool open_device_cache(Exl3ExpertSource& source, strata::kernels::cpu::ExpertPool& pool, Exl3ExpertRuntime& runtime,
+                       size_t stage_index, int64_t layer_begin, int64_t layer_end, int64_t n_expert,
+                       int64_t n_layers, int64_t max_rows, int64_t routed_k, bool allow_cpu_miss, std::string& err) {
+    const auto no_cache = [&](const char* why) {
+        if (!allow_cpu_miss) {
+            err = "EXL3 Flash: stage " + std::to_string(stage_index) + " expert runtime: the device cache is " +
+                  why + ", and a CPU miss is not allowed";
+            return false;
+        }
+        std::string ignored;
+        if (!runtime.open(source, pool, max_rows, routed_k, {}, ignored, layer_begin, layer_end)) {
+            err = "EXL3 Flash: stage " + std::to_string(stage_index) + " expert runtime: " + ignored;
+            return false;
+        }
+        std::fprintf(stderr, "strata exl3-flash: stage %zu device cache: %s; every routed expert is read from "
+                             "the source and computed on the CPU\n", stage_index, why);
+        return true;
+    };
+    if (!device_cache_enabled()) return no_cache("off (STRATA_EXL3_DEVICE_CACHE=0)");
+    size_t free_b = 0, total_b = 0;
+    if (!strata::gpu::mem_info(&free_b, &total_b))
+        return no_cache("the device does not report its free memory");
+    CacheOrder order = device_cache_order();
+    std::vector<std::pair<int32_t, int32_t>> ranked;
+    if (order == CacheOrder::Profile) {
+        const std::string path = device_cache_profile_path();
+        std::string profile_error;
+        int64_t slots = 0;
+        if (path.empty() || !read_expert_profile(path, n_layers, n_expert, ranked, slots, profile_error)) {
+            std::fprintf(stderr, "strata exl3-flash: stage %zu device cache: the profile order needs a profile "
+                                 "file for this model (%s); the spread order is used instead\n",
+                         stage_index, path.empty() ? "STRATA_EXL3_DEVICE_CACHE_PROFILE is not set"
+                                                   : profile_error.c_str());
+            ranked.clear();
+            order = CacheOrder::Spread;
+        }
+    }
+    const uint64_t reserve = device_cache_reserve(static_cast<uint64_t>(total_b));
+    uint64_t room = free_b > reserve ? static_cast<uint64_t>(free_b) - reserve : 0;
+    const int64_t asked_mib = device_cache_budget_mib();
+    if (asked_mib >= 0 && (static_cast<uint64_t>(asked_mib) << 20) < room)
+        room = static_cast<uint64_t>(asked_mib) << 20;
+    // The cache may still not fit: the free figure is what the driver reports, and the driver's own use can
+    // grow.  Then the room is halved and the plan made again; a card with no room at all runs without a cache.
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        const DeviceCachePlan plan =
+            plan_device_cache(source, layer_begin, layer_end, n_expert, room, order, ranked);
+        if (plan.resident.empty()) break;
+        std::string open_error;
+        if (runtime.open(source, pool, max_rows, routed_k, plan.resident, open_error, layer_begin, layer_end)) {
+            std::fprintf(stderr,
+                         "strata exl3-flash: stage %zu device cache: %lld experts resident (%.2f GiB) of %lld, "
+                         "%.2f GiB free, %.2f GiB reserved, order %s, %lld-%lld experts per layer\n",
+                         stage_index, (long long) plan.resident.size(), (double) plan.bytes / 1073741824.0,
+                         (long long) (plan.layers * plan.experts), (double) free_b / 1073741824.0,
+                         (double) reserve / 1073741824.0, cache_order_name(order),
+                         (long long) plan.per_layer_min, (long long) plan.per_layer_max);
+            return true;
+        }
+        if (!capacity_error(open_error)) {
+            // Not a capacity question: the cache could not be filled (a read that failed, a pool that would
+            // not prepare).  The cache is an optimisation; the miss path is the engine's own, so the run goes
+            // on without a cache when a CPU miss is allowed, and says what it did.
+            std::fprintf(stderr, "strata exl3-flash: stage %zu device cache: the cache could not be opened: %s\n",
+                         stage_index, open_error.c_str());
+            if (!allow_cpu_miss) {
+                err = "EXL3 Flash: stage " + std::to_string(stage_index) + " expert runtime: " + open_error;
+                return false;
+            }
+            return no_cache("it could not be opened");
+        }
+        std::fprintf(stderr, "strata exl3-flash: stage %zu device cache: the cache did not fit (%.2f GiB asked, "
+                             "%.2f GiB free): %s\n", stage_index, (double) plan.bytes / 1073741824.0,
+                     (double) free_b / 1073741824.0, open_error.c_str());
+        room /= 2;
+    }
+    return no_cache("no room for the experts");
 }
 
 uint64_t gdn_state_floats(const ModelGeometry& geometry) {
@@ -439,26 +682,9 @@ bool Exl3FlashModel::open(const std::filesystem::path& directory, const Exl3Flas
                 err = "EXL3 Flash: stage " + std::to_string(stage_index) + " expert source: " + err;
                 return false;
             }
-            std::vector<Exl3ExpertRuntime::ResidentPair> resident;
-            for (int64_t layer = current.layer_begin; layer < current.layer_end; ++layer)
-                for (int64_t expert = 0; expert < impl_->geometry.n_expert; ++expert)
-                    resident.emplace_back(static_cast<int32_t>(layer), static_cast<int32_t>(expert));
-            if (!current.runtime->open(*current.source, *current.pool, options.max_rows, routed_k, resident, err,
-                                       current.layer_begin, current.layer_end)) {
-                const std::string first_error = err;
-                if (!options.allow_cpu_expert_miss || !capacity_error(first_error)) {
-                    err = "EXL3 Flash: stage " + std::to_string(stage_index) + " expert runtime: " + first_error;
-                    return false;
-                }
-                current.runtime->close();
-                resident.clear();
-                if (!current.runtime->open(*current.source, *current.pool, options.max_rows, routed_k, resident, err,
-                                           current.layer_begin, current.layer_end)) {
-                    err = "EXL3 Flash: stage " + std::to_string(stage_index) +
-                          " expert cache does not fit and CPU-miss fallback failed: " + err;
-                    return false;
-                }
-            }
+            // The expert runtime (and the device cache it holds) is opened at the END of open(), after every
+            // other device allocation and after the graph capture: the cache takes what the device has left,
+            // so it has to be the last thing that asks for VRAM.
         }
 
         // The Qwen3.8 PLE owner is stage-local at trunk layer 1, while the
@@ -656,6 +882,22 @@ bool Exl3FlashModel::open(const std::filesystem::path& directory, const Exl3Flas
             strata::gpu::stream_destroy(capture_stream);
             if (!err.empty()) return false;
         }
+
+        // ---- THE DEVICE CACHE, PLANNED FROM WHAT THE DEVICE REPORTS ----
+        //
+        // It is opened LAST, after every other device allocation and after the graph capture, because it takes
+        // what the device has left: the room it gets is the free VRAM at this point, less a reserve.
+        for (size_t stage_index = 0; stage_index < impl_->stages.size(); ++stage_index) {
+            auto& stage = impl_->stages[stage_index];
+            const OnDevice on(stage.device);
+            if (!open_device_cache(*stage.source, *stage.pool, *stage.runtime, stage_index,
+                                   stage.layer_begin, stage.layer_end, impl_->geometry.n_expert,
+                                   impl_->geometry.n_layers, options.max_rows, routed_k,
+                                   options.allow_cpu_expert_miss, err)) {
+                return false;
+            }
+        }
+
         layer_set_fused_gr(impl_->previous_fused_gr);
         layer_set_shared_early(impl_->previous_shared_early);
         impl_->policy_saved = false;
