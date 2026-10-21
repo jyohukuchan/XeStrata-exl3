@@ -221,6 +221,47 @@ This integration runs greedy single-token AR and uses CPU expert fallback with p
 This initial CLI rejects requests for MTP, vision, serve, batch and multi-token prompt chunks.
 Qwen3.5 CLI/MTP uses the following path.
 
+### The device cache (Qwen3.8 Flash)
+
+The Qwen3.8 Flash integration keeps its experts in a device cache on the GPU. The cache's size comes from
+**the free VRAM the device reports**: the (layer, expert) pairs that fit in the room left after a reserve
+(a thirty-second of the card's total VRAM, between 192 and 768 MiB) are resident, and the pairs that do not
+fit are read from the source and computed on the CPU as before. A card with less VRAM gets a smaller cache.
+When the cache cannot be opened at all the run goes on with the CPU miss path alone, and says so.
+
+```sh
+STRATA_EXL3_DEVICE_CACHE=0            # no device cache (every expert on the CPU)
+STRATA_EXL3_DEVICE_CACHE_MIB=4096     # the cache's budget in MiB
+STRATA_EXL3_DEVICE_CACHE_ORDER=spread # spread | visited | profile
+STRATA_EXL3_DEVICE_CACHE_PROFILE=PATH # the profile file the profile order ranks with
+```
+
+`spread` (the default) gives every layer the same number of experts. `visited` fills a layer's experts
+before the next layer's, in the order the layers are visited. `profile` takes the pairs a profile
+(`tools/make_profile.py`'s `STRP` format) ranks first, the hottest ones first.
+
+Measured on the V620 at 0000:43:00.0 with the Qwen3.8 EXL3 3.05 bpw checkpoint, `STRATA_EXL3_CPU_INTDOT=1`
+and `STRATA_EXL3_CPU_ROWPARALLEL=1`, context 512, 63 decode tokens, and the engine's own
+`STRATA_EXL3_PREPARE_DETAIL=1` counters:
+
+| Condition | CPU misses | decode |
+| --- | ---: | ---: |
+| no device cache | 32160 / 3216 windows (10.00 per window) | 3.67 tok/s |
+| device cache of 15404 experts (26.72 GiB), `spread` | 11801 (3.67 per window) | **12.88 tok/s** |
+| the same, `visited` | 11978 (3.73 per window) | 12.25 tok/s |
+| the same, `profile` (`data/expert-profile.bin`) | 9429 (2.93 per window) | 12.73 tok/s |
+
+The three orders are within 5% of each other in decode speed, and the order does not follow the miss count:
+a layer's CPU misses run in parallel inside the layer, so a layer with one miss costs as much as a layer with
+ten. The default is `spread`: it spreads the cache evenly over the layers and needs no profile file.
+The cache's start-up costs the read of the experts it holds (34 s on the V620: the read and the device's
+order), and the decode is 0.27 s per token faster.
+
+**The values**: an expert in the cache is computed by the GPU with FP32 accumulation, and the CPU's exact
+path accumulates in FP64, so the last bits differ. The logits of a run without a device cache are bit
+identical with the reference; with the cache the largest absolute difference of a logit is 1.4e-4 (1e-5
+relative), and the greedy tokens do not change.
+
 ## Qwen3.5 MoE MTP integration
 
 `--spec 2` or greater loads `mtp.fc`, three norms, and `mtp.layers.0` attention, routers and shared/routed experts

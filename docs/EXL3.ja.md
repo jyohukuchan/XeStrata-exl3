@@ -213,6 +213,46 @@ strata --exl3 /path/to/qwen38-exl3 --tokens 16,10,16,28 --max-new 2 \
 MTP、vision、serve、batch と複数 token の prompt chunk はこの初期 CLI では要求時に拒否する。
 Qwen3.5 の CLI/MTP 接続は次の経路を使う。
 
+### device cache（Qwen3.8 Flash）
+
+Qwen3.8 Flash の接続は、GPU が保持する expert の device cache を使う。cache の大きさは
+**device が報告する空き VRAM** から決める: 予約（合計 VRAM の 1/32、192〜768 MiB の間）を
+差し引いた room に収まる (layer, expert) 組だけを常駐させ、収まらない組は従来どおり source から
+読んで CPU で計算する。VRAM の少ない card には小さい cache が入る。cache を開けないときは
+CPU miss 経路だけで走り、その旨を表示する。
+
+```sh
+STRATA_EXL3_DEVICE_CACHE=0            # cache を使わない（全部 CPU）
+STRATA_EXL3_DEVICE_CACHE_MIB=4096     # cache の予算を MiB で指定する
+STRATA_EXL3_DEVICE_CACHE_ORDER=spread # spread | visited | profile
+STRATA_EXL3_DEVICE_CACHE_PROFILE=PATH # profile order の profile ファイル
+```
+
+`spread`（既定）は各層に同じ数の expert を与える。`visited` は層を訪れる順に、層を丸ごと
+埋めてから次の層へ進む。`profile` は `tools/make_profile.py` の profile（`STRP` 形式）の
+順に、hot な組から入れる。
+
+測定（V620 0000:43:00.0、Qwen3.8 EXL3 3.05 bpw、`STRATA_EXL3_CPU_INTDOT=1` と
+`STRATA_EXL3_CPU_ROWPARALLEL=1`、context 512、63 decode token、engine 自身の
+`STRATA_EXL3_PREPARE_DETAIL=1` の counter）:
+
+| 条件 | CPU miss | decode |
+| --- | ---: | ---: |
+| device cache なし | 32160 / 3216 window（10.00 per window） | 3.67 tok/s |
+| device cache 15404 expert（26.72 GiB）、`spread` | 11801（3.67 per window） | **12.88 tok/s** |
+| 同、`visited` | 11978（3.73 per window） | 12.25 tok/s |
+| 同、`profile`（`data/expert-profile.bin`） | 9429（2.93 per window） | 12.73 tok/s |
+
+三つの順序の decode 速度は 5% の差で、順序は miss の数では決まらない: 層の CPU 計算は
+層の中で並列に走るので、1 層でも miss があればその層の分だけ時間がかかるからである。
+既定は `spread`（層に平等に配り、profile ファイルが要らない）。
+cache の起動コストは expert を読む分（V620 で 34 s、cache に載る expert の read と
+device 向けの並べ替え）で、decode は 1 token あたり 0.27 s 速くなる。
+
+**数値**: cache に載った expert は GPU の FP32 積和で、CPU の exact 経路（FP64）とは
+最後のビットが違う。device cache を使わない構成の logits は参照と bit 一致で、
+cache を入れると logit の最大絶対差は 1.4e-4（相対 1e-5、greedy の token は不変）。
+
 ## Qwen3.5 MoE の MTP 接続
 
 `--spec 2` 以上は archive の `mtp.fc`、三つの norm、`mtp.layers.0` の attention・router・shared/routed
