@@ -19,7 +19,10 @@
 #include "strata/kernels/rope_scaling.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <set>
@@ -148,6 +151,65 @@ void destroy_graphs(std::vector<strata::gpu::Graph*>& graphs) noexcept {
     }
     graphs.clear();
 }
+
+// Host-side timing of one forward pass, printed when STRATA_EXL3_FLASH_TIMING is set.
+struct HostTiming {
+    bool enabled = false;
+    std::chrono::steady_clock::time_point mark;
+    double embedding_ms = 0;
+    double ple_issue_ms = 0;
+    double ple_collect_ms = 0;
+    double pre_graph_ms = 0;
+    double expert_prepare_ms = 0;
+    double expert_wait_ms = 0;
+    double merge_ms = 0;
+    double post_graph_ms = 0;
+    double head_ms = 0;
+
+    double total_ms() const {
+        return embedding_ms + ple_issue_ms + ple_collect_ms + pre_graph_ms + expert_prepare_ms + expert_wait_ms +
+               merge_ms + post_graph_ms + head_ms;
+    }
+};
+
+bool host_timing_enabled() {
+    static const bool on = std::getenv("STRATA_EXL3_FLASH_TIMING") != nullptr;
+    return on;
+}
+
+double ms_since(std::chrono::steady_clock::time_point& mark) {
+    const auto now = std::chrono::steady_clock::now();
+    const double value = std::chrono::duration<double, std::milli>(now - mark).count();
+    mark = now;
+    return value;
+}
+
+/// Drains the PLE's row ticket if a forward fails between the issue and the
+/// collect.  The table allows one token in flight, so a ticket left behind
+/// would refuse the next token's read and the model would stop with an error
+/// that names the symptom rather than the cause.
+class PleTicketGuard {
+public:
+    void arm(strata::kernels::PleTable* table, float* scratch) {
+        table_ = table;
+        scratch_ = scratch;
+        armed_ = true;
+    }
+    void disarm() { armed_ = false; }
+    ~PleTicketGuard() {
+        if (!armed_ || table_ == nullptr || scratch_ == nullptr) return;
+        std::string ignored;
+        try {
+            (void) table_->collect(scratch_, ignored);
+        } catch (...) {   // a destructor that throws while the stack unwinds would end the process
+        }
+    }
+
+private:
+    strata::kernels::PleTable* table_ = nullptr;
+    float* scratch_ = nullptr;
+    bool armed_ = false;
+};
 
 }  // namespace
 
@@ -851,8 +913,43 @@ bool Exl3FlashModel::forward(int32_t token, int64_t pos, int32_t& next_token, fl
         err = "EXL3 Flash: token is outside the embedding vocabulary";
         return false;
     }
+    PleTicketGuard ple_guard;
     try {
         auto& first = impl_->stages.front();
+        HostTiming timing;
+        timing.enabled = host_timing_enabled();
+        auto mark = std::chrono::steady_clock::now();
+        if (impl_->ple_stage_index < 0 || static_cast<size_t>(impl_->ple_stage_index) >= impl_->stages.size()) {
+            err = "EXL3 Flash: PLE stage ownership is missing";
+            return false;
+        }
+        auto& ple_stage = impl_->stages[static_cast<size_t>(impl_->ple_stage_index)];
+        ple_stage.session.ple_token = token;
+        bool ple_collected = ple_stage.session.ple.table == nullptr;
+        if (ple_stage.session.ple.table != nullptr) {
+            if (!ple_stage.session.ple.ready() ||
+                !ple_stage.session.ple.table->is_open() ||
+                !ple_stage.session.ple.hist ||
+                !ple_stage.session.ple.emb_dev ||
+                !ple_stage.session.ple.scratch ||
+                !ple_stage.session.ple.prev) {
+                err = "EXL3 Flash: PLE state is not ready before token staging";
+                return false;
+            }
+            // THE ROW READ STARTS HERE AND IS COLLECTED JUST BEFORE THE LAYER THAT
+            // CONSUMES IT.  The sixteen rows come from a 32.6 GB sidecar that is read
+            // with unbuffered I/O, so the read costs the disk's latency; collecting it
+            // here would put that latency in front of every layer.  The reader's own
+            // worker thread does the read, and the layers in front of the PLE are
+            // the work it hides behind - the same split the native path uses.
+            mark = std::chrono::steady_clock::now();
+            if (!ple_issue_token(ple_stage.session.ple, err)) {
+                err = "EXL3 Flash: PLE token staging: " + err;
+                return false;
+            }
+            timing.ple_issue_ms = ms_since(mark);
+            ple_guard.arm(ple_stage.session.ple.table, ple_stage.session.ple.emb_host);
+        }
         {
             const OnDevice on(first.device);
             impl_->embedding->gather_one(token, first.embedding_device, nullptr);
@@ -871,33 +968,11 @@ bool Exl3FlashModel::forward(int32_t token, int64_t pos, int32_t& next_token, fl
             }
             impl_->seeded = true;
         }
+        timing.embedding_ms = ms_since(mark);
 
         for (auto& stage : impl_->stages) {
             stage_token(impl_->geometry, pos, 0, stage.session);
         }
-        if (impl_->ple_stage_index < 0 || static_cast<size_t>(impl_->ple_stage_index) >= impl_->stages.size()) {
-            err = "EXL3 Flash: PLE stage ownership is missing";
-            return false;
-        }
-        auto& ple_stage = impl_->stages[static_cast<size_t>(impl_->ple_stage_index)];
-        ple_stage.session.ple_token = token;
-        if (ple_stage.session.ple.table != nullptr) {
-            const OnDevice on(ple_stage.device);
-            if (!ple_stage.session.ple.ready() ||
-                !ple_stage.session.ple.table->is_open() ||
-                !ple_stage.session.ple.hist ||
-                !ple_stage.session.ple.emb_dev ||
-                !ple_stage.session.ple.scratch ||
-                !ple_stage.session.ple.prev) {
-                err = "EXL3 Flash: PLE state is not ready before token staging";
-                return false;
-            }
-            if (!ple_stage_token(ple_stage.session.ple, nullptr, err)) {
-                err = "EXL3 Flash: PLE token staging: " + err;
-                return false;
-            }
-        }
-
         for (size_t stage_index = 0; stage_index < impl_->stages.size(); ++stage_index) {
             auto& stage = impl_->stages[stage_index];
             const OnDevice on(stage.device);
@@ -911,26 +986,52 @@ bool Exl3FlashModel::forward(int32_t token, int64_t pos, int32_t& next_token, fl
             for (int64_t layer = stage.layer_begin; layer < stage.layer_end; ++layer) {
                 const size_t local = static_cast<size_t>(layer - stage.layer_begin);
                 doorbell_reset(stage.doorbell);
+                if (layer == PLE_LAYER && static_cast<int>(stage_index) == impl_->ple_stage_index &&
+                    ple_stage.session.ple.table != nullptr) {
+                    // The gathered rows are the input of this layer's pre graph, so the
+                    // read is collected here and the upload is queued on the same queue
+                    // the graph is launched on: the copy is ordered before the graph.
+                    mark = std::chrono::steady_clock::now();
+                    const bool finished = ple_finish_token(ple_stage.session.ple, nullptr, err);
+                    timing.ple_collect_ms += ms_since(mark);
+                    ple_guard.disarm();
+                    if (!finished) {
+                        err = "EXL3 Flash: PLE token staging: " + err;
+                        return false;
+                    }
+                    ple_collected = true;
+                }
+                mark = std::chrono::steady_clock::now();
                 if (!strata::gpu::graph_launch(stage.pre_graphs[local], nullptr) ||
                     !strata::gpu::stream_sync(nullptr)) {
                     err = "EXL3 Flash: pre graph launch layer " + std::to_string(layer) + ": " +
                           strata::gpu::last_error();
                     return false;
                 }
+                timing.pre_graph_ms += ms_since(mark);
+                mark = std::chrono::steady_clock::now();
                 if (!strata::gpu::memset(stage.parts_device, 0,
                                          stage.merge_output.size() * sizeof(float))) {
                     err = std::string("EXL3 Flash: clearing expert output: ") + strata::gpu::last_error();
                     return false;
                 }
                 sycl::event expert_done;
+                mark = std::chrono::steady_clock::now();
                 if (!prepare_expert_window(stage_index, layer, stage.doorbell.h_x_f, impl_->geometry.n_embd,
                                            stage.doorbell.h_ids, 1, stage.miss_output.data(), impl_->geometry.n_embd,
                                            nullptr, static_cast<const float*>(stage.session.block.mixed),
-                                           static_cast<float*>(stage.parts_device), expert_done, err) ||
-                    !wait_expert_window(stage_index, expert_done, err)) {
+                                           static_cast<float*>(stage.parts_device), expert_done, err)) {
                     err = "EXL3 Flash: expert window layer " + std::to_string(layer) + ": " + err;
                     return false;
                 }
+                timing.expert_prepare_ms += ms_since(mark);
+                mark = std::chrono::steady_clock::now();
+                if (!wait_expert_window(stage_index, expert_done, err)) {
+                    err = "EXL3 Flash: expert window layer " + std::to_string(layer) + ": " + err;
+                    return false;
+                }
+                timing.expert_wait_ms += ms_since(mark);
+                mark = std::chrono::steady_clock::now();
                 if (!strata::gpu::copy(stage.merge_output.data(), stage.parts_device,
                                        stage.merge_output.size() * sizeof(float))) {
                     err = std::string("EXL3 Flash: expert device-to-host merge copy failed: ") + strata::gpu::last_error();
@@ -943,12 +1044,15 @@ bool Exl3FlashModel::forward(int32_t token, int64_t pos, int32_t& next_token, fl
                     err = std::string("EXL3 Flash: expert host-to-device merge copy failed: ") + strata::gpu::last_error();
                     return false;
                 }
+                timing.merge_ms += ms_since(mark);
+                mark = std::chrono::steady_clock::now();
                 if (!strata::gpu::graph_launch(stage.post_graphs[local], nullptr) ||
                     !strata::gpu::stream_sync(nullptr)) {
                     err = "EXL3 Flash: post graph launch layer " + std::to_string(layer) + ": " +
                           strata::gpu::last_error();
                     return false;
                 }
+                timing.post_graph_ms += ms_since(mark);
             }
             if (stage_index + 1 < impl_->stages.size()) {
                 if (!strata::gpu::copy(impl_->bridge_host.data(), stage.session.block.R,
@@ -959,7 +1063,13 @@ bool Exl3FlashModel::forward(int32_t token, int64_t pos, int32_t& next_token, fl
             }
         }
 
+        if (!ple_collected) {
+            err = "EXL3 Flash: the PLE layer was not reached, so its rows were never staged";
+            return false;
+        }
+
         auto& last = impl_->stages.back();
+        mark = std::chrono::steady_clock::now();
         {
             const OnDevice on(last.device);
             if (!lm_head(last.table, impl_->geometry, last.session.block, static_cast<float*>(impl_->logits_device),
@@ -970,6 +1080,7 @@ bool Exl3FlashModel::forward(int32_t token, int64_t pos, int32_t& next_token, fl
                 return false;
             }
         }
+        timing.head_ms = ms_since(mark);
         double best = -std::numeric_limits<double>::infinity();
         for (size_t i = 0; i < impl_->logits_host.size(); ++i) {
             const double value = impl_->logits_host[i];
@@ -986,6 +1097,18 @@ bool Exl3FlashModel::forward(int32_t token, int64_t pos, int32_t& next_token, fl
             ple_stage.session.ple_prev[1] = token;
         }
         ++impl_->next_position;
+        if (timing.enabled) {
+            const auto split = ple_stage.session.ple.table ? ple_stage.session.ple.table->last_collect_timing()
+                                                            : strata::kernels::PleTable::CollectTiming{};
+            std::fprintf(stderr,
+                         "exl3-flash timing pos %lld: total %.1f ms | emb %.1f | ple issue %.1f collect %.1f "
+                         "(wait %.1f, decode %.1f) | pre %.1f | expert_prep %.1f | expert_wait %.1f | merge %.1f | "
+                         "post %.1f | head %.1f\n",
+                         static_cast<long long>(pos), timing.total_ms(), timing.embedding_ms, timing.ple_issue_ms,
+                         timing.ple_collect_ms, split.wait_us / 1000.0, split.decode_us / 1000.0, timing.pre_graph_ms,
+                         timing.expert_prepare_ms, timing.expert_wait_ms, timing.merge_ms, timing.post_graph_ms,
+                         timing.head_ms);
+        }
         return true;
     } catch (const std::exception& e) {
         err = std::string("EXL3 Flash: forward: ") + e.what();

@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -243,6 +244,36 @@ void run(const std::filesystem::path& root) {
     check(std::memcmp(two_token_output.data(), two_token_expected.data(), two_token_output.size() * sizeof(float)) == 0,
           "two-token batch matches explicit-head oracle");
     check(table.io_report().find("row-cache hits") != std::string::npos, "direct cache statistics available");
+
+    // THE SPLIT API, WHICH IS WHAT THE DECODE PATH USES: the issue starts the reads
+    // and returns, and the collect waits for them.  The reader's injected delay makes
+    // the two halves observable: the issue must return long before the delay is over,
+    // so the caller can put other work in between, and the collect must return the
+    // same rows the one-shot path returns.
+    {
+        strata::kernels::PleIoOptions delayed_io = io;
+        delayed_io.cache_rows = 0;         // every row comes from the file
+        delayed_io.max_inflight = 32;
+        strata::kernels::PleTable delayed;
+        std::string delayed_err;
+        check(delayed.open_exl3(path.string(), delayed_err, delayed_io), "PleTable EXL3 direct open without a cache");
+        constexpr double kDelayMs = 150.0;
+        delayed.set_injected_delay_us(kDelayMs * 1000.0);
+        const auto issue_begin = std::chrono::steady_clock::now();
+        check(delayed.issue(rows.data()), "delayed issue");
+        const double issue_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - issue_begin).count();
+        check(issue_ms < kDelayMs / 4.0, "the issue does not wait for the rows");
+        const auto collect_begin = std::chrono::steady_clock::now();
+        check(delayed.collect(got.data(), delayed_err), "delayed collect");
+        const double collect_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - collect_begin).count();
+        check(collect_ms >= kDelayMs / 2.0, "the collect waits for the rows");
+        check(std::memcmp(got.data(), expected_heads.data(), got.size() * sizeof(float)) == 0,
+              "the split collect returns the same rows as the one-shot collect");
+        delayed.set_injected_delay_us(0);
+        delayed.close();
+    }
 
     strata::kernels::PleIoOptions mmap = io;
     mmap.mode = strata::kernels::PleIo::Mmap;

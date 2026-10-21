@@ -1444,7 +1444,7 @@ bool block_layer_pre(const WeightTable& tables, const ModelGeometry& g, int64_t 
                        strata::kernels::fused_gr_supported(g.n_embd, g.hc, g.hc_lr);
     // layer-1's FFN write has not been applied to R yet - unless a control vector follows it, which needs R
     bool pending_ffn = fused && layer > 0 && !strata::kernels::cvec().covers(layer - 1);
-    if (ple != nullptr && ple->ready() && layer == 1 && (half == 0 || half == 1)) {
+    if (ple != nullptr && ple->ready() && layer == PLE_LAYER && (half == 0 || half == 1)) {
         if (pending_ffn) {
             const strata::kernels::GrShapes gs0{g.n_embd, g.hc, g.hc_lr};
             gr_write(bb.R, bb.block_out, bb.inject2, gs0, bb.R, stream);

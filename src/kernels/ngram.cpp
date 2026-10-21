@@ -12,6 +12,7 @@
 #include "strata/artifact/dequant.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/ngram/ple_reader.hpp"
+#include "strata/platform/direct_file.hpp"
 #include "strata/platform/memory.hpp"
 
 #include <cerrno>
@@ -220,6 +221,8 @@ struct PleTable::Impl {
     std::unique_ptr<strata::artifact::exl3_ngram::Reader> exl3_reader;
     std::array<int32_t, PLE_N_HEADS> exl3_heads = {};
     std::string exl3_format;
+    double last_wait_us = 0;      ///< the reader's blocked time in the last collect
+    double last_decode_us = 0;    ///< the CPU decode's time in the last collect
     void decode(const uint8_t* row, float* out160) const { fmt->dequant(row, scale, out160); }
     int32_t exl3_head(uint32_t row) const {
         if (!exl3_reader) return -1;
@@ -572,6 +575,9 @@ const std::vector<int64_t>& PleTable::exl3_head_vocab_sizes() const {
     return impl_->exl3_reader ? impl_->exl3_reader->head_vocab_sizes() : empty;
 }
 PleIo PleTable::mode() const { return impl_->mode; }
+PleTable::CollectTiming PleTable::last_collect_timing() const {
+    return CollectTiming{impl_->last_wait_us, impl_->last_decode_us};
+}
 uint64_t PleTable::rows() const { return impl_->n_rows; }
 uint64_t PleTable::bytes_read() const { return impl_->bytes_read; }
 
@@ -627,15 +633,20 @@ bool PleTable::collect(float* out2560, std::string& err) {
     if (!impl_->pending) { err = "PleTable::collect without issue"; return false; }
     impl_->pending = false;
     if (impl_->mode == PleIo::Direct) {
+        const double t0 = strata::platform::now_us();
         if (!impl_->reader.collect(impl_->ticket, err)) return false;
+        const double t1 = strata::platform::now_us();
+        impl_->last_wait_us = t1 - t0;
         if (impl_->exl3_mode) {
             if (!impl_->decode_exl3(impl_->raw, impl_->rows, PLE_N_HEADS, out2560, PLE_HEAD_DIM, err)) return false;
             impl_->bytes_read += (uint64_t) PLE_N_HEADS * impl_->rb;
+            impl_->last_decode_us = strata::platform::now_us() - t1;
             return true;
         }
         for (int h = 0; h < PLE_N_HEADS; ++h)
             impl_->decode(impl_->raw + (size_t) h * impl_->rb, out2560 + (size_t) h * PLE_HEAD_DIM);
         impl_->bytes_read += (uint64_t) PLE_N_HEADS * impl_->rb;
+        impl_->last_decode_us = strata::platform::now_us() - t1;
         return true;
     }
     for (int h = 0; h < PLE_N_HEADS; ++h) read_row(impl_->rows[h], out2560 + (size_t) h * PLE_HEAD_DIM);

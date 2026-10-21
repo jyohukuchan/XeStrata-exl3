@@ -241,6 +241,16 @@ public:
     std::string io_report() const;
     PleIo mode() const;
 
+    /// The last collect's split, in microseconds: `wait_us` is the time the
+    /// reader blocked for the rows, `decode_us` the time the CPU spent turning
+    /// the fetched rows into floats.  Direct mode only, and zero before the
+    /// first collect.
+    struct CollectTiming {
+        double wait_us = 0;
+        double decode_us = 0;
+    };
+    CollectTiming last_collect_timing() const;
+
 private:
     struct Impl;
     Impl* impl_ = nullptr;

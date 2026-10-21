@@ -550,6 +550,11 @@ bool lm_head_mix(const WeightTable& tables, const ModelGeometry& g, const BlockB
 /// are the only part of the model that does not fit in VRAM, so the CPU pool and the VRAM-resident experts fill
 /// `parts` and this function owns the two ends.  In P2.S5 everything is a miss, so a caller passes whatever the
 /// pool produced; the doorbell protocol is what lets it be produced DURING this layer rather than before it.
+/// The layer the PLE block belongs to, 0-based.  The checkpoint's `ple_layer_ids` is `[2]`, which counts from
+/// one, and the tensors are named `blk.1.ple_*`; `block_layer_pre` applies the block at this layer and a
+/// driver that has to know where the gathered rows are consumed reads the same constant.
+inline constexpr int64_t PLE_LAYER = 1;
+
 // ================================ THE PLE (LAYER 1'S PER-LAYER EMBEDDING) ================================
 //
 // **THIS MODULE EXISTED, WAS PARITY-TESTED, AND WAS NEVER CALLED - WHICH IS WHY GATE C1 FAILED.**  Layer 1 is
@@ -563,6 +568,7 @@ bool lm_head_mix(const WeightTable& tables, const ModelGeometry& g, const BlockB
 // ORIGINAL second GGUF shard, and it is the only tensor this engine reads from the GGUF rather than from the
 // canonical pack.  It is also why the PLE is cheap: sixteen 90-byte rows per token is 1440 bytes of traffic,
 // against the experts' 664 MB.
+
 struct PleRun {
     /// Null when the PLE is not wired (no table, or a pack without `blk.1.ple_*`).  Then `block_layer_pre`
     /// SKIPS the module entirely, which is what every measurement before this change did.
