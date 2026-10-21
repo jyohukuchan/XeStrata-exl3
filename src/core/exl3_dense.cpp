@@ -15,6 +15,7 @@
 #include "strata/kernels/raw_linear.hpp"
 
 #include <limits>
+#include <cstdio>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -424,7 +425,16 @@ bool Exl3Dense::run(const float* x, int64_t ldx, float* y, int64_t ldy, int64_t 
             err = "exl3 dense: the stream belongs to another runtime";
             return false;
         }
-        if (Runtime::owner(x) != runtime_ || Runtime::owner(y) != runtime_) {
+        // The input and the output must be usable by this runtime's queue.  A device allocation of
+        // another device is not; host USM is, because the device reads it over the interconnect.  A
+        // multi-stage model hands a stage the host buffers another stage allocated, so the owner's
+        // runtime alone does not decide it.
+        const auto usable_here = [this](const void* pointer) {
+            if (pointer == nullptr) return false;
+            if (Runtime::owner(pointer) == runtime_) return true;
+            return sycl::get_pointer_type(pointer, runtime_->context()) == sycl::usm::alloc::host;
+        };
+        if (!usable_here(x) || !usable_here(y)) {
             err = "exl3 dense: input or output belongs to another runtime";
             return false;
         }

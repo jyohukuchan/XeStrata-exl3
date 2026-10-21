@@ -29,6 +29,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <fstream>
 #include <string>
@@ -206,8 +207,33 @@ Runtime& Runtime::at(int ordinal) {
     return *r;
 }
 
+namespace {
+// The engine's own allocations, with the runtime that made them.  A context scan cannot tell one
+// device's device USM from another's: get_pointer_type answers "device" for any of them, so the
+// scan would name the first runtime and the wrong device.  The record is exact.
+std::mutex g_alloc_mu;
+std::map<const void*, Runtime*> g_alloc_owner;
+}  // namespace
+
+void Runtime::note_allocation(const void* pointer, Runtime* runtime) {
+    if (pointer == nullptr || runtime == nullptr) return;
+    std::lock_guard<std::mutex> lock(g_alloc_mu);
+    g_alloc_owner[pointer] = runtime;
+}
+
+void Runtime::forget_allocation(const void* pointer) {
+    if (pointer == nullptr) return;
+    std::lock_guard<std::mutex> lock(g_alloc_mu);
+    g_alloc_owner.erase(pointer);
+}
+
 Runtime* Runtime::owner(const void* pointer) {
     if (!pointer) return nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_alloc_mu);
+        auto it = g_alloc_owner.find(pointer);
+        if (it != g_alloc_owner.end()) return it->second;
+    }
     std::lock_guard<std::mutex> lock(g_runtimes_mutex);
     for (auto& r : runtimes())
         if (r && sycl::get_pointer_type(pointer, r->context_) != sycl::usm::alloc::unknown) return r.get();

@@ -30,7 +30,15 @@ public:
     /// The number of GPUs the engine can drive.
     static int count();
     /// The runtime whose context holds `pointer` (device or host USM), or null.
+    ///
+    /// The engine's own allocations are named exactly: the runtime that made them is recorded
+    /// (note_allocation).  A context scan alone cannot tell one device's device USM from
+    /// another's, so it would answer with the first runtime and name the wrong device.
     static Runtime* owner(const void* pointer);
+    /// Records the runtime that made an allocation, so owner() can name it exactly.
+    static void note_allocation(const void* pointer, Runtime* runtime);
+    /// Drops the record of an allocation that is being freed.
+    static void forget_allocation(const void* pointer);
     /// The runtime one of whose queues `stream` is, or null.
     static Runtime* owner_of_stream(const void* stream);
     int ordinal() const { return ordinal_; }
