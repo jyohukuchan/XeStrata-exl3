@@ -108,6 +108,13 @@ bool copy_component(void*& destination, const std::vector<uint16_t>& source, con
     return true;
 }
 
+/// Whether the uploaded F16 weights hold normal halves and signed zeros only.  The answer tells
+/// the kernel that the device's half to float conversion is exact for every one of them.
+bool plain_f16_weights(void* weights, size_t bytes) {
+    if (bytes == 0) return true;
+    return strata::kernels::raw::plain_f16_halves(strata::core::Runtime::get().compute(), weights, bytes);
+}
+
 }  // namespace
 
 Exl3Dense::Exl3Dense() = default;
@@ -230,6 +237,8 @@ bool Exl3Dense::load_remapped(const strata::artifact::exl3::Archive& archive, co
             runtime_ = &Runtime::get();
             raw_view_ = {raw_weights_, raw_bias_ == nullptr ? nullptr : static_cast<const float*>(raw_bias_), ref.ne0,
                          ref.ne1, dtype};
+            if (dtype == strata::kernels::raw::DType::F16)
+                raw_view_.plain_halves = plain_f16_weights(raw_weights_, raw.size());
             raw_ = true;
             max_rows_ = max_rows;
             ref.exl3 = this;
@@ -343,6 +352,8 @@ bool Exl3Dense::load_raw_detached(const strata::artifact::exl3::RawTensor& weigh
         runtime_ = &Runtime::get();
         raw_view_ = {raw_weights_, static_cast<const float*>(raw_bias_), static_cast<int64_t>(k),
                      static_cast<int64_t>(n), dtype};
+        if (dtype == strata::kernels::raw::DType::F16)
+            raw_view_.plain_halves = plain_f16_weights(raw_weights_, weights.data.size());
         raw_ = true;
         max_rows_ = max_rows;
         if (!pointers_owned_by(runtime_)) throw std::runtime_error("raw allocations belong to another runtime");

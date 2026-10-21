@@ -151,6 +151,51 @@ int main() {
             if (bad) ++failures;
         }
 
+        if (dtype == DType::F16) {
+            // The plain path hands every half to the device's conversion and the exact path
+            // builds the value from its bits.  On a tensor of normal halves the two must agree
+            // bit for bit, and the scan must call such a tensor plain.
+            strata::parity::Device device;
+            const size_t count = static_cast<size_t>(n) * static_cast<size_t>(k);
+            uint16_t* d_w16 = device.upload(w16);
+            std::vector<float> plain_input(static_cast<size_t>(k), 0.25f);
+            float* d_plain = device.alloc<float>(static_cast<size_t>(n));
+            float* d_exact = device.alloc<float>(static_cast<size_t>(n));
+            LinearView plain_view{d_w16, nullptr, k, n, DType::F16};
+            plain_view.plain_halves = true;
+            LinearView exact_view{d_w16, nullptr, k, n, DType::F16};
+            const bool scanned_plain = strata::kernels::raw::plain_f16_halves(queue, d_w16, count * sizeof(uint16_t));
+            strata::kernels::raw::linear_fp32(queue, plain_view, device.upload(plain_input), k, d_plain, n, 1)
+                .wait_and_throw();
+            strata::kernels::raw::linear_fp32(queue, exact_view, device.upload(plain_input), k, d_exact, n, 1)
+                .wait_and_throw();
+            std::vector<float> plain_out(static_cast<size_t>(n)), exact_out(static_cast<size_t>(n));
+            strata::parity::copy_out(plain_out.data(), d_plain, plain_out.size());
+            strata::parity::copy_out(exact_out.data(), d_exact, exact_out.size());
+            size_t bad = 0;
+            for (size_t i = 0; i < plain_out.size(); ++i)
+                if (std::memcmp(&plain_out[i], &exact_out[i], sizeof(float)) != 0) ++bad;
+            const bool plain_ok = scanned_plain && bad == 0;
+            std::printf("F16 plain path: %s (scanned plain %d, %zu differing)\n", plain_ok ? "OK" : "FAIL",
+                        (int) scanned_plain, bad);
+            if (!plain_ok) ++failures;
+
+            // A subnormal half is not plain: the scan must say so, and the exact path must still
+            // return its value.
+            std::vector<uint16_t> subnormal = w16;
+            subnormal[0] = 0x0001;
+            uint16_t* d_sub = device.upload(subnormal);
+            const bool scanned_sub = strata::kernels::raw::plain_f16_halves(queue, d_sub, count * sizeof(uint16_t));
+            std::vector<float> sub_input(static_cast<size_t>(k), 0.0f), sub_out(static_cast<size_t>(n));
+            sub_input[0] = 1.0f;
+            LinearView sub_view{d_sub, nullptr, k, n, DType::F16};
+            strata::kernels::raw::linear_fp32(queue, sub_view, device.upload(sub_input), k, d_exact, n, 1).wait_and_throw();
+            strata::parity::copy_out(sub_out.data(), d_exact, sub_out.size());
+            const bool sub_ok = !scanned_sub && sub_out[0] == f32_from_f16(0x0001);
+            std::printf("F16 subnormal weight: %s (scanned plain %d)\n", sub_ok ? "OK" : "FAIL", (int) scanned_sub);
+            if (!sub_ok) ++failures;
+        }
+
         // NaN/Inf are ordinary floating-point weights: no special clamping or filtering is allowed.
         if (dtype == DType::F16) {
             w16[0] = 0x7E00;

@@ -16,6 +16,13 @@ namespace strata::kernels::raw {
 sycl::event linear_fp32(sycl::queue& queue, const LinearView& view, const float* x, int64_t ldx, float* y,
                         int64_t ldy, int64_t rows, const std::vector<sycl::event>& deps = {});
 
+/// Whether every F16 value in `data` is a normal half or a signed zero.
+///
+/// The device's half to float conversion is exact for those, so the kernel may use it without
+/// checking each value.  The answer is false when a subnormal half, an infinity or a NaN is
+/// present, and then the kernel converts every value exactly instead.
+bool plain_f16_halves(sycl::queue& queue, const void* data, size_t bytes);
+
 /// Gather raw F16/BF16/F32 embedding rows. Device ids are kept in their
 /// caller order, repeated ids are allowed, and out-of-range ids produce zero
 /// rows. The table is row-major with `row_bytes` bytes per vocabulary row.
