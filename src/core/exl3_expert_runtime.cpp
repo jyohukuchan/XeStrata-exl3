@@ -77,6 +77,7 @@ void Exl3ExpertRuntime::close() {
     if (d_dst_ != nullptr) strata::gpu::free(d_dst_);
     if (d_ngroups_ != nullptr) strata::gpu::free(d_ngroups_);
     if (d_nentries_ != nullptr) strata::gpu::free(d_nentries_);
+    if (d_entry_plans_ != nullptr) strata::gpu::free(d_entry_plans_);
     if (d_pair_blob_base_ != nullptr) strata::gpu::free(d_pair_blob_base_);
     if (d_pair_format_index_ != nullptr) strata::gpu::free(d_pair_format_index_);
     if (h_blob_base_ != nullptr) strata::gpu::free(h_blob_base_);
@@ -90,6 +91,7 @@ void Exl3ExpertRuntime::close() {
     d_scratch_ = nullptr;
     d_blob_base_ = nullptr; d_format_index_ = nullptr; d_format_table_ = nullptr;
     d_start_ = nullptr; d_tok_ = nullptr; d_dst_ = nullptr; d_ngroups_ = nullptr; d_nentries_ = nullptr;
+    d_entry_plans_ = nullptr;
     d_pair_blob_base_ = nullptr; d_pair_format_index_ = nullptr;
     h_blob_base_ = nullptr; h_format_index_ = nullptr; h_format_table_ = nullptr;
     h_start_ = nullptr; h_tok_ = nullptr; h_dst_ = nullptr; h_ngroups_ = nullptr; h_nentries_ = nullptr;
@@ -126,6 +128,7 @@ bool Exl3ExpertRuntime::allocate_images(std::string& err) {
     if (groups > std::numeric_limits<size_t>::max() / sizeof(uint64_t) ||
         groups > std::numeric_limits<size_t>::max() / sizeof(int32_t) ||
         entries > std::numeric_limits<size_t>::max() / sizeof(int32_t) ||
+        entries > std::numeric_limits<size_t>::max() / sizeof(strata::kernels::exl3::GroupedEntryPlan) ||
         formats > std::numeric_limits<size_t>::max() / sizeof(Exl3ExpertFormatDesc)) {
         err = "exl3 runtime: plan allocation overflows";
         return false;
@@ -145,7 +148,9 @@ bool Exl3ExpertRuntime::allocate_images(std::string& err) {
         !device(reinterpret_cast<void**>(&d_tok_), entries * sizeof(int32_t), "token plan") ||
         !device(reinterpret_cast<void**>(&d_dst_), entries * sizeof(int32_t), "destination plan") ||
         !device(reinterpret_cast<void**>(&d_ngroups_), sizeof(int32_t), "group count") ||
-        !device(reinterpret_cast<void**>(&d_nentries_), sizeof(int32_t), "entry count"))
+        !device(reinterpret_cast<void**>(&d_nentries_), sizeof(int32_t), "entry count") ||
+        !device(reinterpret_cast<void**>(&d_entry_plans_),
+                entries * sizeof(strata::kernels::exl3::GroupedEntryPlan), "entry resolution"))
         return false;
     {
         if (pair_count_ <= 0 || static_cast<uint64_t>(pair_count_) > std::numeric_limits<size_t>::max() / sizeof(uint64_t) ||
@@ -173,6 +178,7 @@ bool Exl3ExpertRuntime::allocate_images(std::string& err) {
     device_plan_.dst = d_dst_;
     device_plan_.ngroups = d_ngroups_;
     device_plan_.nentries = d_nentries_;
+    device_plan_.entry_plans = d_entry_plans_;
     device_plan_.max_groups = max_entries_;
     device_plan_.max_entries = max_entries_;
     device_plan_.max_formats = static_cast<int64_t>(formats);
@@ -195,7 +201,7 @@ bool Exl3ExpertRuntime::allocate_images(std::string& err) {
         return false;
     }
     const void* device_images[] = {d_blob_base_, d_format_index_, d_format_table_, d_start_, d_tok_, d_dst_,
-                                  d_ngroups_, d_nentries_};
+                                  d_ngroups_, d_nentries_, d_entry_plans_};
     for (const void* image : device_images)
         if (Runtime::owner(image) != device_runtime_) {
             err = "exl3 runtime: plan image belongs to another runtime";

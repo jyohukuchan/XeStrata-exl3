@@ -43,7 +43,8 @@ void checked_product(int64_t a, int64_t b, uint64_t& result, const char* what) {
 void check_plan(const GroupedPlan& plan, const float* x, int64_t ldx, const float* y, int64_t ldy,
                 float* scratch, size_t scratch_elements) {
     if (plan.blob_base == nullptr || plan.format_index == nullptr || plan.format_table == nullptr || plan.start == nullptr ||
-        plan.tok == nullptr || plan.dst == nullptr || plan.ngroups == nullptr || plan.nentries == nullptr)
+        plan.tok == nullptr || plan.dst == nullptr || plan.ngroups == nullptr || plan.nentries == nullptr ||
+        plan.entry_plans == nullptr)
         throw std::invalid_argument("exl3_grouped_fp32: all device plan pointers are required");
     if (plan.max_groups <= 0 || plan.max_groups > std::numeric_limits<int32_t>::max() ||
         plan.max_entries <= 0 || plan.max_entries > std::numeric_limits<int32_t>::max() ||
@@ -381,64 +382,99 @@ struct ResolvedEntry {
     bool has_destination = false;
 };
 
-inline ResolvedEntry resolve_entry(const GroupedPlan& plan, int32_t entry, const GroupedOptions& options) {
-    ResolvedEntry result;
+// The format's own consistency, checked on the device because the format table is device memory: it can be
+// replaced between launches, and an unusable format has to become a quiet NaN in the entry's destination row.
+inline bool format_ok(const ExpertBlobLayout& layout, int64_t hidden, int64_t max_ff,
+                      const GroupedOptions& options) {
+    const int64_t ff = layout.gate.n;
+    if (layout.total_bytes == 0 || layout.total_bytes > (uint64_t) std::numeric_limits<ptrdiff_t>::max()) return false;
+    if (layout.gate.k != hidden || layout.up.k != hidden || layout.gate.n != layout.up.n || layout.down.k != ff ||
+        layout.down.n != hidden || ff <= 0 || ff > max_ff)
+        return false;
+    if (!projection_ok(layout.gate, hidden, ff, options.gate.input_hadamard, options.gate.output_hadamard,
+                       layout.total_bytes))
+        return false;
+    if (!projection_ok(layout.up, hidden, ff, options.up.input_hadamard, options.up.output_hadamard,
+                       layout.total_bytes))
+        return false;
+    if (!projection_ok(layout.down, ff, hidden, options.down.input_hadamard, options.down.output_hadamard,
+                       layout.total_bytes))
+        return false;
+    return true;
+}
+
+inline bool raw_projection_aligned(const ExpertProjectionLayout& projection, uint64_t base) {
+    if (projection.storage != ProjectionStorage::raw) return true;
+    const uint64_t weight_alignment = (uint64_t) raw::dtype_bytes(projection.raw_dtype);
+    const uint64_t bias_alignment = (uint64_t) raw::dtype_bytes(projection.raw_bias_dtype);
+    if (weight_alignment == 0 || (projection.raw_weights.offset + base) % weight_alignment != 0) return false;
+    return projection.raw_bias.bytes == 0 ||
+           (bias_alignment != 0 && (projection.raw_bias.offset + base) % bias_alignment == 0);
+}
+
+// The plan's resolution of one entry: the group it belongs to, the format it reads and whether that format passes
+// the device-side checks.  The checks run on the device because the format table is device memory: it can be
+// replaced between launches, and an unusable format has to become a quiet NaN in the entry's destination row.
+inline GroupedEntryPlan resolve_entry_plan(const GroupedPlan& plan, int32_t entry, const GroupedOptions& options) {
+    GroupedEntryPlan resolved;
     const int32_t groups = *plan.ngroups;
     const int32_t entries = *plan.nentries;
-    if (groups < 0 || groups > plan.max_groups || entries < 0 || entries > plan.max_entries || entry < 0 || entry >= entries)
-        return result;
+    if (entry < 0 || entry >= entries || groups < 0 || groups > plan.max_groups) return resolved;
     int32_t group = -1;
     for (int32_t g = 0; g < groups; ++g) {
         const int32_t first = plan.start[g], last = plan.start[g + 1];
-        if (first < 0 || last < first || last > entries) return result;
+        if (first < 0 || last < first || last > entries) break;
         if (entry >= first && entry < last) {
             group = g;
             break;
         }
     }
-    if (group < 0) return result;
+    if (group < 0) return resolved;
+    resolved.flags = 1;  // the entry is active
+    const int32_t format = plan.format_index[group];
+    const uint64_t base = plan.blob_base[group];
+    if (format < 0 || format >= plan.max_formats || base == 0 || base % alignof(uint16_t) != 0) return resolved;
+    const ExpertBlobLayout& layout = plan.format_table[format];
+    if (!format_ok(layout, plan.hidden, plan.max_ff, options) ||
+        base > std::numeric_limits<uint64_t>::max() - layout.total_bytes ||
+        !raw_projection_aligned(layout.gate, base) || !raw_projection_aligned(layout.up, base) ||
+        !raw_projection_aligned(layout.down, base))
+        return resolved;
+    resolved.base = base;
+    resolved.format = format;
+    resolved.flags |= 2;
+    return resolved;
+}
+
+// The entry's views, built from the plan's resolution.  The plan's checks already ran on the device, so the
+// kernels only read the format's layout.
+inline ResolvedEntry entry_from_plan(const GroupedPlan& plan, int32_t entry, const GroupedEntryPlan& resolved) {
+    ResolvedEntry result;
     result.token = plan.tok[entry];
     result.destination = plan.dst[entry];
     result.has_destination = result.destination >= 0 && result.destination < plan.output_rows;
+    if ((resolved.flags & 1u) == 0) {
+        result.has_destination = false;  // an inactive entry is skipped rather than used to emit a sentinel
+        return result;
+    }
     if (result.token < 0 || result.token >= plan.n_tokens) {
         result.has_destination = false;  // invalid input IDs are skipped rather than used to emit a sentinel
         return result;
     }
-    const int32_t format = plan.format_index[group];
-    if (format < 0 || format >= plan.max_formats || plan.blob_base[group] == 0 ||
-        plan.blob_base[group] % alignof(uint16_t) != 0 || !result.has_destination) return result;
-    const ExpertBlobLayout layout = plan.format_table[format];
-    const int64_t ff = layout.gate.n;
-    if (layout.total_bytes == 0 || layout.total_bytes > (uint64_t) std::numeric_limits<ptrdiff_t>::max() ||
-        plan.blob_base[group] > std::numeric_limits<uint64_t>::max() - layout.total_bytes ||
-        layout.gate.k != plan.hidden || layout.up.k != plan.hidden ||
-        layout.gate.n != layout.up.n || layout.down.k != ff || layout.down.n != plan.hidden || ff <= 0 ||
-        ff > plan.max_ff || !projection_ok(layout.gate, plan.hidden, ff, options.gate.input_hadamard,
-                                            options.gate.output_hadamard, layout.total_bytes) ||
-        !projection_ok(layout.up, plan.hidden, ff, options.up.input_hadamard, options.up.output_hadamard,
-                       layout.total_bytes) ||
-        !projection_ok(layout.down, ff, plan.hidden, options.down.input_hadamard,
-                       options.down.output_hadamard, layout.total_bytes))
-        return result;
-    const uint8_t* base = (const uint8_t*) plan.blob_base[group];
-    const auto aligned_raw_projection = [base](const ExpertProjectionLayout& projection) {
-        if (projection.storage != ProjectionStorage::raw) return true;
-        const uint64_t weight_alignment = (uint64_t) raw::dtype_bytes(projection.raw_dtype);
-        const uint64_t bias_alignment = (uint64_t) raw::dtype_bytes(projection.raw_bias_dtype);
-        if (weight_alignment == 0 || (projection.raw_weights.offset + (uint64_t) (uintptr_t) base) % weight_alignment != 0)
-            return false;
-        return projection.raw_bias.bytes == 0 ||
-               (bias_alignment != 0 && (projection.raw_bias.offset + (uint64_t) (uintptr_t) base) % bias_alignment == 0);
-    };
-    if (!aligned_raw_projection(layout.gate) || !aligned_raw_projection(layout.up) ||
-        !aligned_raw_projection(layout.down))
-        return result;
+    if ((resolved.flags & 2u) == 0 || !result.has_destination) return result;
+    const uint8_t* base = (const uint8_t*) resolved.base;
+    const ExpertBlobLayout& layout = plan.format_table[resolved.format];
     result.gate = matrix_from_layout(layout.gate, base);
     result.up = matrix_from_layout(layout.up, base);
     result.down = matrix_from_layout(layout.down, base);
-    result.ff = ff;
+    result.ff = layout.gate.n;
     result.valid = true;
     return result;
+}
+
+// The entry's views, read from the resolution the pipeline published.
+inline ResolvedEntry resolve_entry(const GroupedPlan& plan, int32_t entry) {
+    return entry_from_plan(plan, entry, plan.entry_plans[entry]);
 }
 
 template <bool HalfFma>
@@ -465,7 +501,12 @@ sycl::event submit_gate_up_input_cooperative(sycl::queue& queue, const GroupedPl
             const auto sg = item.get_sub_group(); const int lane = (int) sg.get_local_id()[0];
             const size_t g = (size_t) item.get_group_linear_id();
             const int32_t entry = (int32_t) (g / blocks); const int64_t block = (int64_t) (g % blocks) * 128;
-            const ResolvedEntry r = resolve_entry(plan, entry, options); const bool active = r.valid;
+            // The pipeline's first kernel resolves the plan: it checks the entry's format on the device and
+            // publishes the resolution, so the kernels that follow read it instead of repeating the checks for
+            // every work item.  One work item per entry publishes it.
+            const GroupedEntryPlan entry_plan = resolve_entry_plan(plan, entry, options);
+            if (block == 0) plan.entry_plans[entry] = entry_plan;
+            const ResolvedEntry r = entry_from_plan(plan, entry, entry_plan); const bool active = r.valid;
             const float* in = active ? x + (int64_t) r.token * ldx : nullptr;
             float* gate = active ? scratch + (size_t) entry * (size_t) plane : nullptr;
             float* up = active ? scratch + (size_t) plan.max_entries * (size_t) plane + (size_t) entry * (size_t) plane : nullptr;
@@ -490,7 +531,7 @@ sycl::event submit_gate_up_post_cooperative(sycl::queue& queue, const GroupedPla
             const auto sg=item.get_sub_group(); const int lane=(int)sg.get_local_id()[0]; const size_t g=(size_t)item.get_group_linear_id();
             const int32_t entry = static_cast<int32_t>(g / blocks);
             const int64_t block = static_cast<int64_t>(g % blocks) * 128;
-            const ResolvedEntry r = resolve_entry(plan, entry, options);
+            const ResolvedEntry r = resolve_entry(plan, entry);
             if (!r.valid || block >= r.ff) return;
             float* gd = scratch + 2 * (size_t) plan.max_entries * (size_t) plane +
                         (size_t) entry * (size_t) plane;
@@ -564,7 +605,12 @@ sycl::event submit_gate_up_input(sycl::queue& queue, const GroupedPlan& plan, co
             const size_t flat = (size_t) id[0];
             const int32_t entry = (int32_t) (flat / (size_t) plan.hidden);
             const int64_t row = (int64_t) (flat % (size_t) plan.hidden);
-            const ResolvedEntry resolved = resolve_entry(plan, entry, options);
+            // The pipeline's first kernel resolves the plan: it checks the entry's format on the device and
+            // publishes the resolution, so the kernels that follow read it instead of repeating the checks for
+            // every work item.  One work item per entry publishes it.
+            const GroupedEntryPlan entry_plan = resolve_entry_plan(plan, entry, options);
+            if (row == 0) plan.entry_plans[entry] = entry_plan;
+            const ResolvedEntry resolved = entry_from_plan(plan, entry, entry_plan);
             if (!resolved.valid) return;
             const float* input = x + (int64_t) resolved.token * ldx;
             float* gate_input = scratch + (size_t) entry * (size_t) plane;
@@ -632,8 +678,7 @@ int gate_up_split_k(const sycl::queue& queue, const GroupedPlan& plan) {
 
 template <bool HalfFma>
 sycl::event submit_gate_up_dot_cooperative(sycl::queue& queue, const GroupedPlan& plan, float* scratch,
-                                           int64_t plane, GroupedOptions options,
-                                           const std::vector<sycl::event>& deps) {
+                                           int64_t plane, const std::vector<sycl::event>& deps) {
     const int split_k = gate_up_split_k(queue, plan);
     const bool word_tile = grouped_word_tile_enabled();
     const size_t columns = word_tile ? 16u : 8u;
@@ -655,7 +700,7 @@ sycl::event submit_gate_up_dot_cooperative(sycl::queue& queue, const GroupedPlan
             const int32_t entry = static_cast<int32_t>(group / tiles);
             const int64_t tile = static_cast<int64_t>(group % tiles);
             const int64_t col = tile * static_cast<int64_t>(columns) + column_lane;
-            const ResolvedEntry resolved = resolve_entry(plan, entry, options);
+            const ResolvedEntry resolved = resolve_entry(plan, entry);
             const bool active = resolved.valid && col < resolved.ff;
             const float* gate_input = active ? scratch + static_cast<size_t>(entry) * static_cast<size_t>(plane) : nullptr;
             const float* up_input = active ? scratch + static_cast<size_t>(plan.max_entries) * static_cast<size_t>(plane) +
@@ -721,14 +766,14 @@ sycl::event submit_gate_up_dot_cooperative(sycl::queue& queue, const GroupedPlan
 
 template <bool HalfFma>
 sycl::event submit_gate_up_dot(sycl::queue& queue, const GroupedPlan& plan, float* scratch, int64_t plane,
-                               GroupedOptions options, const std::vector<sycl::event>& deps) {
+                               const std::vector<sycl::event>& deps) {
     return queue.submit([&](sycl::handler& h) {
         if (!deps.empty()) h.depends_on(deps);
         h.parallel_for(sycl::range<1>((size_t) plan.max_entries * (size_t) plan.max_ff), [=](sycl::id<1> id) {
             const size_t flat = (size_t) id[0];
             const int32_t entry = (int32_t) (flat / (size_t) plan.max_ff);
             const int64_t col = (int64_t) (flat % (size_t) plan.max_ff);
-            const ResolvedEntry resolved = resolve_entry(plan, entry, options);
+            const ResolvedEntry resolved = resolve_entry(plan, entry);
             if (!resolved.valid || col >= resolved.ff) return;
             const float* gate_input = scratch + (size_t) entry * (size_t) plane;
             const float* up_input = scratch + (size_t) plan.max_entries * (size_t) plane +
@@ -753,7 +798,7 @@ sycl::event submit_gate_up_post(sycl::queue& queue, const GroupedPlan& plan, flo
             const size_t flat = (size_t) id[0];
             const int32_t entry = (int32_t) (flat / (size_t) plan.max_ff);
             const int64_t col = (int64_t) (flat % (size_t) plan.max_ff);
-            const ResolvedEntry resolved = resolve_entry(plan, entry, options);
+            const ResolvedEntry resolved = resolve_entry(plan, entry);
             if (!resolved.valid || col >= resolved.ff) return;
             float* gate_dot = scratch + 2 * (size_t) plan.max_entries * (size_t) plane +
                               (size_t) entry * (size_t) plane;
@@ -787,8 +832,7 @@ sycl::event submit_gate_up_post(sycl::queue& queue, const GroupedPlan& plan, flo
 
 template <bool HalfFma>
 sycl::event submit_down_dot_cooperative(sycl::queue& queue, const GroupedPlan& plan, float* scratch,
-                                         int64_t plane, GroupedOptions options,
-                                         const std::vector<sycl::event>& deps) {
+                                         int64_t plane, const std::vector<sycl::event>& deps) {
     const bool word_tile = grouped_word_tile_enabled();
     const size_t columns = word_tile ? 16u : 8u;
     const size_t tiles = (static_cast<size_t>(plan.hidden) + columns - 1) / columns;
@@ -805,7 +849,7 @@ sycl::event submit_down_dot_cooperative(sycl::queue& queue, const GroupedPlan& p
             const int32_t entry = static_cast<int32_t>(group / tiles);
             const int64_t tile = static_cast<int64_t>(group % tiles);
             const int64_t col = tile * static_cast<int64_t>(columns) + column_lane;
-            const ResolvedEntry resolved = resolve_entry(plan, entry, options);
+            const ResolvedEntry resolved = resolve_entry(plan, entry);
             const bool active = resolved.valid && col < plan.hidden;
             const float* input = active ? scratch + static_cast<size_t>(entry) * static_cast<size_t>(plane) : nullptr;
             GroupedPartial partial;
@@ -843,7 +887,7 @@ sycl::event submit_down_input_cooperative(sycl::queue& queue, const GroupedPlan&
             const size_t group = (size_t) item.get_group_linear_id();
             const int32_t entry = (int32_t) (group / blocks);
             const int64_t block = (int64_t) (group % blocks) * 128;
-            const ResolvedEntry resolved = resolve_entry(plan, entry, options);
+            const ResolvedEntry resolved = resolve_entry(plan, entry);
             if (!resolved.valid || block >= resolved.ff) return;
             const float* input = scratch + 4 * (size_t) plan.max_entries * (size_t) plane +
                                  (size_t) entry * (size_t) plane;
@@ -876,7 +920,7 @@ sycl::event submit_down_post_cooperative(sycl::queue& queue, const GroupedPlan& 
             const size_t group = (size_t) item.get_group_linear_id();
             const int32_t entry = (int32_t) (group / blocks);
             const int64_t block = (int64_t) (group % blocks) * 128;
-            const ResolvedEntry resolved = resolve_entry(plan, entry, options);
+            const ResolvedEntry resolved = resolve_entry(plan, entry);
             float* output = resolved.has_destination ? y + (int64_t) resolved.destination * ldy : nullptr;
             if (!resolved.valid) {
                 if (output) {
@@ -921,14 +965,14 @@ sycl::event submit_down_post_cooperative(sycl::queue& queue, const GroupedPlan& 
 // The plain down dot, for the devices without the cooperative path.  It has the same two decode forms.
 template <bool HalfFma>
 sycl::event submit_down_dot(sycl::queue& queue, const GroupedPlan& plan, float* scratch, int64_t plane,
-                            GroupedOptions options, const std::vector<sycl::event>& deps) {
+                            const std::vector<sycl::event>& deps) {
     return queue.submit([&](sycl::handler& h) {
         h.depends_on(deps);
         h.parallel_for(sycl::range<1>((size_t) plan.max_entries * (size_t) plan.hidden), [=](sycl::id<1> id) {
             const size_t flat = (size_t) id[0];
             const int32_t entry = (int32_t) (flat / (size_t) plan.hidden);
             const int64_t col = (int64_t) (flat % (size_t) plan.hidden);
-            const ResolvedEntry resolved = resolve_entry(plan, entry, options);
+            const ResolvedEntry resolved = resolve_entry(plan, entry);
             if (!resolved.valid) return;
             const float* input = scratch + (size_t) entry * (size_t) plane;
             float* output = scratch + 2 * (size_t) plan.max_entries * (size_t) plane +
@@ -963,14 +1007,14 @@ sycl::event exl3_grouped_fp32(sycl::queue& queue, const GroupedPlan& plan, const
     sycl::event gate_up_dot;
     if (grouped_cooperative_capability(queue)) {
         if (half_fma)
-            gate_up_dot = submit_gate_up_dot_cooperative<true>(queue, plan, scratch, plane, options, {gate_up_input});
+            gate_up_dot = submit_gate_up_dot_cooperative<true>(queue, plan, scratch, plane, {gate_up_input});
         else
-            gate_up_dot = submit_gate_up_dot_cooperative<false>(queue, plan, scratch, plane, options, {gate_up_input});
+            gate_up_dot = submit_gate_up_dot_cooperative<false>(queue, plan, scratch, plane, {gate_up_input});
     } else {
         if (half_fma)
-            gate_up_dot = submit_gate_up_dot<true>(queue, plan, scratch, plane, options, {gate_up_input});
+            gate_up_dot = submit_gate_up_dot<true>(queue, plan, scratch, plane, {gate_up_input});
         else
-            gate_up_dot = submit_gate_up_dot<false>(queue, plan, scratch, plane, options, {gate_up_input});
+            gate_up_dot = submit_gate_up_dot<false>(queue, plan, scratch, plane, {gate_up_input});
     }
     const sycl::event gate_up_post = submit_gate_up_post(queue, plan, scratch, plane, options, {gate_up_dot});
     const sycl::event activation = queue.submit([&](sycl::handler& h) {
@@ -979,7 +1023,7 @@ sycl::event exl3_grouped_fp32(sycl::queue& queue, const GroupedPlan& plan, const
             const size_t flat = (size_t) id[0];
             const int32_t entry = (int32_t) (flat / (size_t) plan.max_ff);
             const int64_t col = (int64_t) (flat % (size_t) plan.max_ff);
-            const ResolvedEntry resolved = resolve_entry(plan, entry, options);
+            const ResolvedEntry resolved = resolve_entry(plan, entry);
             if (!resolved.valid || col >= resolved.ff) return;
             float* gate_values = scratch + 4 * (size_t) plan.max_entries * (size_t) plane +
                                  (size_t) entry * (size_t) plane;
@@ -999,7 +1043,7 @@ sycl::event exl3_grouped_fp32(sycl::queue& queue, const GroupedPlan& plan, const
             const size_t flat = (size_t) id[0];
             const int32_t entry = (int32_t) (flat / (size_t) plan.max_ff);
             const int64_t row = (int64_t) (flat % (size_t) plan.max_ff);
-            const ResolvedEntry resolved = resolve_entry(plan, entry, options);
+            const ResolvedEntry resolved = resolve_entry(plan, entry);
             if (!resolved.valid || row >= resolved.ff) return;
             const float* activation_values = scratch + 4 * (size_t) plan.max_entries * (size_t) plane +
                                              (size_t) entry * (size_t) plane;
@@ -1021,14 +1065,14 @@ sycl::event exl3_grouped_fp32(sycl::queue& queue, const GroupedPlan& plan, const
     sycl::event down_dot;
     if (grouped_cooperative_capability(queue)) {
         if (half_fma)
-            down_dot = submit_down_dot_cooperative<true>(queue, plan, scratch, plane, options, {down_input});
+            down_dot = submit_down_dot_cooperative<true>(queue, plan, scratch, plane, {down_input});
         else
-            down_dot = submit_down_dot_cooperative<false>(queue, plan, scratch, plane, options, {down_input});
+            down_dot = submit_down_dot_cooperative<false>(queue, plan, scratch, plane, {down_input});
     } else {
         if (half_fma)
-            down_dot = submit_down_dot<true>(queue, plan, scratch, plane, options, {down_input});
+            down_dot = submit_down_dot<true>(queue, plan, scratch, plane, {down_input});
         else
-            down_dot = submit_down_dot<false>(queue, plan, scratch, plane, options, {down_input});
+            down_dot = submit_down_dot<false>(queue, plan, scratch, plane, {down_input});
     }
     if (grouped_cooperative_capability(queue))
         return submit_down_post_cooperative(queue, plan, scratch, plane, ldy, y, options, {down_dot});
@@ -1038,7 +1082,7 @@ sycl::event exl3_grouped_fp32(sycl::queue& queue, const GroupedPlan& plan, const
             const size_t flat = (size_t) id[0];
             const int32_t entry = (int32_t) (flat / (size_t) plan.hidden);
             const int64_t col = (int64_t) (flat % (size_t) plan.hidden);
-            const ResolvedEntry resolved = resolve_entry(plan, entry, options);
+            const ResolvedEntry resolved = resolve_entry(plan, entry);
             if (!resolved.valid) {
                 if (resolved.has_destination)
                     y[(int64_t) resolved.destination * ldy + col] = sycl::nan((uint32_t) 0);

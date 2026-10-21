@@ -436,8 +436,11 @@ int main(int argc, char** argv) {
     int32_t* d_dst = device.upload(dst);
     int32_t* d_ngroups = device.upload(std::vector<int32_t>{ngroups_value});
     int32_t* d_nentries = device.upload(std::vector<int32_t>{nentries_value});
+    strata::kernels::exl3::GroupedEntryPlan* d_entry_plans =
+        device.alloc<strata::kernels::exl3::GroupedEntryPlan>((size_t) 5);
     strata::kernels::exl3::GroupedPlan plan{d_blob_base, d_format_index, d_formats, d_starts, d_tok, d_dst,
                                             d_ngroups, d_nentries, 3, 5, 2, 3, 5, 128, 256};
+    plan.entry_plans = d_entry_plans;
     const int64_t hidden = 128, ldx = 131, ldy = 133;
     std::vector<float> x((size_t) plan.n_tokens * (size_t) ldx, -777.0f);
     for (int64_t r = 0; r < plan.n_tokens; ++r)
@@ -514,9 +517,12 @@ int main(int argc, char** argv) {
     int32_t* d_mixed_dst = device.upload(mixed_dst);
     int32_t* d_mixed_ngroups = device.upload(std::vector<int32_t>{mixed_ngroups_value});
     int32_t* d_mixed_nentries = device.upload(std::vector<int32_t>{mixed_nentries_value});
+    strata::kernels::exl3::GroupedEntryPlan* d_mixed_entry_plans =
+        device.alloc<strata::kernels::exl3::GroupedEntryPlan>((size_t) 1);
     strata::kernels::exl3::GroupedPlan mixed_plan{d_mixed_blob_base, d_mixed_format_index, d_mixed_formats,
                                                    d_mixed_starts, d_mixed_tok, d_mixed_dst, d_mixed_ngroups,
                                                    d_mixed_nentries, 1, 1, 1, 1, 1, 128, 128};
+    mixed_plan.entry_plans = d_mixed_entry_plans;
     std::vector<float> mixed_x(131, -777.0f), mixed_expected(133, sentinel), mixed_actual(133, sentinel);
     for (int i = 0; i < 128; ++i) mixed_x[(size_t) i] = 0.017f * (float) (i - 40);
     mixed_expert_reference(mixed, mixed_x.data(), 131, mixed_expected.data(), 133);
