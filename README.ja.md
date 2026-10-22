@@ -180,9 +180,9 @@ XeStrata はこの形式をコマンドラインから読み込めます（サ�
 - **精度**: 同じ元モデル、同じ 32×1024 の校正 token、同じ 6 つの holdout で
   `KL(P_BF16 || P_candidate)` を測ると、4.5 bpw の EXL3 は 0.0090、I-Quant の IQ4_XS 混合は 0.0218 で、
   EXL3 のほうが 59% 低い。2〜3 bpw では差がさらに大きく、5 bpw では同じ大きさで 60% 低い
-- **速さ**: 32 GB の GPU にエキスパートを全部置ける条件では I-Quant の 95%。
-  8 GiB の上限を置いて CPU と GPU で分ける条件では 73〜85%。EXL3 は重みの復号が I-Quant より重いため、
-  同じ速さにはなりません
+- **速さ**: 32 GB の GPU にエキスパートを全部置ける条件では I-Quant の 98.9%。
+  8 GiB か 12 GiB の上限を置いて CPU と GPU で分ける条件では 73〜78%。EXL3 は重みの復号が
+  I-Quant より重いため、同じ速さにはなりません
 
 ```sh
 strata --exl3 /path/to/exl3-model --metadata-gguf /path/to/metadata-only.gguf \

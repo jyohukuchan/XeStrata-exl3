@@ -194,9 +194,9 @@ XeStrata reads it from the command line (the server path does not have it yet).
   `KL(P_BF16 || P_candidate)` is 0.0090 for EXL3 at 4.5 bpw and 0.0218 for I-Quant's mixed IQ4_XS,
   so EXL3 is 59 percent lower. The gap is larger at 2 and 3 bpw, and at 5 bpw it is 60 percent lower at
   the same size
-- **Speed**: with every expert resident on a 32 GB GPU it reaches 95 percent of I-Quant. With an 8 GiB
-  limit and the CPU and the GPU sharing the work it reaches 73 to 85 percent. EXL3 decodes its weights with
-  more work than I-Quant does, so it does not reach the same speed
+- **Speed**: with every expert resident on a 32 GB GPU it reaches 98.9 percent of I-Quant. With an 8 GiB
+  or 12 GiB limit and the CPU and the GPU sharing the work it reaches 73 to 78 percent. EXL3 decodes its
+  weights with more work than I-Quant does, so it does not reach the same speed
 
 ```sh
 strata --exl3 /path/to/exl3-model --metadata-gguf /path/to/metadata-only.gguf \

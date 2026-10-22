@@ -198,6 +198,27 @@ The host's CPU has no AVX-512, and Intel SDE is not on this host either. The AVX
 
 Running the AVX-512 paths on an AVX-512 CPU, their bit identity with the AVX2 kernels there, and running them under Intel SDE were not done on this host.
 
+## The CPUs and GPUs it applies to
+
+The CPU paths are chosen from the CPUID feature bits. The AVX2 copy of the integer dot runs where AVX2
+is there, the 512-bit copy where AVX512F/BW/VL are, and the exact (FP64) path where neither is. The
+choice never comes from a vendor or a CPU name. The same choice works on Zen 3, Zen 4/5 and the Intel
+Core generations, so consumer CPUs (a two-channel DDR5 machine among them) get the same paths. The
+integer dot needs AVX2; a CPU without it falls back to the exact path and nothing else.
+
+The GPU paths are chosen the same way, from what the device reports. The codebook 2 half precision
+FMA runs on a device that reports `aspect::fp16`, the unsigned dot product on gfx10 and later and
+sm_61 and later, and where a device has only the signed one the sign bits are flipped and the sum is
+carried back, which gives the same number. The wave width, the sub-group width and the local memory
+size come from `max_work_group_size`, `max_num_sub_groups` and `local_mem_size`; no card's constant
+is written into the code.
+
+On a consumer CPU the DRAM bandwidth can be the limit. The CPU paths are written to spend less of
+it: the N-major tile order turns one task's reads into one contiguous range, the row split shares
+the same weights across the rows, and the K split cuts a block into ranges whose reads step together.
+The worker count defaults to the physical cores, and with more workers against a given bandwidth more
+reads are in flight and the bandwidth is used up. No fixed recommended count is added.
+
 ## Capacity checks and worker settings
 
 The source currently checks available RAM and cgroup capacity every layer. An independent diagnostic of 1020 calls measured about 110µs per call: about 87µs for cgroup collection and 20µs for reading and parsing `MemAvailable`. Across 40 layers this is about 4.4ms of call cost, not a claim that all of it can be removed from decode.
