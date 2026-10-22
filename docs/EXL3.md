@@ -311,9 +311,20 @@ CPU's exact path accumulates in FP64. The difference (the largest absolute diffe
 (0.83 and 0.98), and the greedy tokens do not change. The device order does not matter either: with
 `--stage-devices 1,0` the logits are bit identical.
 
-A split of three stages or more, the decode speed and running on Windows have not been checked. The
-R9700 (0000:07:00.0) is kept for other work on this host, so the measurements used the two V620s
-only.
+A split of three stages (the two V620s and the R9700, the 48 layers in 16/16/16) behaves the same
+way: the logits without the device cache are bit identical to the one-stage reference, and with the
+device cache the greedy tokens do not change either. The resident experts are 3563 + 3602 + 3355 =
+10520 on three cards, against 1848 on one.
+
+**The one-stage split is the faster one today** (11.45 against 9.62 tok/s with an 8 GiB limit, and
+8.32 without one). The CPU's expert work falls as expected (without a limit the expert preparation
+drops to 4.4 ms) but `pre` grows from 26 ms to 53 to 70 ms. 26 ms plus about 14 ms for each of the
+two stage boundaries explains it. The residual is 32 KiB, so the time is not the copy but the
+synchronisation and the launches where a stage hands over to the next. Splitting the pool's workers
+per stage does not help. What helps is overlapping the stages so the residual handover hides behind
+the work in front of it, or passing the residual between the devices without going through the host.
+
+Running on Windows has not been checked.
 
 ## Qwen3.5 MoE MTP integration
 

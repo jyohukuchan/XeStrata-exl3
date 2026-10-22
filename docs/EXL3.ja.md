@@ -300,8 +300,18 @@ device cache ありの 1 stage と 2 stage の値は一致しない: cache が�
 同じ程度にとどまり、greedy の token は変わらない。device の順序を逆にしても
 （`--stage-devices 1,0`）logits は bit 一致する。
 
-3 stage 以上の分割、decode 速度、Windows での実行は確かめていない。R9700（0000:07:00.0）は
-この host で他の作業に使われているため、測定には 2 枚の V620 だけを使った。
+**3 stage（V620 ×2 と R9700、48 層を 16/16/16）でも同じことが成り立つ。** device cache なしの
+logits は単一 stage の参照と bit 一致し、device cache ありでも greedy token は変わらない。
+常駐 expert は 3 枚で 3563 + 3602 + 3355 = 10520（1 枚では 1848）になる。
+
+**速さは現状 1 stage のほうが速い**（8 GiB の上限で 11.45 対 9.62 tok/s、上限なしで
+8.32 tok/s）。expert 側の CPU の仕事は想定通り減る（上限なしでは expert_prep が 4.4 ms まで
+下がる）が、`pre` が 26 ms から 53〜70 ms に増える。26 ms に stage 境界 2 つ分の約 14 ms を
+足すと説明が付く。残差は 32 KiB と小さいので、時間を占めるのは copy ではなく stage を
+切り替えるときの同期と起動の並びである。stage ごとの pool worker を割っても速くならない。
+効くのは stage を重ねて residual の受け渡しを前に隠すか、host を経由せず装置間で渡すこと。
+
+Windows での実行は確かめていない。
 
 ## Qwen3.5 MoE の MTP 接続
 
