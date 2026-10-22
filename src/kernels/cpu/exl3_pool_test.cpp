@@ -82,7 +82,11 @@ int main() {
     std::printf("exl3_pool_test\n");
     // The integer dot path is opt-in through the environment, and it reads it
     // once: the switch has to be set before the first call.
-    ::setenv("STRATA_EXL3_CPU_INTDOT", "1", 1);
+#if defined(_WIN32)
+    _putenv_s("STRATA_EXL3_CPU_INTDOT", "1");
+#else
+    setenv("STRATA_EXL3_CPU_INTDOT", "1", 1);
+#endif
     const bool intdot = exl3::mul1_intdot_enabled();
     // The two experts deliberately reverse the hidden/intermediate geometry:
     // one has FF > H and the other H > FF. Each projection has its own K.
