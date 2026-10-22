@@ -178,11 +178,18 @@ inline float raw_weight(const void* data, size_t index) {
 // The accumulation of a row is unchanged: lane l adds the products of the positions l, l+32, l+64
 // ... in that order, and the 32 lanes are then reduced over the subgroup.  The result is the same
 // float as the one-row-per-wave kernel computes.
-template <DType Type, HalfMode Mode>
+//
+// The positions a lane walks are 32 apart, so every iteration waits on its own loads: issued one
+// at a time they cost the memory latency each, and a K of ten thousand takes tens of microseconds
+// per wave.  The loads of `kUnroll` steps are issued first and only then added, in the same step
+// order, so the loads overlap while the sums keep their exact sequence.
+constexpr int64_t kRawUnroll = 8;
+
+template <DType Type, HalfMode Mode, int kRows>
 sycl::event linear_fp32_rows(sycl::queue& queue, const LinearView& view, const float* x, int64_t ldx, float* y,
                               int64_t ldy, int64_t rows, const std::vector<sycl::event>& deps) {
+    static_assert(kRows == 1 || kRows == 2);
     constexpr size_t kSubgroup = 32;
-    constexpr size_t kRows = 2;
     const size_t per_row = (static_cast<size_t>(view.n) + kRows - 1) / kRows;
     const size_t groups = per_row;
     return queue.submit([&](sycl::handler& h) {
@@ -192,7 +199,7 @@ sycl::event linear_fp32_rows(sycl::queue& queue, const LinearView& view, const f
             const sycl::sub_group subgroup = item.get_sub_group();
             const size_t group = static_cast<size_t>(item.get_group_linear_id());
             const size_t first = group * kRows;
-            const size_t second = first + 1 < static_cast<size_t>(view.n) ? first + 1 : first;
+            const size_t second = kRows > 1 && first + 1 < static_cast<size_t>(view.n) ? first + 1 : first;
             const int lane = static_cast<int>(subgroup.get_local_linear_id());
             const size_t base0 = first * static_cast<size_t>(view.k);
             const size_t base1 = second * static_cast<size_t>(view.k);
@@ -202,19 +209,37 @@ sycl::event linear_fp32_rows(sycl::queue& queue, const LinearView& view, const f
             for (int64_t row = 0; row < rows; ++row) {
                 const float* xr = x + row * ldx;
                 float value0 = 0.0f, value1 = 0.0f;
-                #pragma unroll 4
-                for (int64_t in = lane; in < view.k; in += static_cast<int64_t>(kSubgroup)) {
-                    const float input = xr[in];
-                    const size_t offset = static_cast<size_t>(in);
+                const int64_t steps = (view.k - lane + static_cast<int64_t>(kSubgroup) - 1) /
+                                      static_cast<int64_t>(kSubgroup);
+                int64_t step = 0;
+                for (; step + kRawUnroll <= steps; step += kRawUnroll) {
+                    float input[kRawUnroll], w0[kRawUnroll], w1[kRawUnroll];
+                    #pragma unroll
+                    for (int u = 0; u < kRawUnroll; ++u) {
+                        const size_t offset = static_cast<size_t>(lane) + static_cast<size_t>(step + u) * kSubgroup;
+                        input[u] = xr[offset];
+                        w0[u] = raw_weight<Type, Mode>(view.data, base0 + offset);
+                        if (kRows > 1) w1[u] = raw_weight<Type, Mode>(view.data, base1 + offset);
+                    }
+                    #pragma unroll
+                    for (int u = 0; u < kRawUnroll; ++u) {
+                        value0 += input[u] * w0[u];
+                        if (kRows > 1) value1 += input[u] * w1[u];
+                    }
+                }
+                for (; step < steps; ++step) {
+                    const size_t offset = static_cast<size_t>(lane) + static_cast<size_t>(step) * kSubgroup;
+                    const float input = xr[offset];
                     value0 += input * raw_weight<Type, Mode>(view.data, base0 + offset);
-                    value1 += input * raw_weight<Type, Mode>(view.data, base1 + offset);
+                    if (kRows > 1) value1 += input * raw_weight<Type, Mode>(view.data, base1 + offset);
                 }
                 const float reduced0 = sycl::reduce_over_group(subgroup, value0, sycl::plus<float>());
-                const float reduced1 = sycl::reduce_over_group(subgroup, value1, sycl::plus<float>());
-                if (lane == 0) {
+                if (lane == 0)
                     y[row * ldy + static_cast<int64_t>(first)] =
                         reduced0 + (view.bias == nullptr ? 0.0f : view.bias[static_cast<int64_t>(first)]);
-                    if (second != first)
+                if (kRows > 1 && second != first) {
+                    const float reduced1 = sycl::reduce_over_group(subgroup, value1, sycl::plus<float>());
+                    if (lane == 0)
                         y[row * ldy + static_cast<int64_t>(second)] =
                             reduced1 + (view.bias == nullptr ? 0.0f : view.bias[static_cast<int64_t>(second)]);
                 }
@@ -225,6 +250,10 @@ sycl::event linear_fp32_rows(sycl::queue& queue, const LinearView& view, const f
 
 // For a small number of outputs, parallelize product loads without changing the original
 // 32-lane accumulation streams. Products are ephemeral local memory, never expanded weights.
+//
+// Both loops here walk positions that are `threads` or 32 apart, so their loads are issued one at
+// a time and each waits on the memory latency; the same split-phase form as `linear_fp32_rows`
+// overlaps them without moving a single addition.
 template <DType Type, HalfMode Mode>
 sycl::event linear_fp32_products(sycl::queue& queue, const LinearView& view, const float* x, int64_t ldx,
                                  float* y, int64_t ldy, int64_t rows, size_t threads,
@@ -241,15 +270,38 @@ sycl::event linear_fp32_products(sycl::queue& queue, const LinearView& view, con
             const int64_t t = static_cast<int64_t>(item.get_local_id(0));
             const float* xr = x + row * ldx;
             const size_t base = static_cast<size_t>(out) * static_cast<size_t>(view.k);
-            for (int64_t in = t; in < view.k; in += static_cast<int64_t>(threads)) {
-                const size_t offset = static_cast<size_t>(in);
-                const float weight = raw_weight<Type, Mode>(view.data, base + offset);
-                products[offset] = xr[in] * weight;
+            const int64_t loads = (view.k - t + static_cast<int64_t>(threads) - 1) / static_cast<int64_t>(threads);
+            int64_t load = 0;
+            for (; load + kRawUnroll <= loads; load += kRawUnroll) {
+                float input[kRawUnroll], weight[kRawUnroll];
+                size_t offset[kRawUnroll];
+                #pragma unroll
+                for (int u = 0; u < kRawUnroll; ++u) {
+                    offset[u] = static_cast<size_t>(t + (load + u) * static_cast<int64_t>(threads));
+                    input[u] = xr[offset[u]];
+                    weight[u] = raw_weight<Type, Mode>(view.data, base + offset[u]);
+                }
+                #pragma unroll
+                for (int u = 0; u < kRawUnroll; ++u) products[offset[u]] = input[u] * weight[u];
+            }
+            for (; load < loads; ++load) {
+                const size_t offset = static_cast<size_t>(t + load * static_cast<int64_t>(threads));
+                products[offset] = xr[offset] * raw_weight<Type, Mode>(view.data, base + offset);
             }
             item.barrier(sycl::access::fence_space::local_space);
             if (t < 32) {
                 float value = 0.0f;
-                for (int64_t in = t; in < view.k; in += 32) value += products[static_cast<size_t>(in)];
+                const int64_t sums = (view.k - t + 31) / 32;
+                int64_t sum = 0;
+                for (; sum + kRawUnroll <= sums; sum += kRawUnroll) {
+                    float part[kRawUnroll];
+                    #pragma unroll
+                    for (int u = 0; u < kRawUnroll; ++u)
+                        part[u] = products[static_cast<size_t>(t + (sum + u) * 32)];
+                    #pragma unroll
+                    for (int u = 0; u < kRawUnroll; ++u) value += part[u];
+                }
+                for (; sum < sums; ++sum) value += products[static_cast<size_t>(t + sum * 32)];
                 value = sycl::reduce_over_group(item.get_sub_group(), value, sycl::plus<float>());
                 if (t == 0) y[row * ldy + out] = value + (view.bias == nullptr ? 0.0f : view.bias[out]);
             }
@@ -265,18 +317,26 @@ sycl::event select_raw_kernel(sycl::queue& queue, const LinearView& view, const 
                                                  device.get_info<sycl::info::device::max_num_sub_groups>());
     const uint64_t capacity = static_cast<uint64_t>(device.get_info<sycl::info::device::max_compute_units>()) * max_waves;
     const uint64_t groups = static_cast<uint64_t>(rows) * static_cast<uint64_t>(view.n);
-    // The two-rows-per-wave kernel needs enough output rows to keep the device busy; below that
-    // the input range is split over the waves of a work-group instead, and the products travel
-    // through local memory.
-    const uint64_t wave_groups = (groups + 1) / 2;
-    if (wave_groups * 8 >= capacity)
-        return linear_fp32_rows<Type, Mode>(queue, view, x, ldx, y, ldy, rows, deps);
-    const uint64_t required = capacity / groups + (capacity % groups != 0 ? 1 : 0);
-    const uint64_t useful = static_cast<uint64_t>(view.k / 32 + (view.k % 32 != 0 ? 1 : 0));
-    const size_t waves = static_cast<size_t>(std::min({max_waves, required, useful}));
-    if (waves > 1 && static_cast<uint64_t>(view.k) <= device.get_info<sycl::info::device::local_mem_size>() / sizeof(float))
+    // One wave walks one output's whole K in its own lane streams, so a projection with few outputs
+    // leaves the device with few waves and every one of them waiting on its own loads.  The choice
+    // between the forms is free: all of them compute the same float (the same lane streams and the
+    // same subgroup reduction).  Few outputs take the products form, which splits K over the waves
+    // of a work-group; a medium count takes one row per wave; a wide projection takes two rows per
+    // wave so its input row is fetched once for two of them.
+    const bool products_fits =
+        static_cast<uint64_t>(view.k) <= device.get_info<sycl::info::device::local_mem_size>() / sizeof(float);
+    if (groups * 4 < capacity && products_fits) {
+        // About eight products per work-item: enough loads in flight per item to cover the memory
+        // latency, bounded by the work-group size and the K span (one product per position).
+        const uint64_t wanted = static_cast<uint64_t>(view.k) / 8 + (static_cast<uint64_t>(view.k) % 8 != 0 ? 1 : 0);
+        const size_t waves = static_cast<size_t>(
+            std::max<uint64_t>(1, std::min({max_waves, wanted / 32 + (wanted % 32 != 0 ? 1 : 0),
+                                            static_cast<uint64_t>(view.k)})));
         return linear_fp32_products<Type, Mode>(queue, view, x, ldx, y, ldy, rows, waves * 32, deps);
-    return linear_fp32_rows<Type, Mode>(queue, view, x, ldx, y, ldy, rows, deps);
+    }
+    if (groups * 2 < capacity)
+        return linear_fp32_rows<Type, Mode, 1>(queue, view, x, ldx, y, ldy, rows, deps);
+    return linear_fp32_rows<Type, Mode, 2>(queue, view, x, ldx, y, ldy, rows, deps);
 }
 
 }  // namespace

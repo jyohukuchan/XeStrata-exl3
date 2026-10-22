@@ -619,6 +619,7 @@ struct Exl3FlashModel::Impl {
         void* parts_device = nullptr;
         std::vector<float> miss_output;
         std::vector<float> merge_output;
+        std::vector<float> merge_upload;
         float* embedding_device = nullptr;
         std::vector<strata::gpu::Graph*> pre_graphs;
         std::vector<strata::gpu::Graph*> post_graphs;
@@ -932,6 +933,7 @@ bool Exl3FlashModel::open(const std::filesystem::path& directory, const Exl3Flas
             }
             stage.miss_output.assign(parts_elements, 0.0f);
             stage.merge_output.assign(parts_elements, 0.0f);
+            stage.merge_upload.assign(parts_elements, 0.0f);
             if (stage_index == 0) {
                 stage.embedding_device = static_cast<float*>(strata::gpu::alloc_device(
                     static_cast<size_t>(impl_->geometry.n_embd) * sizeof(float)));
@@ -1341,6 +1343,7 @@ bool Exl3FlashModel::reset(std::string& err) {
             }
             std::fill(stage.miss_output.begin(), stage.miss_output.end(), 0.0f);
             std::fill(stage.merge_output.begin(), stage.merge_output.end(), 0.0f);
+            std::fill(stage.merge_upload.begin(), stage.merge_upload.end(), 0.0f);
         }
         // The PLE's token window is the model's: a new sequence starts with no predecessor, which
         // is what the n-gram lookup reads as the end of the context.
@@ -1524,8 +1527,12 @@ bool Exl3FlashModel::forward(int32_t token, int64_t pos, int32_t& next_token, fl
                 }
                 for (size_t i = 0; i < stage.merge_output.size(); ++i)
                     stage.merge_output[i] += stage.miss_output[i];
-                if (!strata::gpu::copy(stage.parts_device, stage.merge_output.data(),
-                                       stage.merge_output.size() * sizeof(float))) {
+                // The host swaps in a second buffer and the upload is queued, not waited: the post
+                // graph runs behind the copy on this queue, and the next layer's download fills the
+                // other buffer, so the host never rewrites what a pending upload still reads.
+                std::swap(stage.merge_output, stage.merge_upload);
+                if (!strata::gpu::copy_async(stage.parts_device, stage.merge_upload.data(),
+                                             stage.merge_upload.size() * sizeof(float), nullptr)) {
                     err = std::string("EXL3 Flash: expert host-to-device merge copy failed: ") + strata::gpu::last_error();
                     return false;
                 }

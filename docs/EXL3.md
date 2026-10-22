@@ -379,6 +379,83 @@ cache holds 0-295 experts per layer (0-210 with the even split).
 
 Running on Windows has not been checked.
 
+### Decode speed and the reference implementation (Qwen3.8 Flash)
+
+rocm_exl3 (exllamav3's ROCm port) runs the same checkpoint (qwen38-flash-next-exl3-3.05bpw) on
+the same two V620s at 23.96 tok/s (41.7 ms per token) for batch-1 decode, 2.09x faster than
+XeStrata's 11.4 tok/s (87 ms per token). The reference implementation's structure was read and
+what transfers was applied. The reference's measurements are
+`/work/runs/qwen38/first-bench-512.json` in the container rocm-exl3-rdna2 (commit 37a96d50,
+a 512-token prompt, 32 decode tokens, the median of two repeats).
+
+**The reference's decode shape.** It replays one graph per layer as XeStrata does, but nothing
+waits on the host between layers: a worker process per device enqueues a whole token's layers in
+one dispatch, and the host waits only where the hidden state crosses a stage boundary (the
+bench's device copies are one per token) and at the final argmax, which runs on the GPU. The
+EXL3 experts stay on the GPU from routing to computation, and one cooperative kernel computes
+every active expert of a layer. About 22 kernels per layer. The trellis is decoded inside the
+kernels as they are used (as in XeStrata), and the codebook 2 (mul1) byte sum is computed with
+the same formula through a dot product instruction. The experts of a layer are fully resident on
+the layer's own device and never cross devices. Activations are F16, the hyper-connection
+residual is FP32 streams, and the KV cache is paged F16/quantized.
+
+**XeStrata's breakdown** (two V620s, `--stage-devices 0,1`, decode after the same 512-token
+prompt, full device cache, the sums of a GPU kernel trace): 3448 kernels per token with 64.6 ms
+of GPU execution against 87 ms of wall clock. Largest first:
+
+| Part | kernels/token | GPU ms |
+| --- | ---: | ---: |
+| raw F16 projections (HC down/up/inject, alpha/beta, router) | 460 | 26.8 |
+| EXL3 dense projections (3 kernels each, Hadamards included) | 650 + 300 | 14.7 |
+| the experts' grouped flow (7 kernels per layer) | 336 | 9.7 |
+| GDN step, norms, conv and the rest | ~400 | 6 |
+| the router's top-10, RoPE, copies and others | ~1200 | 7 |
+| host gaps (the experts' hit plan, the merge copies, ...) | - | 22 |
+
+**What was applied.** None of these moves a single addition, so the values are bit-identical:
+
+* The two raw F16 kernels (`linear_fp32_rows` / `linear_fp32_products`) read positions 32 apart
+  one load at a time; they now issue eight steps of loads first and then add them in the same
+  order. The choice between the products form, which splits K over the waves of a work-group,
+  and the rows form at one or two rows per wave now follows the output count (all three forms
+  return the same float: the same lane sums and the same subgroup reduction). The raw
+  projections' 460 kernels per token go from 26.8 ms to 18.2 ms, and the products form from
+  17.6 µs to 8.9 µs per launch.
+* The experts' merge upload is an asynchronous copy over two alternating host buffers, so the
+  buffer the host starts filling for the next layer is never the one a pending upload reads and
+  the wait for the upload is gone.
+
+A trellis dot (word tile) that reads the words of the four tiles ahead was also tried and not
+kept: inside the graph replay it went from 43 µs to 72 µs per launch. It looked faster in a
+standalone micro-benchmark, but that difference was in the measurement conditions (an unchanged
+Hadamard kernel appeared 2.3x faster in the same two runs), and the trace inside the graph replay
+was the truthful one.
+
+Measured (two V620s, the 512-token prompt, 32 decode tokens, `STRATA_EXL3_FLASH_TIMING=1`):
+
+| State | decode tok/s | per token | pre | expert_wait | expert_prep | merge | head/post/bridge/emb |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| before | 11.38 | 87.1 ms | 62.0 ms | 13.9 ms | 4.5 ms | 3.9 ms | 2.8 ms |
+| after | 12.39 | 80.0 ms | 56.5 ms | 14.2 ms | 3.9 ms | 2.7 ms | 2.6 ms |
+
+The generated tokens are the same before and after. The reference's 23.96 tok/s is not reached
+yet: what remains is the trellis dots still inside `pre` (300 kernels, 13 ms), the experts'
+grouped flow (336 kernels, 9.7 ms of GPU plus 3.9 ms of the host's hit plan), the GDN, RoPE and
+router kernels, and the host gaps around each layer's doorbell.
+
+The values do not change: the logits SHA256 of
+`exl3_flash_probe --tokens 16,10,16,28 --max-new 2 --max-context 8 --dump-logits` keeps the
+reference value with the device cache off on both one and two stages, and `raw_linear_parity`
+passes.
+
+**What does not transfer.** The reference's `exl3_gemm` folds the input Hadamard, the GEMV and
+the output Hadamard into one kernel with a cooperative grid (a grid-wide barrier), and SYCL has
+no portable form of that barrier, so the three kernels stay. The reference's experts staying
+wholly on the GPU cannot be taken as is either: XeStrata's device cache is a contract in which
+the host reads the routed ids to decide hits and misses (the CPU misses keep their FP64
+accumulation). The GPU-side argmax is not applied because the probe that dumps logits needs the
+host logits and the treatment of greedy ties must not change.
+
 ## Qwen3.5 MoE MTP integration
 
 `--spec 2` or greater loads `mtp.fc`, three norms, and `mtp.layers.0` attention, routers and shared/routed experts
