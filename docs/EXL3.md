@@ -208,7 +208,8 @@ BF16 teacher. The diagnostic dump's runtime is not a decode speed acceptance mea
 
 Qwen3.8 `--exl3 DIR` starts directly from the archive's HF config without requiring a metadata GGUF.
 An optional `--metadata-gguf` supplies EOS metadata. Pass input IDs with `--tokens` or `--tokens-file`,
-and choose layer-stage device ordinals with `--stage-devices`. `--pool-workers N` sets CPU workers per stage.
+and choose layer-stage device ordinals with `--stage-devices`. `--stage-layers` names the layer
+count per stage (for example `18,18,12`); the default is the even split. `--pool-workers N` sets CPU workers per stage.
 The default zero derives the count from physical cores; measure the best value on the actual model.
 
 ```sh
@@ -266,14 +267,29 @@ relative), and the greedy tokens do not change.
 
 The EXL3 Flash layers are split over the devices named by `--stage-devices`. Without the option the
 model makes as many stages as the engine has usable GPUs, and the layers are cut at
-`layer_count * stage / stage_count`, so every stage owns at least one layer. Each stage has its own
-device, session arena, dense weights, expert runtime and device cache.
+`layer_count * stage / stage_count`, so every stage owns at least one layer. `--stage-layers 18,18,12`
+names the layer count per stage explicitly (the stage count and the device list still come from
+`--stage-devices`). The split is validated against the stage count and the layer total, and a split
+where a stage gets no layer or the counts do not cover the model stops the start with the reason.
+A last stage with fewer layers leaves more of its card's VRAM to the device cache. Each stage has its
+own device, session arena, dense weights, expert runtime and device cache.
 
 **Only the residual crosses a stage boundary.** The previous stage's residual (`hc * n_embd` floats)
-goes through a host bridge buffer into the next stage's session. The devices do not share an address
-space, so nothing else can be carried from one device to another. The session arena (the GDN state,
-the QSA KV cache, the PLE's conv history), the dense weights, the expert runtime, the device cache
-and the embedding stay on the device of the stage that owns them.
+goes into the next stage's session in one device-to-device copy: where the runtime copies between
+the two devices' memories directly, that path is taken, and where it cannot, the residual goes
+through the host bridge buffer as before. Which one it is is decided at start-up with a small copy
+that is actually issued and checked, and the path taken is reported. The devices do not share an
+address space, so nothing else can be carried from one device to another. The session arena (the
+GDN state, the QSA KV cache, the PLE's conv history), the dense weights, the expert runtime, the
+device cache and the embedding stay on the device of the stage that owns them.
+
+**The host waits only where data crosses it.** forward() issues the stages' work in order and waits
+in four places: (1) each layer's doorbell, where the pre graph publishes the experts' input - the
+wait is on the ring, so the CPU's expert work starts without waiting for the graph's end; (2) the
+expert merge's device-to-host copy; (3) the residual handover at a stage boundary; (4) the final
+logits copy. The residual copy is queued right after the sending stage's last post graph, and the
+receiving stage waits that one completion before queueing its first pre graph. Nothing waits after a
+post graph, so between one layer's end and the next layer's start only the queue's order remains.
 
 **The PLE does not cross a stage boundary.** The PLE block belongs to layer 1, and the layer split
 gives that layer to exactly one stage. That stage (the PLE's home stage) holds the PLE's device
@@ -316,13 +332,33 @@ way: the logits without the device cache are bit identical to the one-stage refe
 device cache the greedy tokens do not change either. The resident experts are 3563 + 3602 + 3355 =
 10520 on three cards, against 1848 on one.
 
-**The one-stage split is the faster one today** (11.45 against 9.62 tok/s with an 8 GiB limit, and
-8.32 without one). The CPU's expert work falls as expected (without a limit the expert preparation
-drops to 4.4 ms) but `pre` grows from 26 ms to 53 to 70 ms. 26 ms plus about 14 ms for each of the
-two stage boundaries explains it. The residual is 32 KiB, so the time is not the copy but the
-synchronisation and the launches where a stage hands over to the next. Splitting the pool's workers
-per stage does not help. What helps is overlapping the stages so the residual handover hides behind
-the work in front of it, or passing the residual between the devices without going through the host.
+**Speed** (the Qwen3.8 Flash EXL3 3.05 bpw checkpoint, 48 layers, the V620s at 0000:03:00.0 and
+0000:43:00.0 and the R9700 at 0000:07:00.0, the median of 7 decode tokens from the prompt
+16,10,16,28, `STRATA_EXL3_FLASH_TIMING=1`, and no other job using a GPU; tok/s is the reciprocal
+of that median):
+
+| Condition | Before the handover rework | Now |
+| --- | ---: | ---: |
+| 1 GPU (V620, 8 GiB VRAM limit) | 87.9 ms (11.4 tok/s) | 85.1 ms (11.8 tok/s) |
+| 1 GPU, no limit | 70.3 ms (14.2 tok/s) | 70.2 ms (14.2 tok/s) |
+| 2 GPUs (24/24, 8 GiB limit) | 111.0 ms (9.0 tok/s) | 100.6 ms (9.9 tok/s) |
+| 2 GPUs, no limit | 88.6 ms (11.3 tok/s) | 85.6 ms (11.7 tok/s) |
+| 3 GPUs (16/16/16, 8 GiB limit) | 105.4 ms (9.5 tok/s) | 97.1 ms (10.3 tok/s) † |
+| 3 GPUs, no limit | 83.0 ms (12.0 tok/s) | 80.3 ms (12.5 tok/s) |
+| 3 GPUs, 8 GiB limit, `--stage-layers 18,18,12` | — | 101.3 ms (9.9 tok/s) |
+
+† Another process took the CPU during the measurement and stretched two tokens (167 and 183 ms);
+this is the median without them. With them the median is 110.2 ms.
+
+What the phase breakdown shows first is that the `post` wait is gone and only `bridge` (the residual
+handover) remains, at 0 to 0.5 ms: `post` falls from 6-8 ms to 0.3-0.7 ms. The pre graph is awaited
+at the doorbell ring, so the CPU's expert work runs beside the rest of the graph and the
+synchronisation between one layer's end and the next layer's start disappears too. On several GPUs
+about 0.2 ms per layer (about 10 ms over 48 layers) and 2.5-4.2 ms for a stage's first pre graph
+remain. Without a limit the resident experts hold more of the model on three cards and the CPU's
+expert work drops to 4.5 ms (15.7 ms on one), so three GPUs come close to one. With
+`--stage-layers 18,18,12` the last stage (the card with the head) runs fewer layers, and its device
+cache holds 0-295 experts per layer (0-210 with the even split).
 
 Running on Windows has not been checked.
 

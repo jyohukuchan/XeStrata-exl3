@@ -33,6 +33,15 @@
 #include <utility>
 #include <vector>
 
+// `_mm_pause` for the doorbell spin.  Guarded because it is x86-only; a target without it still builds, the
+// spin is just less polite to the pipeline.
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#define STRATA_SPIN_PAUSE() _mm_pause()
+#else
+#define STRATA_SPIN_PAUSE() ((void) 0)
+#endif
+
 namespace strata::core {
 namespace {
 
@@ -407,11 +416,12 @@ struct HostTiming {
     double expert_wait_ms = 0;
     double merge_ms = 0;
     double post_graph_ms = 0;
+    double bridge_ms = 0;
     double head_ms = 0;
 
     double total_ms() const {
         return embedding_ms + ple_issue_ms + ple_collect_ms + pre_graph_ms + expert_prepare_ms + expert_wait_ms +
-               merge_ms + post_graph_ms + head_ms;
+               merge_ms + post_graph_ms + bridge_ms + head_ms;
     }
 };
 
@@ -425,6 +435,75 @@ double ms_since(std::chrono::steady_clock::time_point& mark) {
     const double value = std::chrono::duration<double, std::milli>(now - mark).count();
     mark = now;
     return value;
+}
+
+/// Waits for a pre graph's doorbell ring the way the native session loop does: a poll that enters
+/// the driver every iteration (on this driver a device write to mapped pinned memory is host
+/// visible only after one), ending at the ring - which the pre graph may ring before its own end -
+/// or at the graph's end.  A graph that ended without ringing is refused: the window the host
+/// would read is then the previous layer's.
+bool wait_pre_doorbell(const Doorbell& doorbell, const strata::gpu::Event* probe, std::string& err) {
+    volatile const uint32_t* const seq = doorbell.h_seq;
+    for (;;) {
+        const strata::gpu::Status status = strata::gpu::event_status(probe);
+        if (status == strata::gpu::Status::Failed) {
+            err = strata::gpu::last_error();
+            return false;
+        }
+        if (*seq != 0) return true;
+        if (status == strata::gpu::Status::Done) {
+            err = "the pre graph ended without ringing the doorbell";
+            return false;
+        }
+        STRATA_SPIN_PAUSE();
+    }
+}
+
+/// THE RESIDUAL'S PATH ACROSS A STAGE BOUNDARY, TAKEN FROM WHAT A REAL COPY DOES.
+///
+/// The residual is the only data that leaves one stage's device.  Where the runtime copies between
+/// the two devices' memories directly - the driver moves the bytes and no host buffer is touched -
+/// the boundary takes that copy; everywhere else the residual goes through the host bridge, which
+/// is the engine's original path.  The choice is made with a copy that is issued and verified, not
+/// from a capability flag: `peer_access` is REPORTED beside it, and the extension answers "no" on
+/// hosts whose devices still copy directly.
+bool residual_copy_direct(int from_device, int to_device, size_t bytes, bool& peer, std::string& detail) {
+    peer = strata::gpu::peer_access(from_device, to_device);
+    const size_t probe_bytes = std::min<size_t>(bytes, 64 * 1024);
+    std::vector<unsigned char> pattern(probe_bytes);
+    for (size_t i = 0; i < probe_bytes; ++i) pattern[i] = static_cast<unsigned char>(i * 31 + 7);
+    std::vector<unsigned char> readback(probe_bytes, 0);
+    void* src = nullptr;
+    void* dst = nullptr;
+    {
+        const OnDevice on(from_device);
+        src = strata::gpu::alloc_device(probe_bytes);
+        if (src != nullptr && !strata::gpu::copy(src, pattern.data(), probe_bytes)) {
+            strata::gpu::free(src);
+            src = nullptr;
+        }
+    }
+    {
+        const OnDevice on(to_device);
+        dst = strata::gpu::alloc_device(probe_bytes);
+    }
+    bool direct = src != nullptr && dst != nullptr;
+    if (direct) {
+        const OnDevice on(from_device);
+        direct = strata::gpu::copy(dst, src, probe_bytes);
+        if (!direct) detail = strata::gpu::last_error();
+    } else {
+        detail = "no room for the probe copy";
+    }
+    if (direct) {
+        const OnDevice on(to_device);
+        direct = strata::gpu::copy(readback.data(), dst, probe_bytes) &&
+                 std::memcmp(readback.data(), pattern.data(), probe_bytes) == 0;
+        if (!direct) detail = "the copy did not carry the bytes";
+    }
+    if (src != nullptr) strata::gpu::free(src);
+    if (dst != nullptr) strata::gpu::free(dst);
+    return direct;
 }
 
 /// Drains the PLE's row ticket if a forward fails between the issue and the
@@ -464,12 +543,64 @@ Exl3FlashStageRange exl3_flash_stage_range(int64_t layer_count, int64_t stage_co
     return range;
 }
 
-int64_t exl3_flash_ple_stage(int64_t layer_count, int64_t stage_count) {
-    for (int64_t index = 0; index < stage_count; ++index) {
-        const Exl3FlashStageRange range = exl3_flash_stage_range(layer_count, stage_count, index);
-        if (range.layer_begin <= PLE_LAYER && PLE_LAYER < range.layer_end) return index;
+bool exl3_flash_stage_ranges(int64_t layer_count, int64_t stage_count, const std::vector<int64_t>& counts,
+                             std::vector<Exl3FlashStageRange>& ranges, std::string& err) {
+    ranges.clear();
+    err.clear();
+    if (layer_count <= 0) { err = "the model has no layers"; return false; }
+    if (stage_count <= 0) { err = "at least one stage is required"; return false; }
+    if (stage_count > layer_count) {
+        err = "the stage count exceeds the model's layer count";
+        return false;
     }
+    if (!counts.empty() && static_cast<int64_t>(counts.size()) != stage_count) {
+        err = "the layer counts name " + std::to_string(counts.size()) + " stages but " +
+              std::to_string(stage_count) + " stages were selected";
+        return false;
+    }
+    ranges.reserve(static_cast<size_t>(stage_count));
+    int64_t begin = 0;
+    for (int64_t index = 0; index < stage_count; ++index) {
+        int64_t count = counts.empty() ? 0 : counts[static_cast<size_t>(index)];
+        if (counts.empty()) {
+            const Exl3FlashStageRange even = exl3_flash_stage_range(layer_count, stage_count, index);
+            count = even.layer_end - even.layer_begin;
+        }
+        if (count <= 0) {
+            err = "stage " + std::to_string(index) + " gets " + std::to_string(count) +
+                  " layers; every stage must get at least one layer";
+            ranges.clear();
+            return false;
+        }
+        if (count > layer_count - begin) {
+            err = "the layer counts cover more than the model's " + std::to_string(layer_count) + " layers";
+            ranges.clear();
+            return false;
+        }
+        ranges.push_back({begin, begin + count});
+        begin += count;
+    }
+    if (begin != layer_count) {
+        err = "the layer counts cover " + std::to_string(begin) + " layers but the model has " +
+              std::to_string(layer_count);
+        ranges.clear();
+        return false;
+    }
+    return true;
+}
+
+int64_t exl3_flash_ple_stage(const std::vector<Exl3FlashStageRange>& ranges) {
+    for (size_t index = 0; index < ranges.size(); ++index)
+        if (ranges[index].layer_begin <= PLE_LAYER && PLE_LAYER < ranges[index].layer_end)
+            return static_cast<int64_t>(index);
     return -1;
+}
+
+int64_t exl3_flash_ple_stage(int64_t layer_count, int64_t stage_count) {
+    std::vector<Exl3FlashStageRange> ranges;
+    std::string ignored;
+    if (!exl3_flash_stage_ranges(layer_count, stage_count, {}, ranges, ignored)) return -1;
+    return exl3_flash_ple_stage(ranges);
 }
 
 struct Exl3FlashModel::Impl {
@@ -515,6 +646,15 @@ struct Exl3FlashModel::Impl {
     void* logits_device = nullptr;
     std::vector<float> logits_host;
     std::vector<float> bridge_host;
+    // HOW THE RESIDUAL CROSSES A STAGE BOUNDARY.  `residual_direct` is per boundary: the devices
+    // copy between their memories (the driver moves the bytes, no host buffer), else the residual
+    // goes through `bridge_host`.  The crossing is issued on the sending device's queue right
+    // after the stage's last post graph and marked with `cross_event`; the receiving stage waits
+    // that one event where the data crosses.  `doorbell_probe` marks each pre graph so the host
+    // can poll its doorbell ring instead of draining the queue.
+    std::vector<bool> residual_direct;
+    strata::gpu::Event* cross_event = nullptr;
+    strata::gpu::Event* doorbell_probe = nullptr;
     bool initialized = false;
     bool seeded = false;
     int64_t next_position = 0;
@@ -672,6 +812,22 @@ bool Exl3FlashModel::open(const std::filesystem::path& directory, const Exl3Flas
             err = "EXL3 Flash: stage count cannot exceed the number of model layers";
             return false;
         }
+        std::vector<Exl3FlashStageRange> stage_ranges;
+        if (!exl3_flash_stage_ranges(layer_count, stage_count, impl_->options.stage_layers, stage_ranges, err)) {
+            err = "EXL3 Flash: stage layer split: " + err;
+            return false;
+        }
+        {
+            std::string split;
+            for (size_t index = 0; index < stage_ranges.size(); ++index) {
+                if (index > 0) split += ", ";
+                split += std::to_string(stage_ranges[index].layer_begin) + "-" +
+                         std::to_string(stage_ranges[index].layer_end);
+            }
+            std::fprintf(stderr, "strata exl3-flash: %d stages over devices", stage_count);
+            for (const int device : impl_->options.stage_devices) std::fprintf(stderr, " %d", device);
+            std::fprintf(stderr, ": layers %s\n", split.c_str());
+        }
         // Exl3WeightSet::table_ borrows the Stage's WeightTable.  Reserve the
         // complete vector before any Stage is constructed so later stages
         // cannot move an earlier table while it is already registered.
@@ -679,7 +835,7 @@ bool Exl3FlashModel::open(const std::filesystem::path& directory, const Exl3Flas
         for (int stage_index = 0; stage_index < stage_count; ++stage_index) {
             Impl::Stage stage;
             stage.device = impl_->options.stage_devices[static_cast<size_t>(stage_index)];
-            const Exl3FlashStageRange range = exl3_flash_stage_range(layer_count, stage_count, stage_index);
+            const Exl3FlashStageRange& range = stage_ranges[static_cast<size_t>(stage_index)];
             stage.layer_begin = range.layer_begin;
             stage.layer_end = range.layer_end;
             stage.weights = std::make_unique<Exl3WeightSet>();
@@ -724,7 +880,7 @@ bool Exl3FlashModel::open(const std::filesystem::path& directory, const Exl3Flas
             err = "EXL3 Flash: the Qwen3.8 specialized n-gram PLE sidecar is required";
             return false;
         }
-        const int64_t ple_home = exl3_flash_ple_stage(layer_count, stage_count);
+        const int64_t ple_home = exl3_flash_ple_stage(stage_ranges);
         if (ple_home < 0) {
             err = "EXL3 Flash: no stage owns the required Qwen3.8 PLE layer 1";
             return false;
@@ -789,6 +945,31 @@ bool Exl3FlashModel::open(const std::filesystem::path& directory, const Exl3Flas
                 impl_->embedding->gather_one(0, stage.embedding_device, nullptr);
                 session_zero(stage.session, impl_->geometry, stage.embedding_device, nullptr);
             }
+        }
+        // THE RESIDUAL'S PATH ACROSS EACH BOUNDARY, FROM A REAL COPY.  It is probed with the
+        // residual's own size and verified, because the devices of one host differ in what their
+        // runtime does with a copy between two devices' memories, and the host bridge is kept for
+        // the ones that cannot copy directly.
+        for (size_t boundary = 0; boundary + 1 < impl_->stages.size(); ++boundary) {
+            const int from = impl_->stages[boundary].device;
+            const int to = impl_->stages[boundary + 1].device;
+            bool peer = false;
+            std::string detail;
+            const bool direct = residual_copy_direct(from, to, residual_elements * sizeof(float), peer, detail);
+            impl_->residual_direct.push_back(direct);
+            if (direct) {
+                std::fprintf(stderr, "strata exl3-flash: stage %zu -> %zu residual: a direct device-to-device copy "
+                                     "(peer access reports %s)\n", boundary, boundary + 1, peer ? "yes" : "no");
+            } else {
+                std::fprintf(stderr, "strata exl3-flash: stage %zu -> %zu residual: the host bridge (the devices do "
+                                     "not copy directly: %s; peer access reports %s)\n", boundary, boundary + 1,
+                             detail.c_str(), peer ? "yes" : "no");
+            }
+        }
+        if (!strata::gpu::event_create(&impl_->cross_event, false) ||
+            !strata::gpu::event_create(&impl_->doorbell_probe, false)) {
+            err = "EXL3 Flash: crossing event allocation failed";
+            return false;
         }
         {
             auto& ple_owner_stage = impl_->stages[static_cast<size_t>(ple_owner_stage_index)];
@@ -998,6 +1179,15 @@ bool Exl3FlashModel::close(std::string& err) noexcept {
             const OnDevice on(impl_->embedding_device);
             impl_->embedding.reset();
         }
+        if (impl_->cross_event != nullptr) {
+            strata::gpu::event_destroy(impl_->cross_event);
+            impl_->cross_event = nullptr;
+        }
+        if (impl_->doorbell_probe != nullptr) {
+            strata::gpu::event_destroy(impl_->doorbell_probe);
+            impl_->doorbell_probe = nullptr;
+        }
+        impl_->residual_direct.clear();
         impl_->archive.reset();
         impl_->expert_names.clear();
         impl_->map = {};
@@ -1235,10 +1425,9 @@ bool Exl3FlashModel::forward(int32_t token, int64_t pos, int32_t& next_token, fl
                     return false;
                 }
             }
-            if (!strata::gpu::stream_sync(nullptr)) {
-                err = std::string("EXL3 Flash: embedding upload failed: ") + strata::gpu::last_error();
-                return false;
-            }
+            // Nothing here needs the host: the broadcast is queued on the first stage's queue and
+            // the queue's order puts it in front of the first pre graph.  The host waits only
+            // where data crosses to it - the doorbell, the merge, the logits, the stage boundary.
             impl_->seeded = true;
         }
         timing.embedding_ms = ms_since(mark);
@@ -1250,14 +1439,25 @@ bool Exl3FlashModel::forward(int32_t token, int64_t pos, int32_t& next_token, fl
             auto& stage = impl_->stages[stage_index];
             const OnDevice on(stage.device);
             if (stage_index > 0) {
-                // THE RESIDUAL IS THE ONLY THING THAT CROSSES A STAGE BOUNDARY.  It goes through
-                // the host bridge, because the two devices do not share an address space; the
-                // PLE, the embedding and every per-layer state stay on the stage that owns them.
-                if (!strata::gpu::copy(stage.session.block.R, impl_->bridge_host.data(),
-                                       impl_->bridge_host.size() * sizeof(float))) {
+                // THE RESIDUAL IS THE ONLY THING THAT CROSSES A STAGE BOUNDARY.  The previous
+                // stage issued the crossing on its own queue right after its last post graph (see
+                // below), so it has been running while the host got here; this is the one
+                // synchronisation at the crossing.  Devices that copy between their memories
+                // directly have the residual in place by now; the others take it through
+                // `bridge_host` here.  The PLE, the embedding and every per-layer state stay on
+                // the stage that owns them.
+                mark = std::chrono::steady_clock::now();
+                if (!strata::gpu::event_sync(impl_->cross_event)) {
+                    err = std::string("EXL3 Flash: stage boundary residual crossing: ") + strata::gpu::last_error();
+                    return false;
+                }
+                if (!impl_->residual_direct[stage_index - 1] &&
+                    !strata::gpu::copy_async(stage.session.block.R, impl_->bridge_host.data(),
+                                             impl_->bridge_host.size() * sizeof(float), nullptr)) {
                     err = std::string("EXL3 Flash: stage boundary residual upload failed: ") + strata::gpu::last_error();
                     return false;
                 }
+                timing.bridge_ms += ms_since(mark);
             }
             for (int64_t layer = stage.layer_begin; layer < stage.layer_end; ++layer) {
                 const size_t local = static_cast<size_t>(layer - stage.layer_begin);
@@ -1279,15 +1479,24 @@ bool Exl3FlashModel::forward(int32_t token, int64_t pos, int32_t& next_token, fl
                 }
                 mark = std::chrono::steady_clock::now();
                 if (!strata::gpu::graph_launch(stage.pre_graphs[local], nullptr) ||
-                    !strata::gpu::stream_sync(nullptr)) {
+                    !strata::gpu::event_record(impl_->doorbell_probe, nullptr)) {
                     err = "EXL3 Flash: pre graph launch layer " + std::to_string(layer) + ": " +
                           strata::gpu::last_error();
                     return false;
                 }
+                // The host waits at the doorbell - the window crossing to it - and not for the
+                // queue: the poll returns at the ring, which the pre graph rings before its end,
+                // so the expert work below starts beside the graph's tail.  The queue's order is
+                // what carries the layer's state into the rest.
+                if (!wait_pre_doorbell(stage.doorbell, impl_->doorbell_probe, err)) {
+                    err = "EXL3 Flash: pre graph layer " + std::to_string(layer) + ": " + err;
+                    return false;
+                }
                 timing.pre_graph_ms += ms_since(mark);
-                mark = std::chrono::steady_clock::now();
-                if (!strata::gpu::memset(stage.parts_device, 0,
-                                         stage.merge_output.size() * sizeof(float))) {
+                // The expert output is cleared on the queue, ordered before the hit kernels that
+                // fill the entries they compute.
+                if (!strata::gpu::memset_async(stage.parts_device, 0,
+                                               stage.merge_output.size() * sizeof(float), nullptr)) {
                     err = std::string("EXL3 Flash: clearing expert output: ") + strata::gpu::last_error();
                     return false;
                 }
@@ -1322,8 +1531,10 @@ bool Exl3FlashModel::forward(int32_t token, int64_t pos, int32_t& next_token, fl
                 }
                 timing.merge_ms += ms_since(mark);
                 mark = std::chrono::steady_clock::now();
-                if (!strata::gpu::graph_launch(stage.post_graphs[local], nullptr) ||
-                    !strata::gpu::stream_sync(nullptr)) {
+                // The post graph is issued and not waited: nothing behind it needs the host until
+                // the next doorbell, and this queue runs it before whatever comes next - the next
+                // layer's pre graph, or the residual handover below.
+                if (!strata::gpu::graph_launch(stage.post_graphs[local], nullptr)) {
                     err = "EXL3 Flash: post graph launch layer " + std::to_string(layer) + ": " +
                           strata::gpu::last_error();
                     return false;
@@ -1331,11 +1542,24 @@ bool Exl3FlashModel::forward(int32_t token, int64_t pos, int32_t& next_token, fl
                 timing.post_graph_ms += ms_since(mark);
             }
             if (stage_index + 1 < impl_->stages.size()) {
-                if (!strata::gpu::copy(impl_->bridge_host.data(), stage.session.block.R,
-                                       impl_->bridge_host.size() * sizeof(float))) {
-                    err = std::string("EXL3 Flash: stage boundary residual download failed: ") + strata::gpu::last_error();
+                // THE HANDOVER IS ISSUED HERE AND WAITED WHERE THE DATA CROSSES.  The crossing is
+                // queued behind this stage's last post graph and marked with `cross_event`; the
+                // receiving stage starts with that mark.  A direct copy goes from this stage's
+                // residual to the next stage's; the host bridge downloads into `bridge_host`, and
+                // the receiving stage uploads from it after the same mark.
+                mark = std::chrono::steady_clock::now();
+                const size_t residual_bytes = impl_->bridge_host.size() * sizeof(float);
+                const bool sent = impl_->residual_direct[stage_index]
+                                      ? strata::gpu::copy_async(impl_->stages[stage_index + 1].session.block.R,
+                                                                stage.session.block.R, residual_bytes, nullptr)
+                                      : strata::gpu::copy_async(impl_->bridge_host.data(), stage.session.block.R,
+                                                                residual_bytes, nullptr);
+                if (!sent || !strata::gpu::event_record(impl_->cross_event, nullptr)) {
+                    err = std::string("EXL3 Flash: stage boundary residual handover failed: ") +
+                          strata::gpu::last_error();
                     return false;
                 }
+                timing.bridge_ms += ms_since(mark);
             }
         }
 
@@ -1381,11 +1605,11 @@ bool Exl3FlashModel::forward(int32_t token, int64_t pos, int32_t& next_token, fl
             std::fprintf(stderr,
                          "exl3-flash timing pos %lld: total %.1f ms | emb %.1f | ple issue %.1f collect %.1f "
                          "(wait %.1f, decode %.1f) | pre %.1f | expert_prep %.1f | expert_wait %.1f | merge %.1f | "
-                         "post %.1f | head %.1f\n",
+                         "post %.1f | bridge %.1f | head %.1f\n",
                          static_cast<long long>(pos), timing.total_ms(), timing.embedding_ms, timing.ple_issue_ms,
                          timing.ple_collect_ms, split.wait_us / 1000.0, split.decode_us / 1000.0, timing.pre_graph_ms,
                          timing.expert_prepare_ms, timing.expert_wait_ms, timing.merge_ms, timing.post_graph_ms,
-                         timing.head_ms);
+                         timing.bridge_ms, timing.head_ms);
         }
         return true;
     } catch (const std::exception& e) {

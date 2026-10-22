@@ -116,6 +116,7 @@ void usage() {
                  "  --max-new N         generated token count (default 16)\n"
                  "  --context N         K/V context capacity (default model config)\n"
                  "  --stage-devices L   explicit runtime ordinals, e.g. 0,1\n"
+                 "  --stage-layers L    explicit layer counts per stage, e.g. 18,18,12 (default: the even split)\n"
                  "  --pool-workers N    CPU expert workers per stage (default 0: automatic)\n"
                  "  --stop-eos          stop after an EOS token\n"
                  "  --eos ID            add an EOS token and enable stopping\n"
@@ -166,6 +167,7 @@ int exl3_flash_main(int argc, char** argv) {
 
     std::vector<int32_t> prompt;
     std::vector<int> stage_devices;
+    std::vector<int64_t> stage_layers;
     std::vector<int32_t> eos = config_eos;
     std::string metadata_gguf, dump_path;
     int64_t max_new = 16, context = 0;
@@ -220,6 +222,14 @@ int exl3_flash_main(int argc, char** argv) {
                 std::fprintf(stderr, "strata exl3-flash: --stage-devices must be a nonempty ordinal list\n");
                 return 2;
             }
+        } else if (argument == "--stage-layers") {
+            std::vector<int32_t> counts;
+            if (!parse_ids(next("--stage-layers"), counts)) {
+                std::fprintf(stderr, "strata exl3-flash: --stage-layers must be a nonempty layer count list\n");
+                return 2;
+            }
+            stage_layers.clear();
+            for (const int32_t count : counts) stage_layers.push_back(count);
         } else if (argument == "--pool-workers") {
             int64_t value = 0;
             if (!parse_i64(next("--pool-workers"), value) || value < 0 ||
@@ -313,6 +323,7 @@ int exl3_flash_main(int argc, char** argv) {
     strata::core::Exl3FlashModel model;
     strata::core::Exl3FlashModelOptions options;
     options.stage_devices = stage_devices;
+    options.stage_layers = stage_layers;
     options.pool_workers = pool_workers;
     options.max_cells = context;
     options.include_mtp = false;

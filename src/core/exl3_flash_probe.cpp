@@ -37,7 +37,7 @@ bool ids(const std::string& text, std::vector<int32_t>& result) {
 
 void usage() {
     std::cerr << "usage: exl3_flash_probe --exl3 DIR --tokens IDS [--stage-devices IDS] "
-                 "[--max-new N] [--max-context N] [--require-resident] [--dump-logits PATH]\n"
+                 "[--stage-layers COUNTS] [--max-new N] [--max-context N] [--require-resident] [--dump-logits PATH]\n"
                  "Diagnostic full-layer AR execution; its logit copies are not a speed benchmark.\n";
 }
 
@@ -62,6 +62,10 @@ int main(int argc, char** argv) {
             std::vector<int32_t> devices;
             if (!options.stage_devices.empty() || !ids(value, devices)) { usage(); return 2; }
             options.stage_devices.assign(devices.begin(), devices.end());
+        } else if (arg == "--stage-layers") {
+            std::vector<int32_t> counts;
+            if (!options.stage_layers.empty() || !ids(value, counts)) { usage(); return 2; }
+            options.stage_layers.assign(counts.begin(), counts.end());
         } else if (arg == "--max-new") {
             if (!number(value, max_new) || max_new < 1) { usage(); return 2; }
         } else if (arg == "--max-context") {

@@ -43,6 +43,7 @@ class NativeEmbed;
 /// are rejected by open() until their callers register those contracts.
 struct Exl3FlashModelOptions {
     std::vector<int> stage_devices;       ///< explicit runtime ordinals, one per layer stage
+    std::vector<int64_t> stage_layers;    ///< explicit layer counts per stage, e.g. 18,18,12; empty: the even split
     int pool_workers = 0;                 ///< workers per stage; 0 preserves the automatic physical-core default
     int64_t max_rows = 1;                 ///< persistent projection/expert row capacity
     int64_t max_cells = 0;                ///< 0: config.max_position_embeddings
@@ -80,6 +81,15 @@ struct Exl3FlashStageRange {
 /// same for every layer count and stage count, and it is the only place the split is written down.
 Exl3FlashStageRange exl3_flash_stage_range(int64_t layer_count, int64_t stage_count, int64_t stage_index);
 
+/// The stage ranges of one split: every stage's layers, contiguous and in order.
+///
+/// `counts` gives each stage its layer count (`--stage-layers 18,18,12`); empty takes the even
+/// split of `exl3_flash_stage_range`.  A split where a stage gets no layer, or where the counts do
+/// not cover the model's layers exactly, is refused with the reason in `err`, because the stage
+/// that holds a layer decides where that layer's state lives and the last stage holds the head.
+bool exl3_flash_stage_ranges(int64_t layer_count, int64_t stage_count, const std::vector<int64_t>& counts,
+                             std::vector<Exl3FlashStageRange>& ranges, std::string& err);
+
 /// The stage that runs the PLE layer: the PLE's HOME STAGE.
 ///
 /// The PLE block belongs to one layer, and the layer split gives that layer to exactly one stage.
@@ -87,6 +97,8 @@ Exl3FlashStageRange exl3_flash_stage_range(int64_t layer_count, int64_t stage_co
 /// gathered row, the preprojection destinations, the scratch and the conv history - and it reads
 /// the n-gram rows there, so the PLE never crosses a stage boundary.  The other stages do not
 /// touch the PLE at all.  -1 when no stage holds the layer.
+int64_t exl3_flash_ple_stage(const std::vector<Exl3FlashStageRange>& ranges);
+/// The same for the even split of `exl3_flash_stage_range`.
 int64_t exl3_flash_ple_stage(int64_t layer_count, int64_t stage_count);
 
 /// Owns the explicit EXL3 archive-to-runtime bridge for Flash AR execution.  It validates typed geometry and canonical mapping, attaches

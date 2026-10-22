@@ -200,6 +200,7 @@ FP32 logits と manifest を保存する。`--exl3 DIR --metadata-gguf GGUF` ま
 Qwen3.8 の `--exl3 DIR` は archive の HF config から直接起動し、metadata GGUF を必要としない。
 `--metadata-gguf` を指定した場合は EOS metadata の取得に使う。`--tokens` または `--tokens-file` で
 入力 ID を渡し、`--stage-devices` で層分割する device ordinal を選べる。
+`--stage-layers` で各 stage の層数（例 `18,18,12`）を指定でき、既定は均等な分割である。
 `--pool-workers N` は stage ごとの CPU worker 数を指定する。既定の0は物理 core に基づく自動設定で、
 最適な値は実モデルで測定する。
 
@@ -257,14 +258,28 @@ cache を入れると logit の最大絶対差は 1.4e-4（相対 1e-5、greedy 
 
 EXL3 Flash の層は `--stage-devices` で指定した device に分割される。指定がなければ、engine が
 使える GPU の数だけ stage を作り、層は `layer_count * stage / stage_count` で切られるので、
-どの stage も 1 層以上を持つ。stage ごとに device、session arena、dense weight、expert
-runtime、device cache が別々のものになる。
+どの stage も 1 層以上を持つ。`--stage-layers 18,18,12` で各 stage の層数を明示的に指定できる
+（stage 数と device のリストは `--stage-devices` のまま）。指定は stage 数と層数の合計で検証され、
+1 stage も層を持たないか、合計がモデルの層数と合わないときは、理由を出して起動を止める。
+出力 head を持つ最後の stage の層を減らすと、その card に device cache 用の VRAM が多く残る。
+stage ごとに device、session arena、dense weight、expert runtime、device cache が別々のものになる。
 
 **stage 境界をまたぐのは residual だけである。** 前の stage の residual（`hc * n_embd` 個の
-float）は host の bridge buffer を経由して次の stage の session へ copy される。device ごとに
-address space が別なので、ほかの状態を device 間で持ち回ることはできない。session arena
-（GDN state、QSA の KV cache、PLE の conv history）、dense weight、expert runtime、device
-cache、embedding は、それぞれが属する stage の device 上にある。
+float）は次の stage の session へ copy される。copy は device 間の直接 copy が1回である:
+2 台の device の memory の間を runtime が直接 copy できるときはその経路を使い、できないときは
+これまで通り host の bridge buffer を経由する。どちらになるかは起動時に小さな copy を実際に流して
+確かめて決め、採った経路を起動時に報告する。device ごとに address space が別なので、
+ほかの状態を device 間で持ち回ることはできない。session arena（GDN state、QSA の KV cache、
+PLE の conv history）、dense weight、expert runtime、device cache、embedding は、それぞれが属する
+stage の device 上にある。
+
+**host が待つのはデータがまたぐところだけである。** forward は各 stage の仕事を順に発行して
+進み、host が待つのは (1) 各層の doorbell（pre graph が expert の入力を publish するところ。
+鐘を鳴らすのを見て待つので、expert の CPU 側の仕事は graph の終わりを待たずに始まる）、
+(2) expert の merge の device-to-host copy、(3) stage 境界の residual の受け渡し、(4) 最後の
+logits の copy、の4か所だけである。residual の copy は前の stage の最後の post graph の直後に
+queue へ積まれ、次の stage はその完了を1回だけ待って自分の最初の pre graph を積む。post graph の
+後では待たないので、1 層の終わりから次の層の始めまでの host の手間は queue の順序にしか残らない。
 
 **PLE は stage 境界をまたがない。** PLE の block は層 1 のもので、層分割はその層をちょうど
 1 つの stage に与える。その stage（PLE の home stage）が PLE の device 側の半分を持つ: key と
@@ -304,12 +319,31 @@ device cache ありの 1 stage と 2 stage の値は一致しない: cache が�
 logits は単一 stage の参照と bit 一致し、device cache ありでも greedy token は変わらない。
 常駐 expert は 3 枚で 3563 + 3602 + 3355 = 10520（1 枚では 1848）になる。
 
-**速さは現状 1 stage のほうが速い**（8 GiB の上限で 11.45 対 9.62 tok/s、上限なしで
-8.32 tok/s）。expert 側の CPU の仕事は想定通り減る（上限なしでは expert_prep が 4.4 ms まで
-下がる）が、`pre` が 26 ms から 53〜70 ms に増える。26 ms に stage 境界 2 つ分の約 14 ms を
-足すと説明が付く。残差は 32 KiB と小さいので、時間を占めるのは copy ではなく stage を
-切り替えるときの同期と起動の並びである。stage ごとの pool worker を割っても速くならない。
-効くのは stage を重ねて residual の受け渡しを前に隠すか、host を経由せず装置間で渡すこと。
+**速さ**（Qwen3.8 Flash EXL3 3.05 bpw、48 層、V620 0000:03:00.0 と 0000:43:00.0、R9700
+0000:07:00.0、プロンプト 16,10,16,28 からの decode 7 トークンの中央値、`STRATA_EXL3_FLASH_TIMING=1`、
+他に GPU を使うジョブがないとき。tok/s はその中央値からの逆数）:
+
+| 条件 | 受け渡しを直す前 | 現在 |
+| --- | ---: | ---: |
+| 1 GPU（V620、VRAM 上限 8 GiB） | 87.9 ms（11.4 tok/s） | 85.1 ms（11.8 tok/s） |
+| 1 GPU（上限なし） | 70.3 ms（14.2 tok/s） | 70.2 ms（14.2 tok/s） |
+| 2 GPU（24/24、上限 8 GiB） | 111.0 ms（9.0 tok/s） | 100.6 ms（9.9 tok/s） |
+| 2 GPU（上限なし） | 88.6 ms（11.3 tok/s） | 85.6 ms（11.7 tok/s） |
+| 3 GPU（16/16/16、上限 8 GiB） | 105.4 ms（9.5 tok/s） | 97.1 ms（10.3 tok/s）† |
+| 3 GPU（上限なし） | 83.0 ms（12.0 tok/s） | 80.3 ms（12.5 tok/s） |
+| 3 GPU（上限 8 GiB、`--stage-layers 18,18,12`） | — | 101.3 ms（9.9 tok/s） |
+
+† 測定中に別のプロセスが CPU を使う spike が2 トークン（167 と 183 ms）混ざった。それを除いた
+中央値。除かない中央値は 110.2 ms。
+
+phase の内訳で目につくのは `post` の待ちが消えたことと、`bridge`（residual の受け渡し）が
+0〜0.5 ms だけ残ったことである: `post` は 6〜8 ms が 0.3〜0.7 ms になる。pre graph は doorbell の
+鐘で待つので、expert の CPU 側の仕事が graph の残りと並んで走り、層の終わりから次の層の始めまでの
+同期も消える。それでも複数 GPU では各層に約 0.2 ms ずつ（48 層で約 10 ms）と、stage の最初の
+pre graph に 2.5〜4.2 ms が残る。上限なしでは常駐 expert が3枚で多くなる分、expert の CPU 側の
+仕事が 4.5 ms まで下がり（1 枚では 15.7 ms）、3 GPU が 1 GPU に迫る。`--stage-layers 18,18,12` は
+最後の stage（head を持つ card）の層を減らすので、その card の device cache は層あたり0〜295 expert
+を載せる（均等分割では 0〜210）。
 
 Windows での実行は確かめていない。
 
