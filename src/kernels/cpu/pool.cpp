@@ -283,6 +283,61 @@ exl3::Status validate_pool_exl3_job(const ExpertJobExl3& job, int64_t max_rows, 
         return exl3::Status::size_overflow;
     return exl3::Status::ok;
 }
+
+// THE K SPLIT.  A phase of the packed EXL3 path has one task per 128-output
+// block, so a batch of a few experts gives the pool fewer tasks than it has
+// workers and the workers wait.  Cutting the K range of the dot gives the
+// phase more tasks: each task walks a range of the K tiles and leaves its
+// integer partial sums behind, and the task that finishes the block's last
+// range adds them up and applies the block's transform.
+//
+// The sums are exact integers and the transform is applied once, after the
+// addition, so the values do not depend on how many ranges the K was cut
+// into: the split path and the whole-K path produce the same bits.
+
+// The smallest K range a task may get, in 16-wide tiles.
+constexpr int64_t kSplitMinTiles = 2;
+// The most K ranges a block may be cut into.  The bound keeps the partial
+// sums of the prepared workspace small enough to live beside the other
+// buffers of the pool.
+constexpr int64_t kSplitMaxChunks = 8;
+
+// The number of K ranges a phase is cut into.  `base_tasks` is the phase's
+// task count without the cut, `k_tiles` the number of 16-wide tiles of the
+// matrix's K, and `forced` the caller's wish: 0 chooses the count from the
+// worker count, a positive number is that count, and a negative number keeps
+// the whole K in one task.
+//
+// The count the engine chooses is the one that fits the phase's tasks into
+// one round of the workers: a phase with fewer tasks than workers leaves
+// workers idle, and cutting its K fills them.  A phase that already has the
+// workers' worth of tasks is left alone: cutting it would not shorten the
+// round, and the ranges' shorter memory runs and the extra tasks cost more
+// than they save.
+int split_chunks(int64_t base_tasks, int64_t workers, int64_t k_tiles, int64_t forced) {
+    if (base_tasks <= 0 || k_tiles <= 0) return 1;
+    int64_t chunks = forced < 0 ? 1
+                                 : (forced > 0 ? forced : workers / base_tasks);
+    const int64_t cap = (std::max)(int64_t{1}, k_tiles / kSplitMinTiles);
+    if (chunks > cap) chunks = cap;
+    const int64_t bound = ExpertPool::kMaxTasks / base_tasks;
+    if (chunks > bound) chunks = bound;
+    if (chunks < 1) chunks = 1;
+    return static_cast<int>(chunks);
+}
+
+// STRATA_EXL3_CPU_K_SPLIT: the number of K ranges the dot of a block is cut
+// into.  Unset (or 0) chooses the count from the worker count and the batch,
+// a positive number is that count, and a negative number keeps the whole K
+// in one task, which is the path before the split existed.
+int row_k_split_setting() {
+    static const int value = [] {
+        const char* text = std::getenv("STRATA_EXL3_CPU_K_SPLIT");
+        if (text == nullptr || text[0] == '\0') return 0;
+        return std::atoi(text);
+    }();
+    return value;
+}
 }  // namespace
 
 void ExpertPool::diag(std::FILE* f) const {
@@ -555,6 +610,57 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                         j.y + static_cast<size_t>(task.row) * static_cast<size_t>(j.ldy),
                         linear_scratch);
                     break;
+                case Exl3RowTask::Kind::gate_block_chunk:
+                case Exl3RowTask::Kind::up_block_chunk:
+                case Exl3RowTask::Kind::down_block_chunk: {
+                    const bool down = task.kind == Exl3RowTask::Kind::down_block_chunk;
+                    const bool up = task.kind == Exl3RowTask::Kind::up_block_chunk;
+                    const auto& matrix = down ? j.view.down.packed_matrix()
+                                              : (up ? j.view.up.packed_matrix() : j.view.gate.packed_matrix());
+                    const auto& prepared = down ? exl3_rows_.mul1_down[row_slot]
+                                                : (up ? exl3_rows_.mul1_up[row_slot] : exl3_rows_.mul1_gate[row_slot]);
+                    const int chunks = down ? exl3_row_chunks_down_ : exl3_row_chunks_gu_;
+                    const int64_t blocks = down ? exl3_row_blocks_down_ : exl3_row_blocks_gu_;
+                    const int64_t k_tiles = matrix.k / 16;
+                    const size_t k_begin = static_cast<size_t>(k_tiles * task.chunk / chunks);
+                    const size_t k_end = static_cast<size_t>(k_tiles * (task.chunk + 1) / chunks);
+                    const size_t cell = row_slot * static_cast<size_t>(blocks) + task.block;
+                    const size_t block_at = cell * static_cast<size_t>(chunks) * 128;
+                    int32_t* const partials = (down ? exl3_rows_.partial_down.data()
+                                                    : (up ? exl3_rows_.partial_up.data() : exl3_rows_.partial_gate.data())) +
+                                              block_at;
+                    status = exl3::linear_mul1_accumulate_range(matrix, prepared,
+                                                                static_cast<size_t>(task.block) * 8, 8, k_begin,
+                                                                k_end - k_begin,
+                                                                partials + static_cast<size_t>(task.chunk) * 128);
+                    if (status == exl3::Status::ok) {
+                        // The task that finishes the block's last range adds the
+                        // block's sums up and applies the block's transform.
+                        // The counter's release carries the sums of the other
+                        // ranges to it.
+                        auto& counts = down ? exl3_rows_.count_down
+                                            : (up ? exl3_rows_.count_up : exl3_rows_.count_gate);
+                        if (counts[cell].value.fetch_add(1, std::memory_order_acq_rel) == chunks - 1) {
+                            exl3::Mul1Input combined = prepared;
+                            combined.partials = partials;
+                            combined.partial_count = chunks;
+                            combined.partial_stride = 128;
+                            combined.partial_first_tile = static_cast<size_t>(task.block) * 8;
+                            combined.partial_tiles = 8;
+                            linear_scratch.mul1_prepared = &combined;
+                            const float* const input = down ? exl3_rows_.input_down.data() + ff_offset
+                                                           : (up ? exl3_rows_.input_up.data() + hidden_offset
+                                                                 : exl3_rows_.input_gate.data() + hidden_offset);
+                            float* const out = down ? j.y + static_cast<size_t>(task.row) * static_cast<size_t>(j.ldy)
+                                                    : (up ? exl3_rows_.up.data() + ff_offset
+                                                          : exl3_rows_.gate.data() + ff_offset);
+                            status = exl3::linear_output_block(matrix, input,
+                                                              static_cast<int64_t>(task.block) * 128, out,
+                                                              linear_scratch);
+                        }
+                    }
+                    break;
+                }
             }
             if (status != exl3::Status::ok) {
                 int expected = static_cast<int>(exl3::Status::ok);
@@ -854,6 +960,28 @@ exl3::Status ExpertPool::prepare_exl3_rowparallel(int64_t max_rows, int64_t max_
         !mul_u64(hidden_values, 2u, hidden_twice) || !mul_u64(ff_values, 3u, ff_triple) ||
         !fits(hidden_values) || !fits(ff_values) || !fits(hidden_twice) || !fits(ff_triple))
         return exl3::Status::size_overflow;
+    // The K split's partial sums and the counters that name the task which
+    // adds a block's sums up.  A block's sums are one 128-output block's
+    // worth of integers per K range, so the workspace holds the prepared
+    // rows' blocks times the most ranges a block may be cut into.
+    const uint64_t gu_chunks = (std::max)(
+        uint64_t{1}, (std::min)(static_cast<uint64_t>(kSplitMaxChunks),
+                                (static_cast<uint64_t>(max_hidden) / 16u) / static_cast<uint64_t>(kSplitMinTiles)));
+    const uint64_t down_chunks = (std::max)(
+        uint64_t{1}, (std::min)(static_cast<uint64_t>(kSplitMaxChunks),
+                                (static_cast<uint64_t>(max_ff) / 16u) / static_cast<uint64_t>(kSplitMinTiles)));
+    auto partial_values = [&](uint64_t blocks, uint64_t chunks) -> uint64_t {
+        uint64_t values = 0;
+        if (!mul_u64(rows_jobs, blocks, values)) return UINT64_MAX;
+        if (!mul_u64(values, chunks, values)) return UINT64_MAX;
+        if (!mul_u64(values, 128u, values)) return UINT64_MAX;
+        return values;
+    };
+    const uint64_t gate_partials = partial_values(blocks_ff, gu_chunks),
+                   up_partials = gate_partials, down_partials = partial_values(blocks_hidden, down_chunks);
+    if (gate_partials == UINT64_MAX || down_partials == UINT64_MAX || !fits(gate_partials) ||
+        !fits(down_partials))
+        return exl3::Status::size_overflow;
     const exl3::Status base = prepare_exl3(max_rows, max_hidden, max_ff);
     if (base != exl3::Status::ok) return base;
     try {
@@ -870,13 +998,26 @@ exl3::Status ExpertPool::prepare_exl3_rowparallel(int64_t max_rows, int64_t max_
             prepared.quant_gate.resize(static_cast<size_t>(hidden_values));
             prepared.quant_up.resize(static_cast<size_t>(hidden_values));
             prepared.quant_down.resize(static_cast<size_t>(ff_values));
+            prepared.partial_gate.resize(static_cast<size_t>(gate_partials));
+            prepared.partial_up.resize(static_cast<size_t>(up_partials));
+            prepared.partial_down.resize(static_cast<size_t>(down_partials));
+            prepared.count_gate = std::make_unique<Exl3RowWorkspace::CountCell[]>(
+                static_cast<size_t>(rows_jobs * blocks_ff));
+            prepared.count_up = std::make_unique<Exl3RowWorkspace::CountCell[]>(
+                static_cast<size_t>(rows_jobs * blocks_ff));
+            prepared.count_down = std::make_unique<Exl3RowWorkspace::CountCell[]>(
+                static_cast<size_t>(rows_jobs * blocks_hidden));
         }
-        prepared.tasks.resize(static_cast<size_t>(phase_tasks_max));
+        prepared.tasks.resize(static_cast<size_t>(kMaxTasks));
         exl3_rows_ = std::move(prepared);
         exl3_row_max_rows_ = max_rows;
         exl3_row_max_jobs_ = max_jobs;
         exl3_row_max_hidden_ = max_hidden;
         exl3_row_max_ff_ = max_ff;
+        exl3_row_blocks_gu_ = blocks_ff;
+        exl3_row_blocks_down_ = blocks_hidden;
+        exl3_row_max_chunks_gu_ = static_cast<int>(gu_chunks);
+        exl3_row_max_chunks_down_ = static_cast<int>(down_chunks);
         return exl3::Status::ok;
     } catch (const std::bad_alloc&) {
         return exl3::Status::scratch_too_small;
@@ -885,7 +1026,7 @@ exl3::Status ExpertPool::prepare_exl3_rowparallel(int64_t max_rows, int64_t max_
     }
 }
 
-exl3::Status ExpertPool::run_exl3_rowparallel(ExpertJobExl3* jobs, int n) {
+exl3::Status ExpertPool::run_exl3_rowparallel(ExpertJobExl3* jobs, int n, int k_split) {
     if (n <= 0) return exl3::Status::ok;
     if (jobs == nullptr || n > exl3_row_max_jobs_) return exl3::Status::invalid_argument;
     auto* profile = strata::core::detail::exl3_prepare_detail();
@@ -918,6 +1059,25 @@ exl3::Status ExpertPool::run_exl3_rowparallel(ExpertJobExl3* jobs, int n) {
             !add_u64(down_tasks, job_down, down_tasks))
             return exl3::Status::size_overflow;
     }
+    // THE K SPLIT.  The gate/up phase and the down phase get one task per
+    // 128-output block, so a batch of a few experts leaves most of the pool's
+    // workers without work.  The dot of a block is cut into ranges of the K,
+    // which gives the phase more tasks; the ranges' integer sums are added up
+    // by the task that finishes the block's last range, so the values do not
+    // depend on the cut.
+    const int64_t workers = n_ + (host_works_ ? 1 : 0);
+    const int64_t k_tiles_gu = jobs[0].view.gate.k / 16;
+    const int64_t k_tiles_down = jobs[0].view.down.k / 16;
+    const int64_t forced = k_split != 0 ? k_split : row_k_split_setting();
+    int chunks_gu = split_chunks(static_cast<int64_t>(gu_tasks), workers, k_tiles_gu, forced);
+    int chunks_down = split_chunks(static_cast<int64_t>(down_tasks), workers, k_tiles_down, forced);
+    if (chunks_gu > exl3_row_max_chunks_gu_) chunks_gu = exl3_row_max_chunks_gu_;
+    if (chunks_down > exl3_row_max_chunks_down_) chunks_down = exl3_row_max_chunks_down_;
+    exl3_row_chunks_gu_ = chunks_gu;
+    exl3_row_chunks_down_ = chunks_down;
+    if (!mul_u64(gu_tasks, static_cast<uint64_t>(chunks_gu), gu_tasks) ||
+        !mul_u64(down_tasks, static_cast<uint64_t>(chunks_down), down_tasks))
+        return exl3::Status::size_overflow;
     const uint64_t phase_max = (std::max)({input_tasks, gu_tasks, middle_tasks, down_tasks});
     if (phase_max == 0 || phase_max > kMaxTasks || phase_max > exl3_rows_.tasks.capacity())
         return exl3::Status::unsupported_layout;
@@ -933,26 +1093,71 @@ exl3::Status ExpertPool::run_exl3_rowparallel(ExpertJobExl3* jobs, int n) {
         profile->initial_park_ns += strata::core::detail::exl3_detail_ns(park_begin, Clock::now());
     exl3_row_jobs_ = jobs;
     exl3_error_.store(static_cast<int>(exl3::Status::ok), std::memory_order_release);
+    // Whether the row's dot may be cut: the integer path has to read the
+    // projection, and the row's quantized input has to be ready.
+    const auto row_split_ready = [&](const ExpertJobExl3& job, int job_index, int64_t row, bool down) {
+        const size_t row_slot = static_cast<size_t>(job_index) * static_cast<size_t>(exl3_row_max_rows_) +
+                                static_cast<size_t>(row);
+        if (down)
+            return exl3_rows_.mul1_down[row_slot].ready && exl3::linear_mul1_supported(job.view.down.packed_matrix());
+        return exl3_rows_.mul1_gate[row_slot].ready && exl3_rows_.mul1_up[row_slot].ready &&
+               exl3::linear_mul1_supported(job.view.gate.packed_matrix()) &&
+               exl3::linear_mul1_supported(job.view.up.packed_matrix());
+    };
     auto run_tasks = [&](Exl3RowTask::Kind kind, int mode) {
         const auto build_begin = profile != nullptr ? Clock::now() : Clock::time_point{};
         exl3_rows_.tasks.clear();
         for (int job_index = 0; job_index < n; ++job_index) {
             const ExpertJobExl3& job = jobs[job_index];
-            const uint64_t blocks = kind == Exl3RowTask::Kind::down_block
-                                        ? (static_cast<uint64_t>(job.view.down.n) + 127u) / 128u
-                                        : (static_cast<uint64_t>(job.view.gate.n) + 127u) / 128u;
+            const bool down = kind == Exl3RowTask::Kind::down_block;
+            const uint64_t blocks = down ? (static_cast<uint64_t>(job.view.down.n) + 127u) / 128u
+                                         : (static_cast<uint64_t>(job.view.gate.n) + 127u) / 128u;
+            const int chunks = down ? chunks_down : chunks_gu;
+            const int64_t layout_blocks = down ? exl3_row_blocks_down_ : exl3_row_blocks_gu_;
             for (int64_t row = 0; row < job.rows; ++row) {
+                const size_t row_slot = static_cast<size_t>(job_index) * static_cast<size_t>(exl3_row_max_rows_) +
+                                        static_cast<size_t>(row);
                 if (kind == Exl3RowTask::Kind::input_gate_up || kind == Exl3RowTask::Kind::silu_down_input) {
                     exl3_rows_.tasks.push_back(
-                        Exl3RowTask{kind, static_cast<uint16_t>(job_index), static_cast<uint16_t>(row), 0});
+                        Exl3RowTask{kind, static_cast<uint16_t>(job_index), static_cast<uint16_t>(row), 0, 0});
                 } else {
+                    const bool split = chunks > 1 && row_split_ready(job, job_index, row, down);
                     for (uint64_t block = 0; block < blocks; ++block) {
-                        exl3_rows_.tasks.push_back(Exl3RowTask{kind, static_cast<uint16_t>(job_index),
-                                                              static_cast<uint16_t>(row), static_cast<uint16_t>(block)});
-                        if (kind == Exl3RowTask::Kind::gate_block)
-                            exl3_rows_.tasks.push_back(Exl3RowTask{Exl3RowTask::Kind::up_block,
-                                                                  static_cast<uint16_t>(job_index),
-                                                                  static_cast<uint16_t>(row), static_cast<uint16_t>(block)});
+                        if (!split) {
+                            exl3_rows_.tasks.push_back(Exl3RowTask{kind, static_cast<uint16_t>(job_index),
+                                                                      static_cast<uint16_t>(row),
+                                                                      static_cast<uint16_t>(block), 0});
+                            if (kind == Exl3RowTask::Kind::gate_block)
+                                exl3_rows_.tasks.push_back(Exl3RowTask{Exl3RowTask::Kind::up_block,
+                                                                          static_cast<uint16_t>(job_index),
+                                                                          static_cast<uint16_t>(row),
+                                                                          static_cast<uint16_t>(block), 0});
+                            continue;
+                        }
+                        // The counters of the phase name the task that adds a
+                        // block's sums up; they start the phase at zero.
+                        const size_t cell = row_slot * static_cast<size_t>(layout_blocks) + block;
+                        if (down) exl3_rows_.count_down[cell].value.store(0, std::memory_order_relaxed);
+                        else {
+                            exl3_rows_.count_gate[cell].value.store(0, std::memory_order_relaxed);
+                            exl3_rows_.count_up[cell].value.store(0, std::memory_order_relaxed);
+                        }
+                        for (int chunk = 0; chunk < chunks; ++chunk) {
+                            const Exl3RowTask::Kind chunk_kind =
+                                down ? Exl3RowTask::Kind::down_block_chunk
+                                     : (kind == Exl3RowTask::Kind::gate_block ? Exl3RowTask::Kind::gate_block_chunk
+                                                                            : Exl3RowTask::Kind::up_block_chunk);
+                            exl3_rows_.tasks.push_back(Exl3RowTask{chunk_kind, static_cast<uint16_t>(job_index),
+                                                                      static_cast<uint16_t>(row),
+                                                                      static_cast<uint16_t>(block),
+                                                                      static_cast<uint16_t>(chunk)});
+                            if (kind == Exl3RowTask::Kind::gate_block)
+                                exl3_rows_.tasks.push_back(Exl3RowTask{Exl3RowTask::Kind::up_block_chunk,
+                                                                          static_cast<uint16_t>(job_index),
+                                                                          static_cast<uint16_t>(row),
+                                                                          static_cast<uint16_t>(block),
+                                                                          static_cast<uint16_t>(chunk)});
+                        }
                     }
                 }
             }

@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <vector>
@@ -20,13 +21,13 @@ struct Matrix {
     std::vector<uint16_t> trellis, suh, svh, bias;
     strata::kernels::exl3::MatrixView view{};
 
-    Matrix(int64_t k, int64_t n, int bits, uint16_t seed) {
+    Matrix(int64_t k, int64_t n, int bits, uint16_t seed, int codebook = 0) {
         trellis.resize(static_cast<size_t>(k / 16) * static_cast<size_t>(n / 16) * static_cast<size_t>(16 * bits));
         for (size_t i = 0; i < trellis.size(); ++i) trellis[i] = static_cast<uint16_t>(seed + i * 37);
         suh.assign(static_cast<size_t>(k), 0x3c00);
         svh.assign(static_cast<size_t>(n), 0x3c00);
         bias.assign(static_cast<size_t>(n), 0);
-        view = {trellis.data(), suh.data(), svh.data(), bias.data(), k, n, bits, 0};
+        view = {trellis.data(), suh.data(), svh.data(), bias.data(), k, n, bits, codebook};
     }
 };
 
@@ -34,9 +35,11 @@ struct Expert {
     Matrix gate, up, down;
     cpu::ExpertView view;
 
-    Expert(int64_t hidden, int64_t ff, int gate_bits, int up_bits, int down_bits, uint16_t seed)
-        : gate(hidden, ff, gate_bits, seed), up(hidden, ff, up_bits, static_cast<uint16_t>(seed + 1000)),
-          down(ff, hidden, down_bits, static_cast<uint16_t>(seed + 2000)),
+    Expert(int64_t hidden, int64_t ff, int gate_bits, int up_bits, int down_bits, uint16_t seed,
+           int codebook = 0)
+        : gate(hidden, ff, gate_bits, seed, codebook), up(hidden, ff, up_bits, static_cast<uint16_t>(seed + 1000),
+                                                           codebook),
+          down(ff, hidden, down_bits, static_cast<uint16_t>(seed + 2000), codebook),
           view{strata::kernels::exl3::ProjectionView(gate.view), strata::kernels::exl3::ProjectionView(up.view),
                strata::kernels::exl3::ProjectionView(down.view)} {}
 };
@@ -77,6 +80,10 @@ void fill_input(std::vector<float>& values, int seed) {
 
 int main() {
     std::printf("exl3_pool_test\n");
+    // The integer dot path is opt-in through the environment, and it reads it
+    // once: the switch has to be set before the first call.
+    ::setenv("STRATA_EXL3_CPU_INTDOT", "1", 1);
+    const bool intdot = exl3::mul1_intdot_enabled();
     // The two experts deliberately reverse the hidden/intermediate geometry:
     // one has FF > H and the other H > FF. Each projection has its own K.
     Expert wide(128, 256, 2, 3, 5, 11);
@@ -164,6 +171,41 @@ int main() {
     if (mixed_pool.run_exl3(&mixed_job, 1) != exl3::Status::ok ||
         std::memcmp(mixed_expected.data(), mixed_actual.data(), mixed_expected.size() * sizeof(float)) != 0)
         ++failures;
+    // THE K SPLIT.  The dot of a 128-output block cut into ranges of the K
+    // gives the same values as the whole K in one task: the ranges' sums are
+    // exact integers and the block's transform is applied once, after they
+    // are added up.  A codebook 2 expert is what the integer path reads, so
+    // this is the path the split changes.
+    {
+        Expert cb2(256, 512, 2, 2, 2, 313, 2);
+        const int64_t rows = 2, ldx = 260, ldy = 264;
+        std::vector<float> x(static_cast<size_t>(rows * ldx));
+        std::vector<float> expected(static_cast<size_t>(rows * ldy), -1234.0f);
+        std::vector<float> actual(expected.size(), -1234.0f);
+        fill_input(x, 5);
+        cpu::ExpertJobExl3 cb2_job{cb2.view, rows, x.data(), ldx, actual.data(), ldy, 7};
+        // The whole K in one task is the reference: the split has to give the
+        // same bits.
+        cpu::ExpertPool pool(4, false, true);
+        if (pool.prepare_exl3_rowparallel(rows, 1, 256, 512) != exl3::Status::ok) ++failures;
+        if (pool.run_exl3_rowparallel(&cb2_job, 1, 1) != exl3::Status::ok) ++failures;
+        if (pool.last_row_chunks() != 1) ++failures;
+        expected = actual;
+        int split_runs = 0;
+        for (int split : {2, 4, 8}) {
+            std::fill(actual.begin(), actual.end(), -1234.0f);
+            if (pool.run_exl3_rowparallel(&cb2_job, 1, split) != exl3::Status::ok) ++failures;
+            if (pool.last_row_chunks() != split) ++failures;
+            if (split > 1) ++split_runs;
+            if (std::memcmp(expected.data(), actual.data(), expected.size() * sizeof(float)) != 0) ++failures;
+        }
+        // Without the integer path the split does not run, and the values are
+        // the exact path's: the test then says so instead of pretending.
+        if (intdot && split_runs != 3) ++failures;
+        std::printf("  codebook 2 K split 2/4/8 ranges against the whole K, rows %lld: %s (integer dot %s)\n",
+                    (long long) rows, failures ? "FAIL" : "OK", intdot ? "on" : "off");
+    }
+
     std::printf("  mixed packed2/F16/BF16 roles through ExpertPool: %s\n", failures ? "FAIL" : "OK");
     std::printf("  mixed expert K=2/3/5, H/FF 128x256 + 256x128, rows 1/4, host drain on/off: %s\n",
                 failures ? "FAIL" : "OK");
