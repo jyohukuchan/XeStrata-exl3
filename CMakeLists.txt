@@ -1096,6 +1096,10 @@ if(STRATA_BUILD_TESTS)
   target_compile_options(exl3_cpu_layout_parity PRIVATE -fno-fast-math -ffp-contract=off)
   add_test(NAME exl3_cpu_layout_parity COMMAND exl3_cpu_layout_parity)
   set_tests_properties(exl3_cpu_layout_parity PROPERTIES TIMEOUT 120)
+  # The same check without the AVX2 kernels: the portable path must give the
+  # same bits as the vector one, so the reference covers both.
+  add_test(NAME exl3_cpu_layout_generic_parity COMMAND exl3_cpu_layout_parity)
+  set_tests_properties(exl3_cpu_layout_generic_parity PROPERTIES ENVIRONMENT "STRATA_NO_EXL3_AVX2=1" TIMEOUT 120)
   add_executable(exl3_cpu_layout_intdot_parity src/kernels/cpu/exl3_layout_parity.cpp)
   target_link_libraries(exl3_cpu_layout_intdot_parity PRIVATE strata_kernels_cpu strata_exl3_expert_artifact
                         strata_warnings)

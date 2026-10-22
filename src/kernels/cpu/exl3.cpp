@@ -7,6 +7,7 @@
 // the implementation here remains portable C++ with an AVX2-safe baseline.
 #include "strata/kernels/cpu/exl3.hpp"
 #include "strata/kernels/cpu/exl3_mul1_intdot.hpp"
+#include "strata/kernels/f16_bits.hpp"
 
 #include <array>
 #include <cmath>
@@ -17,14 +18,19 @@
 
 // Clang also supports per-function targets for the MSVC ABI. Other compilers
 // retain the generic implementation rather than emitting unguarded AVX2.
+// The half conversion and the fused multiply-add need F16C and FMA; the CPU
+// check in `cpu_avx2_ok` asks for both, so a kernel that uses them is only
+// reached on a CPU that has them.
 #if (defined(__x86_64__) || defined(_M_X64)) && (defined(__clang__) || defined(__GNUC__))
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include <immintrin.h>
 #define EXL3_HAVE_TARGET_AVX2 1
 #define EXL3_TARGET_AVX2 __attribute__((target("avx2")))
+#define EXL3_TARGET_AVX2_F16C __attribute__((target("avx2,f16c,fma")))
 #else
 #define EXL3_HAVE_TARGET_AVX2 0
 #define EXL3_TARGET_AVX2
+#define EXL3_TARGET_AVX2_F16C
 #endif
 
 namespace strata::kernels::cpu::exl3 {
@@ -108,37 +114,16 @@ uint16_t f32_to_f16(float value) {
     return static_cast<uint16_t>(sign | (static_cast<uint32_t>(half_exp) << 10) | half_mantissa);
 }
 
-float f16_to_f32(uint16_t value) {
-    const uint32_t sign = static_cast<uint32_t>(value & 0x8000u) << 16;
-    uint32_t exponent = (value >> 10) & 0x1fu;
-    uint32_t mantissa = value & 0x3ffu;
-    uint32_t bits;
-    if (exponent == 0) {
-        if (mantissa == 0) {
-            bits = sign;
-        } else {
-            exponent = 127 - 15 + 1;
-            while ((mantissa & 0x400u) == 0) {
-                mantissa <<= 1;
-                --exponent;
-            }
-            mantissa &= 0x3ffu;
-            bits = sign | (exponent << 23) | (mantissa << 13);
-        }
-    } else if (exponent == 0x1fu) {
-        bits = sign | 0x7f800000u | (mantissa << 13);
-    } else {
-        bits = sign | ((exponent - 15 + 127) << 23) | (mantissa << 13);
-    }
-    float result;
-    std::memcpy(&result, &bits, sizeof(result));
-    return result;
-}
+// The half to float conversion is the shared one (`f32_from_f16` in
+// f16_bits.hpp), so that the CPU and the device read a half the same way and
+// the parity test can cover all 65,536 of them in one place.  It is exact:
+// every half, the subnormals, the zeros, the infinities and the NaNs
+// included, maps to a float that holds it exactly.
 
 float half_add(uint16_t a, uint16_t b) {
     // The volatile temporary prevents a compiler from contracting the
     // operation into an unrelated wider expression before half rounding.
-    volatile float sum = f16_to_f32(a) + f16_to_f32(b);
+    volatile float sum = f32_from_f16(a) + f32_from_f16(b);
     return sum;
 }
 
@@ -167,9 +152,9 @@ uint16_t decode_state_half(uint16_t state, int codebook) {
     const int byte_sum = static_cast<int>(value & 0xffu) + static_cast<int>((value >> 8) & 0xffu) +
                          static_cast<int>((value >> 16) & 0xffu) + static_cast<int>(value >> 24);
     const uint16_t h = static_cast<uint16_t>(0x6400u + byte_sum);
-    const float inv = f16_to_f32(0x1eeeu);
-    const float bias = f16_to_f32(0xc931u);
-    volatile float product = f16_to_f32(h) * inv;
+    const float inv = f32_from_f16(0x1eeeu);
+    const float bias = f32_from_f16(0xc931u);
+    volatile float product = f32_from_f16(h) * inv;
     volatile float result = product + bias;
     return f32_to_f16(result);
 }
@@ -195,69 +180,138 @@ inline uint16_t decode_state_half_lut(uint16_t state, int codebook) {
     return codebook_lut()[static_cast<size_t>(codebook)][state];
 }
 
-using CodebookF32Lut = std::array<std::array<float, 65536>, 3>;
+using CodebookF32Lut = std::array<float, 65536>;
 
 // F32 values are derived from the exact F16 LUT once.  The pointer for the
 // selected codebook is hoisted by linear_with_scratch; no function/static guard
 // remains in the per-weight loop.
-const CodebookF32Lut& codebook_lut_f32() {
-    static const CodebookF32Lut table = [] {
+//
+// The table of a codebook is built the first time that codebook is decoded,
+// so a model that uses one codebook builds one table and not three.
+const CodebookF32Lut& codebook_lut_f32(int codebook) {
+    const auto make = [](int which) {
         CodebookF32Lut result{};
         const auto& half_table = codebook_lut();
-        for (int codebook = 0; codebook < 3; ++codebook)
-            for (uint32_t state = 0; state < 65536; ++state)
-                result[static_cast<size_t>(codebook)][state] =
-                    f16_to_f32(half_table[static_cast<size_t>(codebook)][state]);
+        for (uint32_t state = 0; state < 65536; ++state)
+            result[state] = f32_from_f16(half_table[static_cast<size_t>(which)][state]);
         return result;
-    }();
-    return table;
+    };
+    switch (codebook) {
+        case 0: {
+            static const CodebookF32Lut table = make(0);
+            return table;
+        }
+        case 1: {
+            static const CodebookF32Lut table = make(1);
+            return table;
+        }
+        default: {
+            static const CodebookF32Lut table = make(2);
+            return table;
+        }
+    }
 }
 
 #if EXL3_HAVE_TARGET_AVX2
-// CB2's byte sum has only 1021 possible values.  Keeping the exact final
-// binary16 result here avoids a 65536-entry gather table in the AVX2 path.
-// Four spare entries make the AVX2 32-bit gather at index 1020 in-bounds.
-using Cb2SumHalfLut = std::array<uint16_t, 1024>;
-const Cb2SumHalfLut& cb2_sum_half_lut() {
-    static const Cb2SumHalfLut table = [] {
-        Cb2SumHalfLut result{};
-        const float inv = f16_to_f32(0x1eeeu);
-        const float bias = f16_to_f32(0xc931u);
-        for (int sum = 0; sum <= 1020; ++sum) {
-            const uint16_t h = static_cast<uint16_t>(0x6400u + sum);
-            volatile float product = f16_to_f32(h) * inv;
-            volatile float value = product + bias;
-            result[static_cast<size_t>(sum)] = f32_to_f16(value);
-        }
-        return result;
-    }();
+// The MUL1 codebook's byte sum is the sum of four bytes, so it lies between
+// 0 and 1020, and the AVX2 path computes the value from the sum in arithmetic
+// (see `decode_cb2_8_f32_avx2`), so no table of the sums is needed here.
+#endif
+
+// ---------------------------------------------------------------- the tables
+//
+// A trellis window's place in its tile does not depend on the data: the window
+// of a state sits at a fixed bit offset, so the words it spans and the shift
+// it needs are a property of the bit width alone.  They are therefore built
+// once, when the program starts, and the per-window arithmetic leaves the
+// loop that decodes a tile.
+
+/// The words and the shift of every trellis window of a 16x16 tile.
+template <int Bits>
+struct TileWindows {
+    uint16_t word0[256];  ///< the first word of the window
+    uint16_t word1[256];  ///< the last word of the window
+    uint8_t shift[256];   ///< the window's shift inside the two words
+};
+
+template <int Bits>
+constexpr TileWindows<Bits> make_tile_windows() {
+    TileWindows<Bits> out{};
+    const size_t words = static_cast<size_t>(Bits) * 8;
+    for (int state = 0; state < 256; ++state) {
+        const int b0 = state * Bits + Bits - 16 + 256 * Bits;
+        const int b1 = b0 + 16;
+        const size_t i0 = static_cast<size_t>(b0 >> 5);
+        const size_t i1 = static_cast<size_t>((b1 - 1) >> 5);
+        out.word0[state] = static_cast<uint16_t>(i0 >= words ? i0 - words : i0);
+        out.word1[state] = static_cast<uint16_t>(i1 >= words ? i1 - words : i1);
+        out.shift[state] = static_cast<uint8_t>((i1 + 1) * 32 - b1);
+    }
+    return out;
+}
+
+template <int Bits>
+const TileWindows<Bits>& tile_windows() {
+    static constexpr TileWindows<Bits> table = make_tile_windows<Bits>();
     return table;
 }
 
-#endif
+/// The words and the shifts of the eight states of a group, relative to the
+/// group's first word: the group is read with one sixteen-byte load, and the
+/// table says which of the four words each lane takes.
+template <int Bits>
+struct TileGroups {
+    int32_t relative0[32][8];
+    int32_t relative1[32][8];
+    int32_t shift[32][8];
+    int32_t left_shift[32][8];
+    int32_t word_base[32];
+};
+
+template <int Bits>
+constexpr TileGroups<Bits> make_tile_groups() {
+    TileGroups<Bits> out{};
+    const size_t words = static_cast<size_t>(Bits) * 8;
+    for (int group = 0; group < 32; ++group) {
+        const int state_base = group * 8;
+        const int first_b0 = state_base * Bits + Bits - 16 + 256 * Bits;
+        const size_t first_i0 = static_cast<size_t>(first_b0 >> 5);
+        out.word_base[group] = static_cast<int>(first_i0 >= words ? first_i0 - words : first_i0);
+        for (int lane = 0; lane < 8; ++lane) {
+            const int b0 = (state_base + lane) * Bits + Bits - 16 + 256 * Bits;
+            const int b1 = b0 + 16;
+            const size_t i0 = static_cast<size_t>(b0 >> 5);
+            const size_t i1 = static_cast<size_t>((b1 - 1) >> 5);
+            out.relative0[group][lane] = static_cast<int32_t>(i0 - first_i0);
+            out.relative1[group][lane] = static_cast<int32_t>(i1 - first_i0);
+            out.shift[group][lane] = static_cast<int32_t>((i1 + 1) * 32 - b1);
+            out.left_shift[group][lane] = static_cast<int32_t>(32 - ((i1 + 1) * 32 - b1));
+        }
+    }
+    return out;
+}
+
+template <int Bits>
+const TileGroups<Bits>& tile_groups() {
+    static constexpr TileGroups<Bits> table = make_tile_groups<Bits>();
+    return table;
+}
 
 // Hot linear path: validation and the codebook LUT pointer are already hoisted.
 // This writes only one bounded 16x16 tile in F32; it never materializes W.
 template <int Bits>
 void decode_tile_f32_hot_bits(const MatrixView& matrix, int64_t tile_k, int64_t tile_n, const float* lut,
                               float* values) {
-    constexpr size_t words32_count = static_cast<size_t>(Bits) * 8;
     const int64_t tiles_n = matrix.n / kTileSide;
     const size_t packed_size = static_cast<size_t>(16 * Bits);
     const size_t tile_index = strata::kernels::exl3::trellis_tile_index(matrix.tile_order, tile_k, tile_n,
                                                                          matrix.k / kTileSide, tiles_n);
     const uint16_t* packed = matrix.trellis + tile_index * packed_size;
+    const TileWindows<Bits>& windows = tile_windows<Bits>();
     for (int state = 0; state < kTileValues; ++state) {
-        const int b0 = state * Bits + Bits - 16 + 256 * Bits;
-        const int b1 = b0 + 16;
-        const size_t i0_raw = static_cast<size_t>(b0 >> 5);
-        const size_t i1_raw = static_cast<size_t>((b1 - 1) >> 5);
-        const size_t i0 = i0_raw >= words32_count ? i0_raw - words32_count : i0_raw;
-        const size_t i1 = i1_raw >= words32_count ? i1_raw - words32_count : i1_raw;
-        const int shift = (i1_raw + 1) * 32 - b1;
-        const uint64_t merged = (static_cast<uint64_t>(load_u32(packed, i0)) << 32) |
-                                load_u32(packed, i1);
-        const uint16_t packed_state = static_cast<uint16_t>((merged >> shift) & 0xffffu);
+        const uint64_t merged = (static_cast<uint64_t>(load_u32(packed, windows.word0[state])) << 32) |
+                                load_u32(packed, windows.word1[state]);
+        const uint16_t packed_state = static_cast<uint16_t>((merged >> windows.shift[state]) & 0xffffu);
         values[strata::kernels::exl3::tile_element_for_state(state)] = lut[packed_state];
     }
 }
@@ -291,30 +345,18 @@ void linear_dot_range_f32(const MatrixView& matrix, const float* input_basis, si
 // An eight-state window spans at most four dwords; one unaligned 16-byte
 // load plus a broadcast/vpermd therefore replaces the two packed-word
 // vpgatherdd operations used by the gather prototype.
-EXL3_TARGET_AVX2 void decode_cb2_8_f32_avx2(const uint32_t* staged, size_t words32_count,
-                                            int bits, int state_base, float* values) {
-    int relative0[8];
-    int relative1[8];
-    int shift_right[8];
-    const int first_b0 = state_base * bits + bits - 16 + 256 * bits;
-    const size_t first_i0_raw = static_cast<size_t>(first_b0 >> 5);
-    const int word_base = static_cast<int>(first_i0_raw >= words32_count ? first_i0_raw - words32_count : first_i0_raw);
-    for (int lane = 0; lane < 8; ++lane) {
-        const int state = state_base + lane;
-        const int b0 = state * bits + bits - 16 + 256 * bits;
-        const int b1 = b0 + 16;
-        const size_t i0_raw = static_cast<size_t>(b0 >> 5);
-        const size_t i1_raw = static_cast<size_t>((b1 - 1) >> 5);
-        relative0[lane] = static_cast<int>(i0_raw - first_i0_raw);
-        relative1[lane] = static_cast<int>(i1_raw - first_i0_raw);
-        shift_right[lane] = static_cast<int>((i1_raw + 1) * 32 - b1);
-    }
-
-    const __m256i vrelative0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(relative0));
-    const __m256i vrelative1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(relative1));
-    const __m256i vshift = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(shift_right));
-    const __m256i vleft_shift = _mm256_sub_epi32(_mm256_set1_epi32(32), vshift);
-    const __m128i four_words = _mm_loadu_si128(reinterpret_cast<const __m128i*>(staged + word_base));
+//
+// The words and the shifts of the eight windows come from a table that the bit
+// width alone fixes, so a group costs one load and the shifts, and no
+// arithmetic per window.
+template <int Bits>
+EXL3_TARGET_AVX2_F16C inline __m256 decode_cb2_8_f32_avx2(const uint32_t* staged, const TileGroups<Bits>& groups,
+                                                           int group) {
+    const __m256i vrelative0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(groups.relative0[group]));
+    const __m256i vrelative1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(groups.relative1[group]));
+    const __m256i vshift = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(groups.shift[group]));
+    const __m256i vleft_shift = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(groups.left_shift[group]));
+    const __m128i four_words = _mm_loadu_si128(reinterpret_cast<const __m128i*>(staged + groups.word_base[group]));
     const __m256i broadcast_words = _mm256_broadcastsi128_si256(four_words);
     const __m256i word0 = _mm256_permutevar8x32_epi32(broadcast_words, vrelative0);
     const __m256i word1 = _mm256_permutevar8x32_epi32(broadcast_words, vrelative1);
@@ -325,51 +367,118 @@ EXL3_TARGET_AVX2 void decode_cb2_8_f32_avx2(const uint32_t* staged, size_t words
     const __m256i multiplied = _mm256_mullo_epi32(state, _mm256_set1_epi32(static_cast<int>(kCb2Multiplier)));
     const __m256i byte_pairs = _mm256_maddubs_epi16(multiplied, _mm256_set1_epi8(1));
     const __m256i byte_sum = _mm256_madd_epi16(byte_pairs, _mm256_set1_epi16(1));
-    const __m256i half_words = _mm256_and_si256(
-        _mm256_i32gather_epi32(reinterpret_cast<const int*>(cb2_sum_half_lut().data()), byte_sum, 2),
-        _mm256_set1_epi32(0xffff));
 
-    // CB2's fixed formula produces only normal finite half values for all
-    // 1021 sums (verified by the gather prototype's all-state proof).
-    const __m256i exponent = _mm256_slli_epi32(
-        _mm256_add_epi32(_mm256_and_si256(_mm256_srli_epi32(half_words, 10), _mm256_set1_epi32(0x1f)),
-                         _mm256_set1_epi32(112)),
-        23);
-    const __m256i sign = _mm256_slli_epi32(_mm256_and_si256(half_words, _mm256_set1_epi32(0x8000)), 16);
-    const __m256i mantissa = _mm256_slli_epi32(_mm256_and_si256(half_words, _mm256_set1_epi32(0x3ff)), 13);
-    const __m256 packed_f32 = _mm256_castsi256_ps(_mm256_or_si256(sign, _mm256_or_si256(exponent, mantissa)));
-    _mm256_storeu_ps(values, packed_f32);
+    // The MUL1 codebook in arithmetic.  The byte sum of the multiplied state
+    // is the sum of four bytes, so it lies between 0 and 1020, and it selects
+    // the value
+    //     f16_rne((1024 + sum) * inv + bias)
+    // with `inv` the half 0x1eee and `bias` the half 0xc931.  The sum is an
+    // integer of at most 1020, so (1024 + sum) * inv is exact in f32 (the
+    // product needs 24 bits at most) and the fused multiply-add therefore
+    // gives the same bits as the scalar decoder's separate multiply and add.
+    // The hardware's half rounding is the same round-to-nearest-even as
+    // `f32_to_f16`, and every value of the codebook is a normal half.
+    const __m256 t = _mm256_add_ps(_mm256_cvtepi32_ps(byte_sum), _mm256_set1_ps(1024.0f));
+    const __m256 q = _mm256_fmadd_ps(t, _mm256_set1_ps(f32_from_f16(0x1eeeu)), _mm256_set1_ps(f32_from_f16(0xc931u)));
+    const __m128i half = _mm256_cvtps_ph(q, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    return _mm256_cvtph_ps(half);
+}
+
+/// The transpose of eight rows of eight floats: the result's row p is the
+/// matrix's column p.
+EXL3_TARGET_AVX2_F16C inline void transpose8x8(__m256 m[8]) {
+    const __m256 t0 = _mm256_unpacklo_ps(m[0], m[1]);
+    const __m256 t1 = _mm256_unpackhi_ps(m[0], m[1]);
+    const __m256 t2 = _mm256_unpacklo_ps(m[2], m[3]);
+    const __m256 t3 = _mm256_unpackhi_ps(m[2], m[3]);
+    const __m256 t4 = _mm256_unpacklo_ps(m[4], m[5]);
+    const __m256 t5 = _mm256_unpackhi_ps(m[4], m[5]);
+    const __m256 t6 = _mm256_unpacklo_ps(m[6], m[7]);
+    const __m256 t7 = _mm256_unpackhi_ps(m[6], m[7]);
+    const __m256 s0 = _mm256_shuffle_ps(t0, t2, 0x44);
+    const __m256 s1 = _mm256_shuffle_ps(t0, t2, 0xEE);
+    const __m256 s2 = _mm256_shuffle_ps(t1, t3, 0x44);
+    const __m256 s3 = _mm256_shuffle_ps(t1, t3, 0xEE);
+    const __m256 s4 = _mm256_shuffle_ps(t4, t6, 0x44);
+    const __m256 s5 = _mm256_shuffle_ps(t4, t6, 0xEE);
+    const __m256 s6 = _mm256_shuffle_ps(t5, t7, 0x44);
+    const __m256 s7 = _mm256_shuffle_ps(t5, t7, 0xEE);
+    m[0] = _mm256_permute2f128_ps(s0, s4, 0x20);
+    m[1] = _mm256_permute2f128_ps(s1, s5, 0x20);
+    m[2] = _mm256_permute2f128_ps(s2, s6, 0x20);
+    m[3] = _mm256_permute2f128_ps(s3, s7, 0x20);
+    m[4] = _mm256_permute2f128_ps(s0, s4, 0x31);
+    m[5] = _mm256_permute2f128_ps(s1, s5, 0x31);
+    m[6] = _mm256_permute2f128_ps(s2, s6, 0x31);
+    m[7] = _mm256_permute2f128_ps(s3, s7, 0x31);
 }
 
 template <int Bits>
-EXL3_TARGET_AVX2 void decode_tile_f32_hot_bits_avx2_cb2(const MatrixView& matrix, int64_t tile_k,
-                                                        int64_t tile_n, float* values) {
+EXL3_TARGET_AVX2_F16C void decode_tile_f32_hot_bits_avx2_cb2(const MatrixView& matrix, int64_t tile_k,
+                                                              int64_t tile_n, float* values) {
     const int64_t tiles_n = matrix.n / kTileSide;
     const size_t packed_size = static_cast<size_t>(16 * Bits);
     const size_t tile_index = strata::kernels::exl3::trellis_tile_index(matrix.tile_order, tile_k, tile_n,
                                                                          matrix.k / kTileSide, tiles_n);
     const uint16_t* packed = matrix.trellis + tile_index * packed_size;
     const size_t words32_count = static_cast<size_t>(Bits) * 8;
+    const TileGroups<Bits>& groups = tile_groups<Bits>();
     alignas(32) uint32_t staged[64 + 3];
     std::memcpy(staged, packed, words32_count * sizeof(uint32_t));
     std::memcpy(staged + words32_count, staged, 3 * sizeof(uint32_t));
-    alignas(32) float decoded[8];
-    for (int state_base = 0; state_base < kTileValues; state_base += 8) {
-        decode_cb2_8_f32_avx2(staged, words32_count, Bits, state_base, decoded);
-        for (int lane = 0; lane < 8; ++lane)
-            values[strata::kernels::exl3::tile_element_for_state(state_base + lane)] = decoded[lane];
+    // The tile's 32 groups of eight states are read as four sets of eight
+    // groups.  The groups of a set are the ones the format puts in the rows
+    // 2u, 2u+1, 2u+8 and 2u+9, and the transpose of the eight groups puts
+    // those four rows in place, so that the values reach the tile without a
+    // scatter of single values.
+    for (int u = 0; u < 4; ++u) {
+        __m256 m[8];
+        for (int v = 0; v < 8; ++v) m[v] = decode_cb2_8_f32_avx2<Bits>(staged, groups, 4 * v + u);
+        transpose8x8(m);
+        _mm256_storeu_ps(values + (2 * u) * kTileSide, m[0]);
+        _mm256_storeu_ps(values + (2 * u) * kTileSide + 8, m[4]);
+        _mm256_storeu_ps(values + (2 * u + 1) * kTileSide, m[1]);
+        _mm256_storeu_ps(values + (2 * u + 1) * kTileSide + 8, m[5]);
+        _mm256_storeu_ps(values + (2 * u + 8) * kTileSide, m[2]);
+        _mm256_storeu_ps(values + (2 * u + 8) * kTileSide + 8, m[6]);
+        _mm256_storeu_ps(values + (2 * u + 9) * kTileSide, m[3]);
+        _mm256_storeu_ps(values + (2 * u + 9) * kTileSide + 8, m[7]);
     }
 }
 
+/// The row-major accumulation of one tile into the sixteen output columns.
+///
+/// The product of the decoded weight and the input is exact in f64 (both are
+/// halves, so their product needs 48 bits at most), so the fused multiply-add
+/// gives the same bits as the separate multiply and add.
+EXL3_TARGET_AVX2_F16C void accumulate_tile_f32_avx2(const float* tile, const float* input, double* acc) {
+    __m256d a0 = _mm256_loadu_pd(acc);
+    __m256d a1 = _mm256_loadu_pd(acc + 4);
+    __m256d a2 = _mm256_loadu_pd(acc + 8);
+    __m256d a3 = _mm256_loadu_pd(acc + 12);
+    for (int row = 0; row < kTileSide; ++row) {
+        const __m256d in = _mm256_set1_pd(static_cast<double>(input[row]));
+        a0 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm_loadu_ps(tile + row * kTileSide)), in, a0);
+        a1 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm_loadu_ps(tile + row * kTileSide + 4)), in, a1);
+        a2 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm_loadu_ps(tile + row * kTileSide + 8)), in, a2);
+        a3 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm_loadu_ps(tile + row * kTileSide + 12)), in, a3);
+    }
+    _mm256_storeu_pd(acc, a0);
+    _mm256_storeu_pd(acc + 4, a1);
+    _mm256_storeu_pd(acc + 8, a2);
+    _mm256_storeu_pd(acc + 12, a3);
+}
+
 template <int Bits>
-EXL3_TARGET_AVX2 void linear_dot_range_f32_avx2(const MatrixView& matrix, const float* input_basis, size_t first_tile,
-                                               size_t tile_count, float* dot, const float* lut) {
-    const size_t k = static_cast<size_t>(matrix.k);
-    const size_t tiles_k = k / kTileSide;
+EXL3_TARGET_AVX2_F16C void linear_dot_range_f32_avx2(const MatrixView& matrix, const float* input_basis, size_t first_tile,
+                                                       size_t tile_count, float* dot, const float* lut) {
+    const size_t tiles_k = matrix.k / kTileSide;
     std::array<float, kTileValues> tile_f32{};
     for (size_t tile_n = first_tile; tile_n < first_tile + tile_count; ++tile_n) {
         double acc[kTileSide] = {};
         for (size_t tile_k = 0; tile_k < tiles_k; ++tile_k) {
+            // The MUL1 codebook's values are computed in arithmetic, so `lut`
+            // is null for it and is read for the other codebooks only.
             if (matrix.codebook == 2)
                 decode_tile_f32_hot_bits_avx2_cb2<Bits>(matrix, static_cast<int64_t>(tile_k),
                                                         static_cast<int64_t>(tile_n), tile_f32.data());
@@ -377,11 +486,7 @@ EXL3_TARGET_AVX2 void linear_dot_range_f32_avx2(const MatrixView& matrix, const 
                 decode_tile_f32_hot_bits<Bits>(matrix, static_cast<int64_t>(tile_k), static_cast<int64_t>(tile_n),
                                                lut, tile_f32.data());
             const size_t row_base = tile_k * kTileSide;
-            for (int row = 0; row < kTileSide; ++row) {
-                const double input = static_cast<double>(input_basis[row_base + static_cast<size_t>(row)]);
-                for (int col = 0; col < kTileSide; ++col)
-                    acc[col] += static_cast<double>(tile_f32[static_cast<size_t>(row * kTileSide + col)]) * input;
-            }
+            accumulate_tile_f32_avx2(tile_f32.data(), input_basis + row_base, acc);
         }
         for (int col = 0; col < kTileSide; ++col)
             dot[(tile_n - first_tile) * kTileSide + static_cast<size_t>(col)] = static_cast<float>(acc[col]);
@@ -393,13 +498,15 @@ EXL3_TARGET_AVX2 void linear_dot_range_f32_avx2(const MatrixView& matrix, const 
 void linear_dot_range_dispatch(const MatrixView& matrix, const float* input_basis, size_t first_tile,
                                size_t tile_count, float* dot, const Mul1Input* mul1 = nullptr) {
     if (mul1 != nullptr && linear_mul1_dot_range(matrix, *mul1, first_tile, tile_count, dot)) return;
-    const float* const lut = codebook_lut_f32()[static_cast<size_t>(matrix.codebook)].data();
 #if EXL3_HAVE_TARGET_AVX2
     static const bool use_avx2 = [] {
         const char* const force_generic = std::getenv("STRATA_NO_EXL3_AVX2");
         return !(force_generic != nullptr && force_generic[0] == '1') && strata::kernels::cpu::cpu_avx2_ok();
     }();
     if (use_avx2) {
+        // The MUL1 codebook's values are computed in arithmetic, so the table
+        // of them is not built for it.
+        const float* const lut = matrix.codebook == 2 ? nullptr : codebook_lut_f32(matrix.codebook).data();
         switch (matrix.bits) {
             case 1: linear_dot_range_f32_avx2<1>(matrix, input_basis, first_tile, tile_count, dot, lut); break;
             case 2: linear_dot_range_f32_avx2<2>(matrix, input_basis, first_tile, tile_count, dot, lut); break;
@@ -413,6 +520,7 @@ void linear_dot_range_dispatch(const MatrixView& matrix, const float* input_basi
         return;
     }
 #endif
+    const float* const lut = codebook_lut_f32(matrix.codebook).data();
     switch (matrix.bits) {
         case 1: linear_dot_range_f32<1>(matrix, input_basis, first_tile, tile_count, dot, lut); break;
         case 2: linear_dot_range_f32<2>(matrix, input_basis, first_tile, tile_count, dot, lut); break;
@@ -464,7 +572,7 @@ Status linear_with_scratch(const MatrixView& matrix, const float* x, float* y, L
 
     for (size_t base = 0; base < k; base += kHadamardSide) {
         for (size_t i = 0; i < kHadamardSide; ++i) {
-            const float scale = f16_to_f32(matrix.suh[base + i]);
+            const float scale = f32_from_f16(matrix.suh[base + i]);
             volatile float product = x[base + i] * scale;
             scratch.input_basis[base + i] = product;
         }
@@ -478,10 +586,10 @@ Status linear_with_scratch(const MatrixView& matrix, const float* x, float* y, L
     for (size_t base = 0; base < n; base += kHadamardSide) {
         hadamard_normalized(y + base);
         for (size_t i = 0; i < kHadamardSide; ++i) {
-            volatile float scaled = y[base + i] * f16_to_f32(matrix.svh[base + i]);
+            volatile float scaled = y[base + i] * f32_from_f16(matrix.svh[base + i]);
             y[base + i] = scaled;
             if (matrix.bias != nullptr) {
-                volatile float with_bias = y[base + i] + f16_to_f32(matrix.bias[base + i]);
+                volatile float with_bias = y[base + i] + f32_from_f16(matrix.bias[base + i]);
                 y[base + i] = with_bias;
             }
         }
@@ -494,7 +602,7 @@ Status prepare_input_basis_impl(const MatrixView& matrix, const float* x, float*
     if (status != Status::ok) return status;
     for (size_t base = 0; base < static_cast<size_t>(matrix.k); base += kHadamardSide) {
         for (size_t i = 0; i < kHadamardSide; ++i) {
-            const float scale = f16_to_f32(matrix.suh[base + i]);
+            const float scale = f32_from_f16(matrix.suh[base + i]);
             volatile float product = x[base + i] * scale;
             basis[base + i] = product;
         }
@@ -515,11 +623,11 @@ Status linear_output_block_impl(const MatrixView& matrix, const float* input_bas
                               kHadamardSide / kTileSide, scratch.input_basis, scratch.mul1_prepared);
     hadamard_normalized(scratch.input_basis);
     for (size_t i = 0; i < kHadamardSide; ++i) {
-        volatile float scaled = scratch.input_basis[i] * f16_to_f32(matrix.svh[col0 + static_cast<int64_t>(i)]);
+        volatile float scaled = scratch.input_basis[i] * f32_from_f16(matrix.svh[col0 + static_cast<int64_t>(i)]);
         y[col0 + static_cast<int64_t>(i)] = scaled;
         if (matrix.bias != nullptr) {
             volatile float with_bias = y[col0 + static_cast<int64_t>(i)] +
-                                       f16_to_f32(matrix.bias[col0 + static_cast<int64_t>(i)]);
+                                       f32_from_f16(matrix.bias[col0 + static_cast<int64_t>(i)]);
             y[col0 + static_cast<int64_t>(i)] = with_bias;
         }
     }
