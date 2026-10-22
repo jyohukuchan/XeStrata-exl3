@@ -336,8 +336,8 @@ void linear_dot_range_f32(const MatrixView& matrix, const float* input_basis, si
 // width alone fixes, so a group costs one load and the shifts, and no
 // arithmetic per window.
 template <int Bits>
-EXL3_TARGET_AVX2_F16C void decode_cb2_8_f32_avx2(const uint32_t* staged, const TileGroups<Bits>& groups, int group,
-                                                  float* values) {
+EXL3_TARGET_AVX2_F16C inline __m256 decode_cb2_8_f32_avx2(const uint32_t* staged, const TileGroups<Bits>& groups,
+                                                           int group) {
     const __m256i vrelative0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(groups.relative0[group]));
     const __m256i vrelative1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(groups.relative1[group]));
     const __m256i vshift = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(groups.shift[group]));
@@ -367,7 +367,36 @@ EXL3_TARGET_AVX2_F16C void decode_cb2_8_f32_avx2(const uint32_t* staged, const T
     const __m256 t = _mm256_add_ps(_mm256_cvtepi32_ps(byte_sum), _mm256_set1_ps(1024.0f));
     const __m256 q = _mm256_fmadd_ps(t, _mm256_set1_ps(f32_from_f16(0x1eeeu)), _mm256_set1_ps(f32_from_f16(0xc931u)));
     const __m128i half = _mm256_cvtps_ph(q, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
-    _mm256_storeu_ps(values, _mm256_cvtph_ps(half));
+    return _mm256_cvtph_ps(half);
+}
+
+/// The transpose of eight rows of eight floats: the result's row p is the
+/// matrix's column p.
+EXL3_TARGET_AVX2_F16C inline void transpose8x8(__m256 m[8]) {
+    const __m256 t0 = _mm256_unpacklo_ps(m[0], m[1]);
+    const __m256 t1 = _mm256_unpackhi_ps(m[0], m[1]);
+    const __m256 t2 = _mm256_unpacklo_ps(m[2], m[3]);
+    const __m256 t3 = _mm256_unpackhi_ps(m[2], m[3]);
+    const __m256 t4 = _mm256_unpacklo_ps(m[4], m[5]);
+    const __m256 t5 = _mm256_unpackhi_ps(m[4], m[5]);
+    const __m256 t6 = _mm256_unpacklo_ps(m[6], m[7]);
+    const __m256 t7 = _mm256_unpackhi_ps(m[6], m[7]);
+    const __m256 s0 = _mm256_shuffle_ps(t0, t2, 0x44);
+    const __m256 s1 = _mm256_shuffle_ps(t0, t2, 0xEE);
+    const __m256 s2 = _mm256_shuffle_ps(t1, t3, 0x44);
+    const __m256 s3 = _mm256_shuffle_ps(t1, t3, 0xEE);
+    const __m256 s4 = _mm256_shuffle_ps(t4, t6, 0x44);
+    const __m256 s5 = _mm256_shuffle_ps(t4, t6, 0xEE);
+    const __m256 s6 = _mm256_shuffle_ps(t5, t7, 0x44);
+    const __m256 s7 = _mm256_shuffle_ps(t5, t7, 0xEE);
+    m[0] = _mm256_permute2f128_ps(s0, s4, 0x20);
+    m[1] = _mm256_permute2f128_ps(s1, s5, 0x20);
+    m[2] = _mm256_permute2f128_ps(s2, s6, 0x20);
+    m[3] = _mm256_permute2f128_ps(s3, s7, 0x20);
+    m[4] = _mm256_permute2f128_ps(s0, s4, 0x31);
+    m[5] = _mm256_permute2f128_ps(s1, s5, 0x31);
+    m[6] = _mm256_permute2f128_ps(s2, s6, 0x31);
+    m[7] = _mm256_permute2f128_ps(s3, s7, 0x31);
 }
 
 template <int Bits>
@@ -383,11 +412,23 @@ EXL3_TARGET_AVX2_F16C void decode_tile_f32_hot_bits_avx2_cb2(const MatrixView& m
     alignas(32) uint32_t staged[64 + 3];
     std::memcpy(staged, packed, words32_count * sizeof(uint32_t));
     std::memcpy(staged + words32_count, staged, 3 * sizeof(uint32_t));
-    alignas(32) float decoded[8];
-    for (int group = 0; group < kTileValues / 8; ++group) {
-        decode_cb2_8_f32_avx2<Bits>(staged, groups, group, decoded);
-        for (int lane = 0; lane < 8; ++lane)
-            values[strata::kernels::exl3::tile_element_for_state(group * 8 + lane)] = decoded[lane];
+    // The tile's 32 groups of eight states are read as four sets of eight
+    // groups.  The groups of a set are the ones the format puts in the rows
+    // 2u, 2u+1, 2u+8 and 2u+9, and the transpose of the eight groups puts
+    // those four rows in place, so that the values reach the tile without a
+    // scatter of single values.
+    for (int u = 0; u < 4; ++u) {
+        __m256 m[8];
+        for (int v = 0; v < 8; ++v) m[v] = decode_cb2_8_f32_avx2<Bits>(staged, groups, 4 * v + u);
+        transpose8x8(m);
+        _mm256_storeu_ps(values + (2 * u) * kTileSide, m[0]);
+        _mm256_storeu_ps(values + (2 * u) * kTileSide + 8, m[4]);
+        _mm256_storeu_ps(values + (2 * u + 1) * kTileSide, m[1]);
+        _mm256_storeu_ps(values + (2 * u + 1) * kTileSide + 8, m[5]);
+        _mm256_storeu_ps(values + (2 * u + 8) * kTileSide, m[2]);
+        _mm256_storeu_ps(values + (2 * u + 8) * kTileSide + 8, m[6]);
+        _mm256_storeu_ps(values + (2 * u + 9) * kTileSide, m[3]);
+        _mm256_storeu_ps(values + (2 * u + 9) * kTileSide + 8, m[7]);
     }
 }
 
