@@ -4,6 +4,8 @@
 // rows 1/4 and host-drain modes against cpu::exl3::expert.
 #include "strata/kernels/cpu/pool.hpp"
 
+#include "strata/kernels/cpu/expert_layout.hpp"
+
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -206,6 +208,43 @@ int main() {
         // Without the integer path the split does not run, and the values are
         // the exact path's: the test then says so instead of pretending.
         if (intdot && split_runs != 3) ++failures;
+        // The AVX-512 kernel of the integer dot against the AVX2 one, on the
+        // same expert and the same input: the same bytes.  A CPU without
+        // AVX-512 cannot run the AVX-512 kernel, so the comparison is skipped
+        // there and the test says so.
+        if (!intdot) {
+            std::printf("  codebook 2 integer dot, AVX-512 kernel against AVX2: skipped (integer dot off)\n");
+        } else if (!cpu::cpu_avx512_ok()) {
+            std::printf("  codebook 2 integer dot, AVX-512 kernel against AVX2: skipped (no AVX-512)\n");
+        } else {
+            const strata::kernels::exl3::MatrixView& matrix = cb2.gate.view;
+            std::vector<float> basis(256);
+            for (size_t i = 0; i < basis.size(); ++i)
+                basis[i] = 0.1f * static_cast<float>((int(i) + 3) % 19 - 9);
+            std::vector<int32_t> duplicated_avx2(256), duplicated_avx512(256);
+            exl3::Mul1Input avx2, avx512;
+            if (!exl3::prepare_mul1_input(matrix, basis.data(), duplicated_avx2.data(), duplicated_avx2.size(), avx2,
+                                          exl3::Mul1Isa::avx2) ||
+                !exl3::prepare_mul1_input(matrix, basis.data(), duplicated_avx512.data(), duplicated_avx512.size(),
+                                          avx512, exl3::Mul1Isa::avx512)) ++failures;
+            else {
+                if (avx2.q != avx512.q || avx2.sum != avx512.sum ||
+                    std::memcmp(duplicated_avx2.data(), duplicated_avx512.data(),
+                                duplicated_avx2.size() * sizeof(int32_t)) != 0) ++failures;
+                std::vector<float> dot_avx2(512), dot_avx512(512);
+                std::vector<int32_t> sums_avx2(32 * 16), sums_avx512(32 * 16);
+                if (!exl3::linear_mul1_dot_range(matrix, avx2, 0, 32, dot_avx2.data(), exl3::Mul1Isa::avx2) ||
+                    !exl3::linear_mul1_dot_range(matrix, avx512, 0, 32, dot_avx512.data(), exl3::Mul1Isa::avx512) ||
+                    std::memcmp(dot_avx2.data(), dot_avx512.data(), dot_avx2.size() * sizeof(float)) != 0) ++failures;
+                if (exl3::linear_mul1_accumulate_range(matrix, avx2, 0, 32, 0, 8, sums_avx2.data(),
+                                                        exl3::Mul1Isa::avx2) != exl3::Status::ok ||
+                    exl3::linear_mul1_accumulate_range(matrix, avx512, 0, 32, 0, 8, sums_avx512.data(),
+                                                        exl3::Mul1Isa::avx512) != exl3::Status::ok ||
+                    std::memcmp(sums_avx2.data(), sums_avx512.data(), sums_avx2.size() * sizeof(int32_t)) != 0)
+                    ++failures;
+            }
+            std::printf("  codebook 2 integer dot, AVX-512 kernel against AVX2: %s\n", failures ? "FAIL" : "OK");
+        }
         std::printf("  codebook 2 K split 2/4/8 ranges against the whole K, rows %lld: %s (integer dot %s)\n",
                     (long long) rows, failures ? "FAIL" : "OK", intdot ? "on" : "off");
     }

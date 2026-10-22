@@ -164,6 +164,40 @@ The cut does not go below the 128-output block: 128 outputs form one Hadamard tr
 
 The measurement environment and the model's location are in the repository's `LOCAL.md`.
 
+## The CPU kernels in AVX-512
+
+The EXL3 CPU kernels have two computation paths. The integer dot (codebook 2, MUL1) adds 16 outputs at a time in integers; the exact path (FP64) decodes a tile to F32 and adds in FP64. Both have an AVX-512 copy now, and a CPU that has AVX-512 walks them at 512 bits. The AVX2 kernels stay as they are and are the path of a CPU without AVX-512.
+
+### The integer dot in AVX-512
+
+The AVX2 kernel decodes row by row, eight columns at a time, into two 256-bit registers. The AVX-512 kernel decodes a row's sixteen columns into one 512-bit register. The tile's registers are read 256 bits at a time, as before, and a column's dword is picked with the same lane index, so it is the same dword. The funnel shift keeps the AVX2 form: the shift is shared by each eight-column half, and the two halves of the 512-bit vector keep their own shift.
+
+The results are bit identical.
+
+- The 16-bit codes come out of the same dword of the same tile with the same funnel shift.
+- The byte sum adds the same four bytes of the same product in the same order, so it is the same integer, and the sum of integers does not depend on the order.
+- The activation's rounding is VRNDSCALEPS with the same immediate as the AVX2 kernel's VRNDPS: nearest, ties to even, no exception. The scale q and the clamp to [-127,127] are the same.
+- The affine conversion applies the same two operations to the same values. With -ffp-contract=off there is no fusion into an FMA.
+
+### The exact path in AVX-512
+
+The exact path computes the MUL1 codebook's values in arithmetic and adds them in FP64. The AVX-512 copy puts two groups of eight states into one 512-bit register, so the byte sum and the fused multiply-add cover sixteen states at a time. The conversion to F16 stays at 256 bits: the 512-bit form needs AVX512-FP16, which Zen 4 does not have. The FP64 addition is done at 512 bits, and the order of the addition of each column does not change.
+
+### The choice at run time
+
+The choice is made from the CPU's feature bits. `cpu_avx512_ok` reads AVX512F/BW/VL/VNNI/VBMI from CPUID and XCR0, and STRATA_FORCE_AVX2=1 drops the CPU to AVX2. It is never made from a vendor string or a model name. The integer dot's AVX-512 copy needs neither F16C nor FMA, so AVX512F/BW/VL are enough. The exact path's AVX-512 copy uses F16C's 256-bit conversion, so the F16C and FMA bits `cpu_avx2_ok` reads are asked for as well. A named kernel the CPU cannot run is refused, not attempted: the instruction would fault.
+
+### What was checked on this host
+
+The host's CPU has no AVX-512, and Intel SDE is not on this host either. The AVX-512 paths were not run. The following was checked instead.
+
+- A model of the AVX-512 algorithm written in scalar code agrees with the AVX2 implementation bit for bit, for bit widths 1 to 8, over the decode, the byte sum, the addition and the affine conversion.
+- The 512-bit byte sum and the 256-bit one give the same value per column. The pairing of VPMADDUBSW is inside each 64-bit granule and the pairing of VPMADDWD inside each 128-bit lane, so the four bytes of a column stay in one column at either width.
+- The group pairs the exact path's AVX-512 copy reads (8p+u, 8p+4+u) sit where the AVX2 copy's m[v]=4v+u puts them.
+- The rounding means what VRNDPS means. The definition of VRNDSCALEPS in the Intel SDM takes the rounding mode from imm8[1:0] when imm8[2] is 0, has no scaling at imm8[7:4]=0, and imm8[1:0]=00 is nearest even.
+
+Running the AVX-512 paths on an AVX-512 CPU, their bit identity with the AVX2 kernels there, and running them under Intel SDE were not done on this host.
+
 ## Capacity checks and worker settings
 
 The source currently checks available RAM and cgroup capacity every layer. An independent diagnostic of 1020 calls measured about 110µs per call: about 87µs for cgroup collection and 20µs for reading and parsing `MemAvailable`. Across 40 layers this is about 4.4ms of call cost, not a claim that all of it can be removed from decode.
