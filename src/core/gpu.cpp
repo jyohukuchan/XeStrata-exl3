@@ -175,7 +175,7 @@ void* alloc_device(size_t bytes) {
         std::lock_guard<std::mutex> lock(g_live_mu);
         g_live[p] = bytes;
         g_live_bytes += bytes;
-        core::Runtime::note_allocation(p, &rt());
+        core::Runtime::note_allocation(p, bytes, &rt());
         return p;
     } catch (const std::exception& e) { fail("alloc_device", e); return nullptr; }
 }
@@ -184,7 +184,7 @@ void* alloc_host(size_t bytes) {
     try {
         void* p = sycl::malloc_host(bytes, rt().context());
         if (!p) g_error = "alloc_host: " + std::to_string(bytes) + " bytes refused";
-        core::Runtime::note_allocation(p, &rt());
+        core::Runtime::note_allocation(p, bytes, &rt());
         return p;
     } catch (const std::exception& e) { fail("alloc_host", e); return nullptr; }
 }

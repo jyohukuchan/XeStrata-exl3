@@ -208,17 +208,25 @@ Runtime& Runtime::at(int ordinal) {
 }
 
 namespace {
-// The engine's own allocations, with the runtime that made them.  A context scan cannot tell one
-// device's device USM from another's: get_pointer_type answers "device" for any of them, so the
-// scan would name the first runtime and the wrong device.  The record is exact.
+// The engine's own allocations, with the runtime that made them and the size of the block.  A
+// context scan cannot tell one device's device USM from another's: get_pointer_type answers
+// "device" for any of them, so the scan would name the first runtime and the wrong device.  The
+// record is exact.
+//
+// The SIZE is what makes a pointer INTO an allocation nameable.  The engine carves its session
+// arenas, its expert caches and its work buffers out of one allocation each, and every buffer
+// inside them is an interior pointer: the arena's own address is recorded, the block's address is
+// not.  A multi-stage model then has a stage's own buffers named by the scan - the first runtime -
+// and the stage's dense owner refuses them ("input or output belongs to another runtime") although
+// they are its own.
 std::mutex g_alloc_mu;
-std::map<const void*, Runtime*> g_alloc_owner;
+std::map<const void*, std::pair<Runtime*, size_t>> g_alloc_owner;
 }  // namespace
 
-void Runtime::note_allocation(const void* pointer, Runtime* runtime) {
+void Runtime::note_allocation(const void* pointer, size_t bytes, Runtime* runtime) {
     if (pointer == nullptr || runtime == nullptr) return;
     std::lock_guard<std::mutex> lock(g_alloc_mu);
-    g_alloc_owner[pointer] = runtime;
+    g_alloc_owner[pointer] = {runtime, bytes};
 }
 
 void Runtime::forget_allocation(const void* pointer) {
@@ -232,7 +240,15 @@ Runtime* Runtime::owner(const void* pointer) {
     {
         std::lock_guard<std::mutex> lock(g_alloc_mu);
         auto it = g_alloc_owner.find(pointer);
-        if (it != g_alloc_owner.end()) return it->second;
+        if (it != g_alloc_owner.end()) return it->second.first;
+        // A pointer inside an allocation belongs to the runtime that made it.  The allocations do
+        // not overlap, so the one that can hold the pointer is the last one that starts below it.
+        auto below = g_alloc_owner.upper_bound(pointer);
+        if (below != g_alloc_owner.begin()) {
+            --below;
+            const uintptr_t base = reinterpret_cast<uintptr_t>(below->first);
+            if (reinterpret_cast<uintptr_t>(pointer) < base + below->second.second) return below->second.first;
+        }
     }
     std::lock_guard<std::mutex> lock(g_runtimes_mutex);
     for (auto& r : runtimes())

@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <exception>
 #include <list>
 #include <mutex>
@@ -33,10 +34,13 @@ public:
     ///
     /// The engine's own allocations are named exactly: the runtime that made them is recorded
     /// (note_allocation).  A context scan alone cannot tell one device's device USM from
-    /// another's, so it would answer with the first runtime and name the wrong device.
+    /// another's, so it would answer with the first runtime and name the wrong device.  A pointer
+    /// INTO a recorded allocation (the engine carves its arenas out of one block each) names the
+    /// runtime that made the block.
     static Runtime* owner(const void* pointer);
-    /// Records the runtime that made an allocation, so owner() can name it exactly.
-    static void note_allocation(const void* pointer, Runtime* runtime);
+    /// Records the runtime that made an allocation, so owner() can name it exactly.  `bytes` is
+    /// the size of the block, which is what lets a pointer inside it be named as well.
+    static void note_allocation(const void* pointer, size_t bytes, Runtime* runtime);
     /// Drops the record of an allocation that is being freed.
     static void forget_allocation(const void* pointer);
     /// The runtime one of whose queues `stream` is, or null.

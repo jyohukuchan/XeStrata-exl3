@@ -253,6 +253,56 @@ device 向けの並べ替え）で、decode は 1 token あたり 0.27 s 速く�
 最後のビットが違う。device cache を使わない構成の logits は参照と bit 一致で、
 cache を入れると logit の最大絶対差は 1.4e-4（相対 1e-5、greedy の token は不変）。
 
+### 複数 GPU（Qwen3.8 Flash）
+
+EXL3 Flash の層は `--stage-devices` で指定した device に分割される。指定がなければ、engine が
+使える GPU の数だけ stage を作り、層は `layer_count * stage / stage_count` で切られるので、
+どの stage も 1 層以上を持つ。stage ごとに device、session arena、dense weight、expert
+runtime、device cache が別々のものになる。
+
+**stage 境界をまたぐのは residual だけである。** 前の stage の residual（`hc * n_embd` 個の
+float）は host の bridge buffer を経由して次の stage の session へ copy される。device ごとに
+address space が別なので、ほかの状態を device 間で持ち回ることはできない。session arena
+（GDN state、QSA の KV cache、PLE の conv history）、dense weight、expert runtime、device
+cache、embedding は、それぞれが属する stage の device 上にある。
+
+**PLE は stage 境界をまたがない。** PLE の block は層 1 のもので、層分割はその層をちょうど
+1 つの stage に与える。その stage（PLE の home stage）が PLE の device 側の半分を持つ: key と
+value の projection の owner、n-gram から集めた row、preprojection の出力先、scratch、conv
+history。n-gram の row は home stage で読み、同じ stage の層 1 の前 graph で消費されるので、
+PLE の一部が境界をまたぐことはない。PLE の token window（現在の token とその 2 個前の token）は
+host 側の読み出し用なので、model 自身に持つ。home stage は層分割から決めるので、stage 数や
+device の順序が変わっても、PLE の層を持つ stage は必ず 1 つで、ほかの stage は PLE に
+触らない。
+
+**buffer の所有者は「確保した runtime」で名指しする。** engine の allocation は
+`Runtime::note_allocation` が確保した runtime を記録し、`Runtime::owner` はその記録を先に
+読む。記録は allocation の大きさも持つので、allocation の内側の pointer（session arena から
+切り出した buffer、expert cache の slot）も同じ runtime のものとして名付けられる。context の
+scan だけでは区別できない: device USM は `get_pointer_type` がどの device に対しても "device"
+と答えるので、scan は最初の runtime を名指しし、2 枚目以降の card では自分の buffer を
+「他の runtime のもの」と誤認する。EXL3 の複数 GPU 経路はそのため、stage 1 の dense owner が
+自分の buffer を拒否して止まっていた（"input or output belongs to another runtime"）。
+
+測定（V620 0000:03:00.0 と 0000:43:00.0、Qwen3.8 EXL3 3.05 bpw、48 層、2 stage では 24 層ずつ、
+`STRATA_VRAM_LIMIT_MIB=8192`、プロンプト 16,10,16,28 の 2 token）:
+
+| 条件 | stage | 出力 |
+| --- | ---: | --- |
+| device cache なし、CPU の exact 経路 | 1 | logits SHA256 `1fe719ac...`（単一 stage の参照値） |
+| device cache なし、CPU の exact 経路 | 2 | logits SHA256 `1fe719ac...`（単一 stage と **bit 一致**） |
+| device cache あり、CPU の整数 dot と row 並列 | 1 | stage 0 に 1871 expert（3.25 GiB）、logits SHA256 `e88713bc...` |
+| 同 | 2 | stage 0 に 3196 expert（5.54 GiB）、stage 1 に 3011 expert（5.22 GiB）、logits SHA256 `51e69318...` |
+
+device cache ありの 1 stage と 2 stage の値は一致しない: cache が常駐させる expert の組が
+違うためで、GPU が計算した expert は FP32 の積和、CPU の exact 経路は FP64 だからである。
+その差（logit の最大絶対差 1.06）は、単一 stage で exact と cache の差（0.83 と 0.98）と
+同じ程度にとどまり、greedy の token は変わらない。device の順序を逆にしても
+（`--stage-devices 1,0`）logits は bit 一致する。
+
+3 stage 以上の分割、decode 速度、Windows での実行は確かめていない。R9700（0000:07:00.0）は
+この host で他の作業に使われているため、測定には 2 枚の V620 だけを使った。
+
 ## Qwen3.5 MoE の MTP 接続
 
 `--spec 2` 以上は archive の `mtp.fc`、三つの norm、`mtp.layers.0` の attention・router・shared/routed

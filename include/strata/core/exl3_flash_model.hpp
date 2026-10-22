@@ -5,6 +5,7 @@
 
 #include "strata/artifact/exl3_model_map.hpp"
 #include "strata/artifact/exl3_model_spec.hpp"
+#include "strata/core/layer.hpp"
 #include "strata/core/layout.hpp"
 #include "strata/core/weights.hpp"
 
@@ -66,6 +67,27 @@ struct Exl3FlashStageView {
     Exl3ExpertSource* expert_source = nullptr;
     Exl3ExpertRuntime* expert_runtime = nullptr;
 };
+
+/// The layer range one stage owns.  The layers are split as evenly as the count allows, so every
+/// stage gets at least one layer as long as there are no more stages than layers; open() refuses
+/// that case, and an empty range is what the helper answers for it.
+struct Exl3FlashStageRange {
+    int64_t layer_begin = 0;
+    int64_t layer_end = 0;
+};
+
+/// The range of stage `stage_index` of `stage_count` over `layer_count` layers.  The split is the
+/// same for every layer count and stage count, and it is the only place the split is written down.
+Exl3FlashStageRange exl3_flash_stage_range(int64_t layer_count, int64_t stage_count, int64_t stage_index);
+
+/// The stage that runs the PLE layer: the PLE's HOME STAGE.
+///
+/// The PLE block belongs to one layer, and the layer split gives that layer to exactly one stage.
+/// The home stage holds the PLE's device half - the key and value projections' owners, the
+/// gathered row, the preprojection destinations, the scratch and the conv history - and it reads
+/// the n-gram rows there, so the PLE never crosses a stage boundary.  The other stages do not
+/// touch the PLE at all.  -1 when no stage holds the layer.
+int64_t exl3_flash_ple_stage(int64_t layer_count, int64_t stage_count);
 
 /// Owns the explicit EXL3 archive-to-runtime bridge for Flash AR execution.  It validates typed geometry and canonical mapping, attaches
 /// the exact EXL3/raw rows to one WeightTable per GPU stage, prepares the
