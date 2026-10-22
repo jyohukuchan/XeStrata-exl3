@@ -13,6 +13,7 @@
 
 #include <cstdint>
 #include <iostream>
+#include <string>
 #include <vector>
 
 namespace {
@@ -71,6 +72,48 @@ bool ple_home_holds_the_ple_layer(int64_t layers, int64_t stages) {
     return true;
 }
 
+// The explicit split (--stage-layers): the same soundness from the counts the caller gives, and
+// refusals with a reason for the counts that are not a split at all.
+bool explicit_split_is_sound(int64_t layers, const std::vector<int64_t>& counts) {
+    std::vector<strata::core::Exl3FlashStageRange> ranges;
+    std::string err;
+    if (!strata::core::exl3_flash_stage_ranges(layers, static_cast<int64_t>(counts.size()), counts, ranges, err)) {
+        std::cerr << "the explicit split of " << layers << " layers was refused: " << err << '\n';
+        return false;
+    }
+    int64_t previous_end = 0;
+    for (size_t index = 0; index < ranges.size(); ++index) {
+        if (ranges[index].layer_begin != previous_end || ranges[index].layer_end <= ranges[index].layer_begin) {
+            std::cerr << "the explicit split is not contiguous at stage " << index << '\n';
+            return false;
+        }
+        previous_end = ranges[index].layer_end;
+    }
+    if (previous_end != layers) {
+        std::cerr << "the explicit split covers " << previous_end << " of " << layers << " layers\n";
+        return false;
+    }
+    if (layers > strata::core::PLE_LAYER) {
+        const int64_t home = strata::core::exl3_flash_ple_stage(ranges);
+        if (home < 0 || ranges[static_cast<size_t>(home)].layer_begin > strata::core::PLE_LAYER ||
+            strata::core::PLE_LAYER >= ranges[static_cast<size_t>(home)].layer_end) {
+            std::cerr << "the explicit split's home stage does not hold the PLE layer\n";
+            return false;
+        }
+    }
+    return true;
+}
+
+bool explicit_split_is_refused(int64_t layers, int64_t stages, const std::vector<int64_t>& counts, const char* what) {
+    std::vector<strata::core::Exl3FlashStageRange> ranges;
+    std::string err;
+    if (strata::core::exl3_flash_stage_ranges(layers, stages, counts, ranges, err) || err.empty()) {
+        std::cerr << "a split that is " << what << " was answered instead of refused\n";
+        return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 int main() {
@@ -95,6 +138,18 @@ int main() {
         std::cerr << "an invalid split was answered instead of refused\n";
         return 1;
     }
+    // The explicit split (--stage-layers) gives the same coverage from the counts, uneven ones
+    // included, and refuses the counts that are not a split of the model.
+    if (!explicit_split_is_sound(48, {18, 18, 12}) || !explicit_split_is_sound(48, {47, 1}) ||
+        !explicit_split_is_sound(48, {1, 47}) || !explicit_split_is_sound(48, {48}) ||
+        !explicit_split_is_sound(1, {1}))
+        return 1;
+    if (!explicit_split_is_refused(48, 3, {18, 18, 13}, "more layers than the model") ||
+        !explicit_split_is_refused(48, 3, {18, 18, 11}, "fewer layers than the model") ||
+        !explicit_split_is_refused(48, 3, {24, 24, 0}, "a stage without a layer") ||
+        !explicit_split_is_refused(48, 3, {24, -1, 25}, "a stage without a layer") ||
+        !explicit_split_is_refused(48, 3, {24, 24}, "one count short of the stages"))
+        return 1;
     std::cout << "EXL3 Flash stage split checks: OK\n";
     return 0;
 }
