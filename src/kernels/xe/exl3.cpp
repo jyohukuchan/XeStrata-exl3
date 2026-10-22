@@ -342,8 +342,11 @@ sycl::event submit_packed_dot(sycl::queue& queue, const MatrixView& view, const 
 
 
 bool word_tile_preload_enabled() {
+    // The preload of the word tile into the local memory is the default: it
+    // is the path the speed gate was taken with.  Setting the variable to 0
+    // keeps the kernel that reads the tile from the global memory.
     const char* text = std::getenv("STRATA_EXL3_WORD_TILE_PRELOAD");
-    return text != nullptr && text[0] == '1' && text[1] == '\0';
+    return !(text != nullptr && text[0] == '0' && text[1] == '\0');
 }
 
 // RR is compile-time so bank masks remain constants, not an additional runtime mask table lookup.

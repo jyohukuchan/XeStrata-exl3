@@ -817,28 +817,37 @@ if(STRATA_ENABLE_XE)
       ${CMAKE_CURRENT_SOURCE_DIR}/third_party/main/nlohmann-json)
     target_compile_options(exl3_expert_dispatch_test PRIVATE -fno-fast-math -ffp-contract=off)
     add_test(NAME exl3_expert_dispatch_test COMMAND exl3_expert_dispatch_test)
-    set_tests_properties(exl3_expert_dispatch_test PROPERTIES TIMEOUT 120)
+    # The integer dot applies the codebook's affine to the summed bytes, while
+    # the exact path and the GPU decode every element to its half value first.
+    # The two agree on a model's logits but not on synthetic data, so the tests
+    # that compare the CPU's expert with the GPU's or with the exact path run
+    # with the integer dot off; the integer dot's own tests cover it.
+    set_tests_properties(exl3_expert_dispatch_test PROPERTIES TIMEOUT 120
+      ENVIRONMENT "STRATA_EXL3_CPU_INTDOT=0")
     add_executable(exl3_expert_runtime_test src/core/exl3_expert_runtime_test.cpp)
     target_link_libraries(exl3_expert_runtime_test PRIVATE strata_engine)
     target_include_directories(exl3_expert_runtime_test SYSTEM PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/third_party/main/nlohmann-json)
     target_compile_options(exl3_expert_runtime_test PRIVATE -fno-fast-math -ffp-contract=off)
     add_test(NAME exl3_expert_runtime_test COMMAND exl3_expert_runtime_test)
-    set_tests_properties(exl3_expert_runtime_test PROPERTIES TIMEOUT 120)
+    set_tests_properties(exl3_expert_runtime_test PROPERTIES TIMEOUT 120
+      ENVIRONMENT "STRATA_EXL3_CPU_INTDOT=0")
     add_executable(exl3_expert_source_test src/core/exl3_expert_source_test.cpp)
     target_link_libraries(exl3_expert_source_test PRIVATE strata_engine)
     target_include_directories(exl3_expert_source_test SYSTEM PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/third_party/main/nlohmann-json)
     target_compile_options(exl3_expert_source_test PRIVATE -fno-fast-math -ffp-contract=off)
     add_test(NAME exl3_expert_source_test COMMAND exl3_expert_source_test)
+    set_tests_properties(exl3_expert_source_test PROPERTIES TIMEOUT 120
+      ENVIRONMENT "STRATA_EXL3_CPU_INTDOT=0")
     # The same source test with each tile order the switch selects: the
     # format's own order, and the CPU block order beside the N-major default.
     add_test(NAME exl3_expert_source_canonical_order COMMAND exl3_expert_source_test)
     set_tests_properties(exl3_expert_source_canonical_order PROPERTIES
-      ENVIRONMENT "STRATA_EXL3_CPU_TILE_ORDER=0" TIMEOUT 120)
+      ENVIRONMENT "STRATA_EXL3_CPU_TILE_ORDER=0;STRATA_EXL3_CPU_INTDOT=0" TIMEOUT 120)
     add_test(NAME exl3_expert_source_block_order COMMAND exl3_expert_source_test)
     set_tests_properties(exl3_expert_source_block_order PROPERTIES
-      ENVIRONMENT "STRATA_EXL3_CPU_TILE_ORDER=1" TIMEOUT 120)
+      ENVIRONMENT "STRATA_EXL3_CPU_TILE_ORDER=1;STRATA_EXL3_CPU_INTDOT=0" TIMEOUT 120)
     add_executable(raw_linear_parity src/kernels/raw_linear_parity.cpp)
     target_link_libraries(raw_linear_parity PRIVATE strata_kernels strata_kernels_cpu)
     target_compile_options(raw_linear_parity PRIVATE -fno-fast-math -ffp-contract=off)

@@ -316,7 +316,12 @@ bool Exl3ExpertRuntime::open(Exl3ExpertSource& source, strata::kernels::cpu::Exp
         err = "exl3 runtime: CPU pool EXL3 scratch preparation failed"; close(); return false;
     }
     const char* rowparallel = std::getenv("STRATA_EXL3_CPU_ROWPARALLEL");
-    if (rowparallel != nullptr && rowparallel[0] == '1') {
+    // The row-parallel phases are the default: they give the pool the tasks it
+    // needs and split the dot along the K when a phase's tasks do not fill the
+    // workers.  The values do not depend on the split (the ranges' sums are
+    // exact integers), so the path is bit identical to the whole-expert one.
+    // Setting the variable to 0 keeps the old behaviour.
+    if (!(rowparallel != nullptr && rowparallel[0] == '0' && rowparallel[1] == '\0')) {
         // Every runtime miss entry is a one-row job. Bound the prepared job
         // count by the largest phase rather than disabling a large window:
         // a larger actual miss batch takes the existing whole-expert path.

@@ -270,8 +270,14 @@ bool mul1_intdot_enabled() {
     static const bool enabled = [] {
         const char* value = std::getenv("STRATA_EXL3_CPU_INTDOT");
         const char* force_generic = std::getenv("STRATA_NO_EXL3_AVX2");
-        return value != nullptr && value[0] == '1' &&
-               !(force_generic != nullptr && force_generic[0] == '1') && strata::kernels::cpu::cpu_avx2_ok();
+        // The integer dot is the default on a CPU that has AVX2: it is the
+        // path the EXL3 quality measurements and the speed gate were taken
+        // with, and it is what the CPU expert path can afford when the
+        // experts come from RAM.  Setting the variable to 0 keeps the exact
+        // (FP64) path, which is the reference the parity tests compare with.
+        const bool off = value != nullptr && value[0] == '0' && value[1] == '\0';
+        return !off && !(force_generic != nullptr && force_generic[0] == '1') &&
+               strata::kernels::cpu::cpu_avx2_ok();
     }();
     return enabled;
 #else

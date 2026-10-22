@@ -158,7 +158,13 @@ bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std
     if (!probe) { err = "moe window: stream create failed"; return false; }
     const char* v = std::getenv("STRATA_VERIFY_SEGMENTED");
     const char* device_hit = std::getenv("STRATA_EXL3_DEVICE_HIT_PLAN");
-    const bool request_device_hit = exl3 && device_hit != nullptr && std::strtol(device_hit, nullptr, 10) == 1;
+    // The plan that lets the GPU compute the experts its cache holds is the
+    // default: it is the plan the speed gate and the quality measurement were
+    // taken with, and it keeps the experts that are resident on the device.
+    // Setting the variable to 0 keeps the plan that hands every routed expert
+    // to the CPU.
+    const bool request_device_hit =
+        exl3 && !(device_hit != nullptr && std::strtol(device_hit, nullptr, 10) == 0);
     const bool force_segmented = v != nullptr && std::strtol(v, nullptr, 10) != 0;
     const bool visible = (!force_segmented && (request_device_hit || v == nullptr)) &&
                          strata::kernels::doorbell_visible(probe);
