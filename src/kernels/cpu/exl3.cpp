@@ -4,7 +4,8 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // CPU EXL3 trellis extraction, codebooks and the batch-1 correctness path.
 // The packed-tile and codebook rules are derived from exllamav3's MIT code;
-// the implementation here remains portable C++ with an AVX2-safe baseline.
+// the implementation here remains portable C++ with an AVX2-safe baseline,
+// with an AVX-512 copy of the vector kernels beside the AVX2 ones.
 #include "strata/kernels/cpu/exl3.hpp"
 #include "strata/kernels/cpu/exl3_mul1_intdot.hpp"
 #include "strata/kernels/f16_bits.hpp"
@@ -25,12 +26,21 @@
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include <immintrin.h>
 #define EXL3_HAVE_TARGET_AVX2 1
+#define EXL3_HAVE_TARGET_AVX512 1
 #define EXL3_TARGET_AVX2 __attribute__((target("avx2")))
 #define EXL3_TARGET_AVX2_F16C __attribute__((target("avx2,f16c,fma")))
+// The AVX-512 copy of the vector kernels.  f16c and fma are in the list for
+// the same reason they are in the AVX2 kernel's: the MUL1 codebook's values
+// are computed with a fused multiply-add and rounded to a half.  AVX512-FP16
+// is not asked for, and the half conversion stays at 256 bits: Zen 4 has no
+// AVX512-FP16.
+#define EXL3_TARGET_AVX512 __attribute__((target("avx512f,avx512bw,avx512vl,avx2,f16c,fma")))
 #else
 #define EXL3_HAVE_TARGET_AVX2 0
+#define EXL3_HAVE_TARGET_AVX512 0
 #define EXL3_TARGET_AVX2
 #define EXL3_TARGET_AVX2_F16C
+#define EXL3_TARGET_AVX512
 #endif
 
 namespace strata::kernels::cpu::exl3 {
@@ -349,9 +359,12 @@ void linear_dot_range_f32(const MatrixView& matrix, const float* input_basis, si
 // The words and the shifts of the eight windows come from a table that the bit
 // width alone fixes, so a group costs one load and the shifts, and no
 // arithmetic per window.
+//
+// The states of one group of eight: the gather the AVX2 path reads, split out
+// so that the AVX-512 path beside it decodes the same states.
 template <int Bits>
-EXL3_TARGET_AVX2_F16C inline __m256 decode_cb2_8_f32_avx2(const uint32_t* staged, const TileGroups<Bits>& groups,
-                                                           int group) {
+EXL3_TARGET_AVX2_F16C inline __m256i decode_group_states_avx2(const uint32_t* staged, const TileGroups<Bits>& groups,
+                                                             int group) {
     const __m256i vrelative0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(groups.relative0[group]));
     const __m256i vrelative1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(groups.relative1[group]));
     const __m256i vshift = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(groups.shift[group]));
@@ -362,7 +375,13 @@ EXL3_TARGET_AVX2_F16C inline __m256 decode_cb2_8_f32_avx2(const uint32_t* staged
     const __m256i word1 = _mm256_permutevar8x32_epi32(broadcast_words, vrelative1);
     const __m256i merged = _mm256_or_si256(_mm256_sllv_epi32(word0, vleft_shift),
                                            _mm256_srlv_epi32(word1, vshift));
-    const __m256i state = _mm256_and_si256(merged, _mm256_set1_epi32(0xffff));
+    return _mm256_and_si256(merged, _mm256_set1_epi32(0xffff));
+}
+
+template <int Bits>
+EXL3_TARGET_AVX2_F16C inline __m256 decode_cb2_8_f32_avx2(const uint32_t* staged, const TileGroups<Bits>& groups,
+                                                           int group) {
+    const __m256i state = decode_group_states_avx2<Bits>(staged, groups, group);
 
     const __m256i multiplied = _mm256_mullo_epi32(state, _mm256_set1_epi32(static_cast<int>(kCb2Multiplier)));
     const __m256i byte_pairs = _mm256_maddubs_epi16(multiplied, _mm256_set1_epi8(1));
@@ -495,9 +514,144 @@ EXL3_TARGET_AVX2_F16C void linear_dot_range_f32_avx2(const MatrixView& matrix, c
 
 #endif  // EXL3_HAVE_TARGET_AVX2
 
+#if EXL3_HAVE_TARGET_AVX512
+
+// The MUL1 codebook in arithmetic, at 512 bits: two groups of eight states in
+// one register, so the byte sum and the fused multiply-add cover sixteen
+// states at a time.
+//
+// The half conversion stays at 256 bits: the 512-bit form needs AVX512-FP16,
+// which Zen 4 does not have.  The 256-bit conversion is the AVX2 path's own
+// (F16C's), so the values are the same bits.
+template <int Bits>
+EXL3_TARGET_AVX512 inline void decode_cb2_16_f32_avx512(const uint32_t* staged, const TileGroups<Bits>& groups,
+                                                        int group_a, int group_b, __m256& out_a, __m256& out_b) {
+    const __m256i states_a = decode_group_states_avx2<Bits>(staged, groups, group_a);
+    const __m256i states_b = decode_group_states_avx2<Bits>(staged, groups, group_b);
+    const __m512i states = _mm512_inserti64x4(_mm512_castsi256_si512(states_a), states_b, 1);
+    const __m512i multiplied = _mm512_mullo_epi32(states, _mm512_set1_epi32(static_cast<int>(kCb2Multiplier)));
+    const __m512i byte_pairs = _mm512_maddubs_epi16(multiplied, _mm512_set1_epi8(1));
+    const __m512i byte_sum = _mm512_madd_epi16(byte_pairs, _mm512_set1_epi16(1));
+    const __m512 t = _mm512_add_ps(_mm512_cvtepi32_ps(byte_sum), _mm512_set1_ps(1024.0f));
+    const __m512 q = _mm512_fmadd_ps(t, _mm512_set1_ps(f32_from_f16(0x1eeeu)), _mm512_set1_ps(f32_from_f16(0xc931u)));
+    const __m256 q_lo = _mm512_castps512_ps256(q);
+    const __m256 q_hi = _mm256_castsi256_ps(_mm512_extracti64x4_epi64(_mm512_castps_si512(q), 1));
+    const __m128i half_lo = _mm256_cvtps_ph(q_lo, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    const __m128i half_hi = _mm256_cvtps_ph(q_hi, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    out_a = _mm256_cvtph_ps(half_lo);
+    out_b = _mm256_cvtph_ps(half_hi);
+}
+
+// The tile's 32 groups of eight states, read as four sets of eight groups:
+// the same groups and the same transpose as the AVX2 path, with two groups
+// in one 512-bit register.
+template <int Bits>
+EXL3_TARGET_AVX512 void decode_tile_f32_hot_bits_avx512_cb2(const MatrixView& matrix, int64_t tile_k, int64_t tile_n,
+                                                             float* values) {
+    const int64_t tiles_n = matrix.n / kTileSide;
+    const size_t packed_size = static_cast<size_t>(16 * Bits);
+    const size_t tile_index = strata::kernels::exl3::trellis_tile_index(matrix.tile_order, tile_k, tile_n,
+                                                                         matrix.k / kTileSide, tiles_n);
+    const uint16_t* packed = matrix.trellis + tile_index * packed_size;
+    const size_t words32_count = static_cast<size_t>(Bits) * 8;
+    const TileGroups<Bits>& groups = tile_groups<Bits>();
+    alignas(64) uint32_t staged[64 + 3];
+    std::memcpy(staged, packed, words32_count * sizeof(uint32_t));
+    std::memcpy(staged + words32_count, staged, 3 * sizeof(uint32_t));
+    // The groups of a set are the ones the format puts in the rows 2u, 2u+1,
+    // 2u+8 and 2u+9, and the transpose of the eight groups puts those four
+    // rows in place, so that the values reach the tile without a scatter of
+    // single values.
+    for (int u = 0; u < 4; ++u) {
+        __m256 m[8];
+        for (int p = 0; p < 4; ++p)
+            decode_cb2_16_f32_avx512<Bits>(staged, groups, 8 * p + u, 8 * p + 4 + u, m[2 * p], m[2 * p + 1]);
+        transpose8x8(m);
+        _mm256_storeu_ps(values + (2 * u) * kTileSide, m[0]);
+        _mm256_storeu_ps(values + (2 * u) * kTileSide + 8, m[4]);
+        _mm256_storeu_ps(values + (2 * u + 1) * kTileSide, m[1]);
+        _mm256_storeu_ps(values + (2 * u + 1) * kTileSide + 8, m[5]);
+        _mm256_storeu_ps(values + (2 * u + 8) * kTileSide, m[2]);
+        _mm256_storeu_ps(values + (2 * u + 8) * kTileSide + 8, m[6]);
+        _mm256_storeu_ps(values + (2 * u + 9) * kTileSide, m[3]);
+        _mm256_storeu_ps(values + (2 * u + 9) * kTileSide + 8, m[7]);
+    }
+}
+
+/// The row-major accumulation of one tile into the sixteen output columns, at
+/// 512 bits.  The product of the decoded weight and the input is exact in
+/// f64 (both are halves, so their product needs 48 bits at most), so the
+/// fused multiply-add gives the same bits as the separate multiply and add,
+/// and the columns keep their order of accumulation.
+EXL3_TARGET_AVX512 void accumulate_tile_f32_avx512(const float* tile, const float* input, double* acc) {
+    __m512d a0 = _mm512_loadu_pd(acc);
+    __m512d a1 = _mm512_loadu_pd(acc + 8);
+    for (int row = 0; row < kTileSide; ++row) {
+        const __m512d in = _mm512_set1_pd(static_cast<double>(input[row]));
+        a0 = _mm512_fmadd_pd(_mm512_cvtps_pd(_mm256_loadu_ps(tile + row * kTileSide)), in, a0);
+        a1 = _mm512_fmadd_pd(_mm512_cvtps_pd(_mm256_loadu_ps(tile + row * kTileSide + 8)), in, a1);
+    }
+    _mm512_storeu_pd(acc, a0);
+    _mm512_storeu_pd(acc + 8, a1);
+}
+
+template <int Bits>
+EXL3_TARGET_AVX512 void linear_dot_range_f32_avx512(const MatrixView& matrix, const float* input_basis,
+                                                     size_t first_tile, size_t tile_count, float* dot, const float* lut) {
+    const size_t tiles_k = matrix.k / kTileSide;
+    std::array<float, kTileValues> tile_f32{};
+    for (size_t tile_n = first_tile; tile_n < first_tile + tile_count; ++tile_n) {
+        double acc[kTileSide] = {};
+        for (size_t tile_k = 0; tile_k < tiles_k; ++tile_k) {
+            // The MUL1 codebook's values are computed in arithmetic, so `lut`
+            // is null for it and is read for the other codebooks only.
+            if (matrix.codebook == 2)
+                decode_tile_f32_hot_bits_avx512_cb2<Bits>(matrix, static_cast<int64_t>(tile_k),
+                                                         static_cast<int64_t>(tile_n), tile_f32.data());
+            else
+                decode_tile_f32_hot_bits<Bits>(matrix, static_cast<int64_t>(tile_k), static_cast<int64_t>(tile_n),
+                                               lut, tile_f32.data());
+            const size_t row_base = tile_k * kTileSide;
+            accumulate_tile_f32_avx512(tile_f32.data(), input_basis + row_base, acc);
+        }
+        for (int col = 0; col < kTileSide; ++col)
+            dot[(tile_n - first_tile) * kTileSide + static_cast<size_t>(col)] = static_cast<float>(acc[col]);
+    }
+}
+
+#endif  // EXL3_HAVE_TARGET_AVX512
+
 void linear_dot_range_dispatch(const MatrixView& matrix, const float* input_basis, size_t first_tile,
                                size_t tile_count, float* dot, const Mul1Input* mul1 = nullptr) {
     if (mul1 != nullptr && linear_mul1_dot_range(matrix, *mul1, first_tile, tile_count, dot)) return;
+#if EXL3_HAVE_TARGET_AVX512
+    // The AVX-512 kernel of the exact path, where the CPU has it: the choice
+    // is made from the feature bits `cpu_avx512_ok` reads, never from a
+    // vendor string or a model name.  The F16C and FMA bits the AVX2 probe
+    // reads are needed as well, because the MUL1 codebook's values are
+    // rounded to a half with F16C's 256-bit conversion.
+    static const bool use_avx512 = [] {
+        const char* const force_generic = std::getenv("STRATA_NO_EXL3_AVX2");
+        return !(force_generic != nullptr && force_generic[0] == '1') && strata::kernels::cpu::cpu_avx512_ok() &&
+               strata::kernels::cpu::cpu_avx2_ok();
+    }();
+    if (use_avx512) {
+        // The MUL1 codebook's values are computed in arithmetic, so the table
+        // of them is not built for it.
+        const float* const lut = matrix.codebook == 2 ? nullptr : codebook_lut_f32(matrix.codebook).data();
+        switch (matrix.bits) {
+            case 1: linear_dot_range_f32_avx512<1>(matrix, input_basis, first_tile, tile_count, dot, lut); break;
+            case 2: linear_dot_range_f32_avx512<2>(matrix, input_basis, first_tile, tile_count, dot, lut); break;
+            case 3: linear_dot_range_f32_avx512<3>(matrix, input_basis, first_tile, tile_count, dot, lut); break;
+            case 4: linear_dot_range_f32_avx512<4>(matrix, input_basis, first_tile, tile_count, dot, lut); break;
+            case 5: linear_dot_range_f32_avx512<5>(matrix, input_basis, first_tile, tile_count, dot, lut); break;
+            case 6: linear_dot_range_f32_avx512<6>(matrix, input_basis, first_tile, tile_count, dot, lut); break;
+            case 7: linear_dot_range_f32_avx512<7>(matrix, input_basis, first_tile, tile_count, dot, lut); break;
+            default: linear_dot_range_f32_avx512<8>(matrix, input_basis, first_tile, tile_count, dot, lut); break;
+        }
+        return;
+    }
+#endif
 #if EXL3_HAVE_TARGET_AVX2
     static const bool use_avx2 = [] {
         const char* const force_generic = std::getenv("STRATA_NO_EXL3_AVX2");

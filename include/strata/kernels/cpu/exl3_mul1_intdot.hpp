@@ -29,18 +29,27 @@ struct Mul1Input {
     size_t partial_tiles = 0;
 };
 
+// The vector kernel the integer dot runs.  `auto_select` is the run-time
+// choice from the CPU's feature bits: the AVX-512 kernel where the CPU has
+// it, the AVX2 kernel elsewhere.  The two named kernels are for the parity
+// test, which runs both on a CPU that has AVX-512 and compares the bits; a
+// named kernel the CPU cannot run is refused, not attempted.
+enum class Mul1Isa { auto_select, avx2, avx512 };
+
 // Explicit prototype opt-in plus the existing CPUID/XCR0 capability check.
 bool mul1_intdot_enabled();
 
 // Quantize an already transformed FP32 input using one Q8 scale per K vector.
 // A false result leaves `prepared` disabled; the caller keeps the exact path.
 bool prepare_mul1_input(const strata::kernels::exl3::MatrixView& matrix, const float* input_basis,
-                        int32_t* duplicated, size_t capacity, Mul1Input& prepared);
+                        int32_t* duplicated, size_t capacity, Mul1Input& prepared,
+                        Mul1Isa isa = Mul1Isa::auto_select);
 
 // Only dot-space output is written. Hpost, svh, bias remain in the existing
 // caller. Decode uses register permutes and integer multiply-add, no full W.
 bool linear_mul1_dot_range(const strata::kernels::exl3::MatrixView& matrix, const Mul1Input& prepared,
-                           size_t first_tile, size_t tile_count, float* dot);
+                           size_t first_tile, size_t tile_count, float* dot,
+                           Mul1Isa isa = Mul1Isa::auto_select);
 
 // The same dot, cut along K: the sums of the K range [k_tile_begin,
 // k_tile_begin + k_tile_count) of the tile range [first_tile, first_tile +
@@ -50,7 +59,8 @@ bool linear_mul1_dot_range(const strata::kernels::exl3::MatrixView& matrix, cons
 // addition does not change the result.
 Status linear_mul1_accumulate_range(const strata::kernels::exl3::MatrixView& matrix, const Mul1Input& prepared,
                                     size_t first_tile, size_t tile_count, size_t k_tile_begin,
-                                    size_t k_tile_count, int32_t* acc);
+                                    size_t k_tile_count, int32_t* acc,
+                                    Mul1Isa isa = Mul1Isa::auto_select);
 
 // Whether the integer dot path can read this projection: the codebook, the
 // bit width and the geometry the path accepts, and the explicit opt-in.

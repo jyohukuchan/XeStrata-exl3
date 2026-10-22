@@ -18,9 +18,14 @@
 #include <immintrin.h>
 #define EXL3_INTDOT_AVAILABLE 1
 #define EXL3_INTDOT_AVX2 __attribute__((target("avx2")))
+// The AVX-512 kernel: the same decode and the same arithmetic at 512 bits.
+// avx2 is in the list because the tile's registers are read 256 bits at a
+// time; a 512-bit load would read past the end of a tile of few bits.
+#define EXL3_INTDOT_AVX512 __attribute__((target("avx512f,avx512bw,avx512vl,avx2")))
 #else
 #define EXL3_INTDOT_AVAILABLE 0
 #define EXL3_INTDOT_AVX2
+#define EXL3_INTDOT_AVX512
 #endif
 
 namespace strata::kernels::cpu::exl3 {
@@ -262,6 +267,234 @@ EXL3_INTDOT_AVX2 void combine_partials(const Mul1Input& input, size_t tile_count
         _mm256_storeu_ps(dot + tile * 16 + 8, z_hi);
     }
 }
+
+// ---- the AVX-512 kernel ----
+//
+// The same decode and the same arithmetic as the AVX2 kernel above, at 512
+// bits: one register holds the sixteen columns of a row instead of eight,
+// so a permute, a multiply-add and an accumulation cover twice the columns.
+//
+// The results are the AVX2 kernel's bits, not the same numbers computed
+// again:
+//  - the tile's registers are read the same way (256 bits at a time) and a
+//    column's dword is picked with the same lane index, so the sixteen codes
+//    of a row are the same codes;
+//  - the funnel shift keeps the AVX2 form: the shift is shared by each
+//    eight-column half, and the two halves keep their own shift;
+//  - the byte sum adds the same four bytes of the same product, so it is the
+//    same integer, and the sums are exact integers, so their order does not
+//    matter;
+//  - the activation's rounding is VRNDSCALEPS with the same immediate as
+//    the AVX2 kernel's VRNDPS (round to nearest, ties to even, no
+//    exception), so the quantized activation is the same;
+//  - the affine conversion is the same two operations on the same values.
+
+template <int bits, int row, bool second_word>
+constexpr std::array<int32_t, 16> avx512_lane_idx() {
+    constexpr auto idx16 = make_row_indices<bits, row, second_word>();
+    std::array<int32_t, 16> out{};
+    for (int i = 0; i < 16; ++i) out[i] = idx16[i] % 8;
+    return out;
+}
+
+template <int bits, int row, bool second_word, int Reg>
+constexpr uint16_t avx512_reg_mask() {
+    constexpr auto idx16 = make_row_indices<bits, row, second_word>();
+    uint16_t mask = 0;
+    for (int i = 0; i < 16; ++i)
+        if (idx16[i] / 8 == Reg) mask |= static_cast<uint16_t>(1) << i;
+    return mask;
+}
+
+// The register's eight dwords in the low half of a 512-bit register, so a
+// permute with a column's lane index picks the dword the AVX2 permute picks.
+EXL3_INTDOT_AVX512 inline __m512i avx512_source(__m256i reg) {
+    return _mm512_zextsi256_si512(reg);
+}
+
+// The sixteen columns of a row in one register: the same gather as the AVX2
+// path, with the columns that come from one register permuted out of it and
+// the registers that contribute blended in the order of their index.
+template <int bits, int row, bool second_word, int Reg = 0>
+EXL3_INTDOT_AVX512
+inline __m512i avx512_gather(const __m256i (&preg)[bits])
+{
+    constexpr auto li = avx512_lane_idx<bits, row, second_word>();
+    const __m512i lane_idx_v = _mm512_setr_epi32(li[0], li[1], li[2], li[3], li[4], li[5], li[6], li[7], li[8],
+                                                 li[9], li[10], li[11], li[12], li[13], li[14], li[15]);
+    if constexpr (Reg + 1 >= bits)
+    {
+        return _mm512_permutexvar_epi32(lane_idx_v, avx512_source(preg[Reg]));
+    }
+    else
+    {
+        constexpr uint16_t mask = avx512_reg_mask<bits, row, second_word, Reg>();
+        if constexpr (mask == 0)
+        {
+            return avx512_gather<bits, row, second_word, Reg + 1>(preg);
+        }
+        else
+        {
+            const __m512i cur = _mm512_permutexvar_epi32(lane_idx_v, avx512_source(preg[Reg]));
+            const __m512i rest = avx512_gather<bits, row, second_word, Reg + 1>(preg);
+            return _mm512_mask_mov_epi32(rest, static_cast<__mmask16>(mask), cur);
+        }
+    }
+}
+
+// The codes of row `row`'s sixteen states, in one register.  The shift is
+// shared by each eight-column half (by construction of the tile's
+// tensor-core permutation, the same invariant the VNNI path relies on), so
+// the two halves keep their own shift, in the two halves of the vector.
+template <int bits, int row>
+EXL3_INTDOT_AVX512
+inline void avx512_row_codes(const __m256i (&preg)[bits], __m512i& codes)
+{
+    const __m512i a = avx512_gather<bits, row, false>(preg);
+    const __m512i b = avx512_gather<bits, row, true>(preg);
+    constexpr int s0 = row_shift<bits, row>(0);
+    constexpr int s1 = row_shift<bits, row>(8);
+    const __m512i shift = _mm512_setr_epi32(s0, s0, s0, s0, s0, s0, s0, s0, s1, s1, s1, s1, s1, s1, s1, s1);
+    const __m512i left = _mm512_setr_epi32(32 - s0, 32 - s0, 32 - s0, 32 - s0, 32 - s0, 32 - s0, 32 - s0, 32 - s0,
+                                           32 - s1, 32 - s1, 32 - s1, 32 - s1, 32 - s1, 32 - s1, 32 - s1, 32 - s1);
+    const __m512i merged = _mm512_or_si512(_mm512_srlv_epi32(b, shift), _mm512_sllv_epi32(a, left));
+    codes = _mm512_and_si512(merged, _mm512_set1_epi32(0xffff));
+}
+
+// The same pair product bytes BEFORE including the activation, at 512 bits:
+// each unsigned pair is <=510, so vpmaddubsw cannot saturate.  Then
+// vpmaddwd applies the duplicated signed activation and produces one exact
+// i32 byte-sum product per column.
+template <int Bits, int Row = 0>
+EXL3_INTDOT_AVX512 inline void accumulate_rows512(const __m256i (&packed)[Bits], const int32_t* x, __m512i& acc) {
+    if constexpr (Row < 16) {
+        __m512i states;
+        avx512_row_codes<Bits, Row>(packed, states);
+        const __m512i mult = _mm512_set1_epi32(static_cast<int32_t>(kMul1));
+        const __m512i ones = _mm512_set1_epi8(1);
+        const __m512i pairs = _mm512_maddubs_epi16(_mm512_mullo_epi32(states, mult), ones);
+        const __m512i activation = _mm512_set1_epi32(x[Row]);
+        acc = _mm512_add_epi32(acc, _mm512_madd_epi16(pairs, activation));
+        accumulate_rows512<Bits, Row + 1>(packed, x, acc);
+    }
+}
+
+// The activation quantized the same way as in the AVX2 kernel.  The K of a
+// matrix the path accepts is a multiple of 128, so the sixteen-wide steps
+// cover it without a tail.
+EXL3_INTDOT_AVX512 void quantize_input_avx512(const float* input, size_t k, int32_t* duplicated, float q,
+                                               int32_t& sum) {
+    const __m512 reciprocal = _mm512_set1_ps(1.0f / q);
+    const __m512i lo = _mm512_set1_epi32(-127), hi = _mm512_set1_epi32(127);
+    const __m512i mask = _mm512_set1_epi32(0xffff);
+    __m512i total = _mm512_setzero_si512();
+    for (size_t i = 0; i < k; i += 16) {
+        const __m512 scaled = _mm512_mul_ps(_mm512_loadu_ps(input + i), reciprocal);
+        // Explicit ties-to-even, independent of ambient MXCSR rounding mode:
+        // VRNDSCALEPS with the AVX2 kernel's immediate rounds to nearest,
+        // ties to even, and raises no exception.
+        const __m512 rounded = _mm512_roundscale_ps(scaled, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+        const __m512i quantized = _mm512_min_epi32(hi, _mm512_max_epi32(lo, _mm512_cvttps_epi32(rounded)));
+        total = _mm512_add_epi32(total, quantized);
+        const __m512i lower = _mm512_and_si512(quantized, mask);
+        _mm512_storeu_si512(reinterpret_cast<__m512i*>(duplicated + i),
+                            _mm512_or_si512(lower, _mm512_slli_epi32(lower, 16)));
+    }
+    alignas(64) int32_t lanes[16];
+    _mm512_store_si512(lanes, total);
+    sum = 0;
+    for (int32_t lane : lanes) sum += lane;
+}
+
+// The dot of a tile range over a range of the K tiles, at 512 bits.  The
+// walk of the rows is written once, in `accumulate_rows512`, and the sums
+// and the conversion are the AVX2 kernel's.
+template <int Bits>
+EXL3_INTDOT_AVX512 void dot_range512(const MatrixView& matrix, const Mul1Input& input, size_t first_tile,
+                                     size_t tile_count, size_t k_tile_begin, size_t k_tile_count, int32_t* sums,
+                                     float* dot) {
+    const size_t tiles_k = static_cast<size_t>(matrix.k / 16);
+    const size_t tiles_n = static_cast<size_t>(matrix.n / 16);
+    const size_t packed_words = static_cast<size_t>(16 * Bits);
+    const __m512i correction = _mm512_set1_epi32(510 * input.sum);
+    const __m512 scale = _mm512_set1_ps(kInv * input.q);
+    const __m512 delta = _mm512_set1_ps((kAffineDelta * input.q) * static_cast<float>(input.sum));
+    for (size_t tile_n = first_tile; tile_n < first_tile + tile_count; ++tile_n) {
+        __m512i acc = _mm512_setzero_si512();
+        for (size_t tile_k = k_tile_begin; tile_k < k_tile_begin + k_tile_count; ++tile_k) {
+            const size_t tile_index = strata::kernels::exl3::trellis_tile_index(
+                matrix.tile_order, static_cast<int64_t>(tile_k), static_cast<int64_t>(tile_n),
+                static_cast<int64_t>(tiles_k), static_cast<int64_t>(tiles_n));
+            const uint16_t* tile = matrix.trellis + tile_index * packed_words;
+            __m256i registers[Bits];
+            for (int i = 0; i < Bits; ++i)
+                registers[i] = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(tile + i * 16));
+            accumulate_rows512<Bits>(registers, input.duplicated + tile_k * 16, acc);
+        }
+        if (sums != nullptr) {
+            // The sums of a K range: they are added up by `combine_partials512`,
+            // which converts them once.
+            int32_t* out = sums + (tile_n - first_tile) * 16;
+            _mm512_storeu_si512(reinterpret_cast<__m512i*>(out), acc);
+            continue;
+        }
+        // Center in exact i32 before conversion, avoiding cancellation between
+        // two large FP32 terms. No FP64 products or binary16 decode remains.
+        const __m512 z = _mm512_add_ps(_mm512_mul_ps(
+            _mm512_cvtepi32_ps(_mm512_sub_epi32(acc, correction)), scale), delta);
+        float* out = dot + (tile_n - first_tile) * 16;
+        _mm512_storeu_ps(out, z);
+    }
+}
+
+// The sums of a K range, added up and converted, at 512 bits: the same
+// values as the AVX2 kernel's.
+EXL3_INTDOT_AVX512 void combine_partials512(const Mul1Input& input, size_t tile_count, const int32_t* partials,
+                                            int partial_count, size_t partial_stride, float* dot) {
+    const __m512i correction = _mm512_set1_epi32(510 * input.sum);
+    const __m512 scale = _mm512_set1_ps(kInv * input.q);
+    const __m512 delta = _mm512_set1_ps((kAffineDelta * input.q) * static_cast<float>(input.sum));
+    for (size_t tile = 0; tile < tile_count; ++tile) {
+        const int32_t* first = partials + tile * 16;
+        __m512i acc = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(first));
+        for (int part = 1; part < partial_count; ++part) {
+            const int32_t* src = partials + static_cast<size_t>(part) * partial_stride + tile * 16;
+            acc = _mm512_add_epi32(acc, _mm512_loadu_si512(reinterpret_cast<const __m512i*>(src)));
+        }
+        const __m512 z = _mm512_add_ps(_mm512_mul_ps(
+            _mm512_cvtepi32_ps(_mm512_sub_epi32(acc, correction)), scale), delta);
+        _mm512_storeu_ps(dot + tile * 16, z);
+    }
+}
+
+// The kernel's walk of the tile range: the bit width picks the
+// instantiation, the kernel the one the caller resolved.
+template <int Bits>
+void dot_range_dispatch(Mul1Isa kernel, const MatrixView& matrix, const Mul1Input& input, size_t first_tile,
+                        size_t tile_count, size_t k_tile_begin, size_t k_tile_count, int32_t* sums, float* dot) {
+    if (kernel == Mul1Isa::avx512)
+        dot_range512<Bits>(matrix, input, first_tile, tile_count, k_tile_begin, k_tile_count, sums, dot);
+    else
+        dot_range<Bits>(matrix, input, first_tile, tile_count, k_tile_begin, k_tile_count, sums, dot);
+}
+// The kernel a request names.  The run-time choice is the AVX-512 kernel
+// where the CPU has it (`cpu_avx512_ok` reads the feature bits, never a
+// vendor string or a model name) and the AVX2 kernel elsewhere.
+Mul1Isa resolve_isa(Mul1Isa isa) {
+    if (isa != Mul1Isa::auto_select) return isa;
+    static const bool avx512 = strata::kernels::cpu::cpu_avx512_ok();
+    return avx512 ? Mul1Isa::avx512 : Mul1Isa::avx2;
+}
+
+// Whether this CPU can run the kernel a request names.  A kernel the CPU
+// cannot run is refused, not attempted: the instruction would fault.
+bool isa_available(Mul1Isa isa) {
+    switch (isa) {
+        case Mul1Isa::avx512: return strata::kernels::cpu::cpu_avx512_ok();
+        case Mul1Isa::avx2: return strata::kernels::cpu::cpu_avx2_ok();
+        default: return true;
+    }
+}
 #endif
 }  // namespace
 
@@ -286,12 +519,14 @@ bool mul1_intdot_enabled() {
 }
 
 bool prepare_mul1_input(const MatrixView& matrix, const float* input_basis, int32_t* duplicated,
-                        size_t capacity, Mul1Input& prepared) {
+                        size_t capacity, Mul1Input& prepared, Mul1Isa isa) {
     prepared = {};
     if (!mul1_intdot_enabled() || !eligible(matrix) || input_basis == nullptr || duplicated == nullptr ||
         capacity < static_cast<size_t>(matrix.k))
         return false;
 #if EXL3_INTDOT_AVAILABLE
+    const Mul1Isa kernel = resolve_isa(isa);
+    if (!isa_available(kernel)) return false;
     // Positive IEEE bits are ordered like their finite values. This scan also
     // sees tiny/non-finite inputs when ambient DAZ/FTZ is enabled.
     uint32_t amax_bits = 0;
@@ -307,7 +542,10 @@ bool prepare_mul1_input(const MatrixView& matrix, const float* input_basis, int3
     const float q = amax_bits != 0 ? amax / 127.0f : 1.0f;
     if (!(q > 0.0f) || !std::isfinite(1.0f / q)) return false;
     int32_t sum = 0;
-    quantize_input(input_basis, static_cast<size_t>(matrix.k), duplicated, q, sum);
+    if (kernel == Mul1Isa::avx512)
+        quantize_input_avx512(input_basis, static_cast<size_t>(matrix.k), duplicated, q, sum);
+    else
+        quantize_input(input_basis, static_cast<size_t>(matrix.k), duplicated, q, sum);
     prepared = {duplicated, static_cast<size_t>(matrix.k), q, sum, true};
     return true;
 #else
@@ -316,30 +554,36 @@ bool prepare_mul1_input(const MatrixView& matrix, const float* input_basis, int3
 }
 
 bool linear_mul1_dot_range(const MatrixView& matrix, const Mul1Input& prepared,
-                           size_t first_tile, size_t tile_count, float* dot) {
+                           size_t first_tile, size_t tile_count, float* dot, Mul1Isa isa) {
     if (!mul1_intdot_enabled() || !eligible(matrix) || !prepared.ready || prepared.duplicated == nullptr ||
         prepared.count < static_cast<size_t>(matrix.k) || dot == nullptr || tile_count == 0 ||
         tile_count > static_cast<size_t>(matrix.n / 16) || first_tile > static_cast<size_t>(matrix.n / 16) - tile_count)
         return false;
 #if EXL3_INTDOT_AVAILABLE
+    const Mul1Isa kernel = resolve_isa(isa);
+    if (!isa_available(kernel)) return false;
     // The sums of a K split, when the caller has them: the same conversion the
     // walk over the trellis applies to its own sums, so the value is the same.
     if (prepared.partials != nullptr && prepared.partial_count > 0 &&
         prepared.partial_first_tile == first_tile && prepared.partial_tiles == tile_count &&
         prepared.partial_stride >= tile_count * 16) {
-        combine_partials(prepared, tile_count, prepared.partials, prepared.partial_count, prepared.partial_stride,
-                         dot);
+        if (kernel == Mul1Isa::avx512)
+            combine_partials512(prepared, tile_count, prepared.partials, prepared.partial_count,
+                               prepared.partial_stride, dot);
+        else
+            combine_partials(prepared, tile_count, prepared.partials, prepared.partial_count,
+                             prepared.partial_stride, dot);
         return true;
     }
     switch (matrix.bits) {
-        case 1: dot_range<1>(matrix, prepared, first_tile, tile_count, 0, matrix.k / 16, nullptr, dot); break;
-        case 2: dot_range<2>(matrix, prepared, first_tile, tile_count, 0, matrix.k / 16, nullptr, dot); break;
-        case 3: dot_range<3>(matrix, prepared, first_tile, tile_count, 0, matrix.k / 16, nullptr, dot); break;
-        case 4: dot_range<4>(matrix, prepared, first_tile, tile_count, 0, matrix.k / 16, nullptr, dot); break;
-        case 5: dot_range<5>(matrix, prepared, first_tile, tile_count, 0, matrix.k / 16, nullptr, dot); break;
-        case 6: dot_range<6>(matrix, prepared, first_tile, tile_count, 0, matrix.k / 16, nullptr, dot); break;
-        case 7: dot_range<7>(matrix, prepared, first_tile, tile_count, 0, matrix.k / 16, nullptr, dot); break;
-        default: dot_range<8>(matrix, prepared, first_tile, tile_count, 0, matrix.k / 16, nullptr, dot); break;
+        case 1: dot_range_dispatch<1>(kernel, matrix, prepared, first_tile, tile_count, 0, matrix.k / 16, nullptr, dot); break;
+        case 2: dot_range_dispatch<2>(kernel, matrix, prepared, first_tile, tile_count, 0, matrix.k / 16, nullptr, dot); break;
+        case 3: dot_range_dispatch<3>(kernel, matrix, prepared, first_tile, tile_count, 0, matrix.k / 16, nullptr, dot); break;
+        case 4: dot_range_dispatch<4>(kernel, matrix, prepared, first_tile, tile_count, 0, matrix.k / 16, nullptr, dot); break;
+        case 5: dot_range_dispatch<5>(kernel, matrix, prepared, first_tile, tile_count, 0, matrix.k / 16, nullptr, dot); break;
+        case 6: dot_range_dispatch<6>(kernel, matrix, prepared, first_tile, tile_count, 0, matrix.k / 16, nullptr, dot); break;
+        case 7: dot_range_dispatch<7>(kernel, matrix, prepared, first_tile, tile_count, 0, matrix.k / 16, nullptr, dot); break;
+        default: dot_range_dispatch<8>(kernel, matrix, prepared, first_tile, tile_count, 0, matrix.k / 16, nullptr, dot); break;
     }
     return true;
 #else
@@ -348,23 +592,26 @@ bool linear_mul1_dot_range(const MatrixView& matrix, const Mul1Input& prepared,
 }
 
 Status linear_mul1_accumulate_range(const MatrixView& matrix, const Mul1Input& prepared, size_t first_tile,
-                                    size_t tile_count, size_t k_tile_begin, size_t k_tile_count, int32_t* acc) {
+                                    size_t tile_count, size_t k_tile_begin, size_t k_tile_count, int32_t* acc,
+                                    Mul1Isa isa) {
     if (!mul1_intdot_enabled() || !eligible(matrix) || !prepared.ready || prepared.duplicated == nullptr ||
         prepared.count < static_cast<size_t>(matrix.k) || acc == nullptr || tile_count == 0 ||
         tile_count > static_cast<size_t>(matrix.n / 16) || first_tile > static_cast<size_t>(matrix.n / 16) - tile_count)
         return Status::unsupported_layout;
 #if EXL3_INTDOT_AVAILABLE
+    const Mul1Isa kernel = resolve_isa(isa);
+    if (!isa_available(kernel)) return Status::unsupported_layout;
     const size_t tiles_k = static_cast<size_t>(matrix.k / 16);
     if (k_tile_count == 0 || k_tile_begin > tiles_k - k_tile_count) return Status::invalid_argument;
     switch (matrix.bits) {
-        case 1: dot_range<1>(matrix, prepared, first_tile, tile_count, k_tile_begin, k_tile_count, acc, nullptr); break;
-        case 2: dot_range<2>(matrix, prepared, first_tile, tile_count, k_tile_begin, k_tile_count, acc, nullptr); break;
-        case 3: dot_range<3>(matrix, prepared, first_tile, tile_count, k_tile_begin, k_tile_count, acc, nullptr); break;
-        case 4: dot_range<4>(matrix, prepared, first_tile, tile_count, k_tile_begin, k_tile_count, acc, nullptr); break;
-        case 5: dot_range<5>(matrix, prepared, first_tile, tile_count, k_tile_begin, k_tile_count, acc, nullptr); break;
-        case 6: dot_range<6>(matrix, prepared, first_tile, tile_count, k_tile_begin, k_tile_count, acc, nullptr); break;
-        case 7: dot_range<7>(matrix, prepared, first_tile, tile_count, k_tile_begin, k_tile_count, acc, nullptr); break;
-        default: dot_range<8>(matrix, prepared, first_tile, tile_count, k_tile_begin, k_tile_count, acc, nullptr); break;
+        case 1: dot_range_dispatch<1>(kernel, matrix, prepared, first_tile, tile_count, k_tile_begin, k_tile_count, acc, nullptr); break;
+        case 2: dot_range_dispatch<2>(kernel, matrix, prepared, first_tile, tile_count, k_tile_begin, k_tile_count, acc, nullptr); break;
+        case 3: dot_range_dispatch<3>(kernel, matrix, prepared, first_tile, tile_count, k_tile_begin, k_tile_count, acc, nullptr); break;
+        case 4: dot_range_dispatch<4>(kernel, matrix, prepared, first_tile, tile_count, k_tile_begin, k_tile_count, acc, nullptr); break;
+        case 5: dot_range_dispatch<5>(kernel, matrix, prepared, first_tile, tile_count, k_tile_begin, k_tile_count, acc, nullptr); break;
+        case 6: dot_range_dispatch<6>(kernel, matrix, prepared, first_tile, tile_count, k_tile_begin, k_tile_count, acc, nullptr); break;
+        case 7: dot_range_dispatch<7>(kernel, matrix, prepared, first_tile, tile_count, k_tile_begin, k_tile_count, acc, nullptr); break;
+        default: dot_range_dispatch<8>(kernel, matrix, prepared, first_tile, tile_count, k_tile_begin, k_tile_count, acc, nullptr); break;
     }
     return Status::ok;
 #else

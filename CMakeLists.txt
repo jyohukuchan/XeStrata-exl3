@@ -1109,6 +1109,11 @@ if(STRATA_BUILD_TESTS)
   # same bits as the vector one, so the reference covers both.
   add_test(NAME exl3_cpu_layout_generic_parity COMMAND exl3_cpu_layout_parity)
   set_tests_properties(exl3_cpu_layout_generic_parity PROPERTIES ENVIRONMENT "STRATA_NO_EXL3_AVX2=1" TIMEOUT 120)
+  # The same check with the AVX2 kernel on a CPU that has AVX-512: the
+  # default entry takes the AVX-512 kernel there, and both are checked
+  # against the same reference, so the two kernels must agree.
+  add_test(NAME exl3_cpu_layout_avx2_parity COMMAND exl3_cpu_layout_parity)
+  set_tests_properties(exl3_cpu_layout_avx2_parity PROPERTIES ENVIRONMENT "STRATA_FORCE_AVX2=1" TIMEOUT 120)
   add_executable(exl3_cpu_layout_intdot_parity src/kernels/cpu/exl3_layout_parity.cpp)
   target_link_libraries(exl3_cpu_layout_intdot_parity PRIVATE strata_kernels_cpu strata_exl3_expert_artifact
                         strata_warnings)
