@@ -136,6 +136,34 @@ The tile orders were compared afterwards, and the N-major order became the defau
 
 The measurement was CPU only. The maintainer runs the GPU decode measurements.
 
+## More tasks by cutting the dot along K
+
+The CPU expert pool's packed EXL3 row-parallel phase has one task per 128-output block per expert row. When a layer has only a few experts that miss the VRAM tier and fall back to the host, the gate/up phase has misses×8 tasks and the down phase misses×16, so many layers have fewer tasks than the pool's workers, and the workers idle.
+
+The dot was therefore cut along K. The block's dot is split into ranges of K, and each range is a task of its own. Each task leaves its integer partial sums behind in a workspace, and the task that finishes the block's last range adds them up and applies the block's transform once.
+
+The cut applies only when the phase's tasks do not fill the workers. The number of ranges is `floor(workers / tasks)`, which fills one round of them. A phase that already has the workers' worth of tasks is left alone: there the cut does not shorten a round, and the ranges' shorter memory runs cost more than the cut saves.
+
+The partial sums are exact integers and the transform is applied once, after they are added up, so the order of the addition changes but the values do not. On a real checkpoint, 0 of 10240 expert output values differ and the whole model's logits (7946240 bytes) compare bit for bit equal. The teacher KL therefore does not have to be taken again.
+
+CPU only, with the real weights (H 2048, FF 512, 40 layers, the integer dot on), the median of the 40-layer round over 3 repeats. The one-expert-per-layer shape (the starved one) changes as follows.
+
+| workers | before µs | after µs |
+| ---: | ---: | ---: |
+| 8 | 4009 | 3978 |
+| 24 | 3386 | 3016 |
+| 32 | 4656 | 3250 |
+| 48 | 5227 | 3599 |
+| 64 | 4638 | 3342 |
+
+The five-experts-per-layer shape already fills the workers in each phase, so the cut does not apply and the two arms are the same within the noise: +0.8%, +0.7%, +0.8%, -5.5% and +0.0% at 8, 24, 32, 48 and 64 workers.
+
+The whole model's decode (the fixed-token bench, 128 positions, the 8 GiB VRAM limit, the matrix engines off, the integer dot and the row split on) gains 0.8% to 4.0%: 34.58 to 35.04 tok/s at 8 workers, 40.51 to 40.82 at 24, 38.75 to 39.23 at 32, 36.64 to 37.36 at 48 and 33.39 to 34.73 at 64. The curve's shape does not change and its peak is at 24 workers; the fall after that is memory bandwidth, not the task count.
+
+The cut does not go below the 128-output block: 128 outputs form one Hadamard transform, so the block's dot would have to be assembled before the transform. The per-task bookkeeping is about 0.2µs, and forcing the cut where it does not pay made the gate/up phase 40% and the down phase 87% slower. It is therefore limited to the conditions where it pays.
+
+The measurement environment and the model's location are in the repository's `LOCAL.md`.
+
 ## Capacity checks and worker settings
 
 The source currently checks available RAM and cgroup capacity every layer. An independent diagnostic of 1020 calls measured about 110µs per call: about 87µs for cgroup collection and 20µs for reading and parsing `MemAvailable`. Across 40 layers this is about 4.4ms of call cost, not a claim that all of it can be removed from decode.
