@@ -180,9 +180,23 @@ EXL3_INTDOT_AVX2 void quantize_input(const float* input, size_t k, int32_t* dupl
     for (int32_t lane : lanes) sum += lane;
 }
 
+// The dot of a tile range over a range of the K tiles.
+//
+// `sums` receives the integer sums of the K range, one per output of the tile
+// range, and `dot` the float dot of the whole K.  Exactly one of them is
+// given.  The K range is here because a batch of a few experts gives the
+// pool fewer tasks than it has workers, and a task that walks a range of the K
+// gives the phase more tasks; the ranges' sums are added up afterwards, and
+// since they are integers the sum does not depend on how the K was cut.
+//
+// The walk of the rows is written once, in `accumulate_rows`: the compiler
+// inlines that walk into this function, and it stops inlining it when the
+// call sits in two functions of its own.  A call per tile would cost the dot
+// about a tenth of its time.
 template <int Bits>
-EXL3_INTDOT_AVX2 void dot_range(const MatrixView& matrix, const Mul1Input& input,
-                                size_t first_tile, size_t tile_count, float* dot) {
+EXL3_INTDOT_AVX2 void dot_range(const MatrixView& matrix, const Mul1Input& input, size_t first_tile,
+                                size_t tile_count, size_t k_tile_begin, size_t k_tile_count, int32_t* sums,
+                                float* dot) {
     const size_t tiles_k = static_cast<size_t>(matrix.k / 16);
     const size_t tiles_n = static_cast<size_t>(matrix.n / 16);
     const size_t packed_words = static_cast<size_t>(16 * Bits);
@@ -192,7 +206,7 @@ EXL3_INTDOT_AVX2 void dot_range(const MatrixView& matrix, const Mul1Input& input
     const __m256 delta = _mm256_set1_ps((kAffineDelta * input.q) * static_cast<float>(input.sum));
     for (size_t tile_n = first_tile; tile_n < first_tile + tile_count; ++tile_n) {
         __m256i acc_lo = _mm256_setzero_si256(), acc_hi = _mm256_setzero_si256();
-        for (size_t tile_k = 0; tile_k < tiles_k; ++tile_k) {
+        for (size_t tile_k = k_tile_begin; tile_k < k_tile_begin + k_tile_count; ++tile_k) {
             const size_t tile_index = strata::kernels::exl3::trellis_tile_index(
                 matrix.tile_order, static_cast<int64_t>(tile_k), static_cast<int64_t>(tile_n),
                 static_cast<int64_t>(tiles_k), static_cast<int64_t>(tiles_n));
@@ -201,6 +215,14 @@ EXL3_INTDOT_AVX2 void dot_range(const MatrixView& matrix, const Mul1Input& input
             for (int i = 0; i < Bits; ++i)
                 registers[i] = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(tile + i * 16));
             accumulate_rows<Bits>(registers, input.duplicated + tile_k * 16, acc_lo, acc_hi);
+        }
+        if (sums != nullptr) {
+            // The sums of a K range: they are added up by `combine_partials`,
+            // which converts them once.
+            int32_t* out = sums + (tile_n - first_tile) * 16;
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(out), acc_lo);
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(out + 8), acc_hi);
+            continue;
         }
         // Center in exact i32 before conversion, avoiding cancellation between
         // two large FP32 terms. No FP64 products or binary16 decode remains.
@@ -211,6 +233,33 @@ EXL3_INTDOT_AVX2 void dot_range(const MatrixView& matrix, const Mul1Input& input
         float* out = dot + (tile_n - first_tile) * 16;
         _mm256_storeu_ps(out, z_lo);
         _mm256_storeu_ps(out + 8, z_hi);
+    }
+}
+
+// Adds the integer partial sums of a K split and applies the affine
+// correction, which is the conversion the unsplit path applies to its own
+// sums.  The sums are integers, so the result is the same value the unsplit
+// path produces, whatever the number of ranges was.
+EXL3_INTDOT_AVX2 void combine_partials(const Mul1Input& input, size_t tile_count, const int32_t* partials,
+                                       int partial_count, size_t partial_stride, float* dot) {
+    const __m256i correction = _mm256_set1_epi32(510 * input.sum);
+    const __m256 scale = _mm256_set1_ps(kInv * input.q);
+    const __m256 delta = _mm256_set1_ps((kAffineDelta * input.q) * static_cast<float>(input.sum));
+    for (size_t tile = 0; tile < tile_count; ++tile) {
+        const int32_t* first = partials + tile * 16;
+        __m256i acc_lo = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(first));
+        __m256i acc_hi = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(first + 8));
+        for (int part = 1; part < partial_count; ++part) {
+            const int32_t* src = partials + static_cast<size_t>(part) * partial_stride + tile * 16;
+            acc_lo = _mm256_add_epi32(acc_lo, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src)));
+            acc_hi = _mm256_add_epi32(acc_hi, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + 8)));
+        }
+        const __m256 z_lo = _mm256_add_ps(_mm256_mul_ps(
+            _mm256_cvtepi32_ps(_mm256_sub_epi32(acc_lo, correction)), scale), delta);
+        const __m256 z_hi = _mm256_add_ps(_mm256_mul_ps(
+            _mm256_cvtepi32_ps(_mm256_sub_epi32(acc_hi, correction)), scale), delta);
+        _mm256_storeu_ps(dot + tile * 16, z_lo);
+        _mm256_storeu_ps(dot + tile * 16 + 8, z_hi);
     }
 }
 #endif
@@ -267,18 +316,61 @@ bool linear_mul1_dot_range(const MatrixView& matrix, const Mul1Input& prepared,
         tile_count > static_cast<size_t>(matrix.n / 16) || first_tile > static_cast<size_t>(matrix.n / 16) - tile_count)
         return false;
 #if EXL3_INTDOT_AVAILABLE
+    // The sums of a K split, when the caller has them: the same conversion the
+    // walk over the trellis applies to its own sums, so the value is the same.
+    if (prepared.partials != nullptr && prepared.partial_count > 0 &&
+        prepared.partial_first_tile == first_tile && prepared.partial_tiles == tile_count &&
+        prepared.partial_stride >= tile_count * 16) {
+        combine_partials(prepared, tile_count, prepared.partials, prepared.partial_count, prepared.partial_stride,
+                         dot);
+        return true;
+    }
     switch (matrix.bits) {
-        case 1: dot_range<1>(matrix, prepared, first_tile, tile_count, dot); break;
-        case 2: dot_range<2>(matrix, prepared, first_tile, tile_count, dot); break;
-        case 3: dot_range<3>(matrix, prepared, first_tile, tile_count, dot); break;
-        case 4: dot_range<4>(matrix, prepared, first_tile, tile_count, dot); break;
-        case 5: dot_range<5>(matrix, prepared, first_tile, tile_count, dot); break;
-        case 6: dot_range<6>(matrix, prepared, first_tile, tile_count, dot); break;
-        case 7: dot_range<7>(matrix, prepared, first_tile, tile_count, dot); break;
-        default: dot_range<8>(matrix, prepared, first_tile, tile_count, dot); break;
+        case 1: dot_range<1>(matrix, prepared, first_tile, tile_count, 0, matrix.k / 16, nullptr, dot); break;
+        case 2: dot_range<2>(matrix, prepared, first_tile, tile_count, 0, matrix.k / 16, nullptr, dot); break;
+        case 3: dot_range<3>(matrix, prepared, first_tile, tile_count, 0, matrix.k / 16, nullptr, dot); break;
+        case 4: dot_range<4>(matrix, prepared, first_tile, tile_count, 0, matrix.k / 16, nullptr, dot); break;
+        case 5: dot_range<5>(matrix, prepared, first_tile, tile_count, 0, matrix.k / 16, nullptr, dot); break;
+        case 6: dot_range<6>(matrix, prepared, first_tile, tile_count, 0, matrix.k / 16, nullptr, dot); break;
+        case 7: dot_range<7>(matrix, prepared, first_tile, tile_count, 0, matrix.k / 16, nullptr, dot); break;
+        default: dot_range<8>(matrix, prepared, first_tile, tile_count, 0, matrix.k / 16, nullptr, dot); break;
     }
     return true;
 #else
+    return false;
+#endif
+}
+
+Status linear_mul1_accumulate_range(const MatrixView& matrix, const Mul1Input& prepared, size_t first_tile,
+                                    size_t tile_count, size_t k_tile_begin, size_t k_tile_count, int32_t* acc) {
+    if (!mul1_intdot_enabled() || !eligible(matrix) || !prepared.ready || prepared.duplicated == nullptr ||
+        prepared.count < static_cast<size_t>(matrix.k) || acc == nullptr || tile_count == 0 ||
+        tile_count > static_cast<size_t>(matrix.n / 16) || first_tile > static_cast<size_t>(matrix.n / 16) - tile_count)
+        return Status::unsupported_layout;
+#if EXL3_INTDOT_AVAILABLE
+    const size_t tiles_k = static_cast<size_t>(matrix.k / 16);
+    if (k_tile_count == 0 || k_tile_begin > tiles_k - k_tile_count) return Status::invalid_argument;
+    switch (matrix.bits) {
+        case 1: dot_range<1>(matrix, prepared, first_tile, tile_count, k_tile_begin, k_tile_count, acc, nullptr); break;
+        case 2: dot_range<2>(matrix, prepared, first_tile, tile_count, k_tile_begin, k_tile_count, acc, nullptr); break;
+        case 3: dot_range<3>(matrix, prepared, first_tile, tile_count, k_tile_begin, k_tile_count, acc, nullptr); break;
+        case 4: dot_range<4>(matrix, prepared, first_tile, tile_count, k_tile_begin, k_tile_count, acc, nullptr); break;
+        case 5: dot_range<5>(matrix, prepared, first_tile, tile_count, k_tile_begin, k_tile_count, acc, nullptr); break;
+        case 6: dot_range<6>(matrix, prepared, first_tile, tile_count, k_tile_begin, k_tile_count, acc, nullptr); break;
+        case 7: dot_range<7>(matrix, prepared, first_tile, tile_count, k_tile_begin, k_tile_count, acc, nullptr); break;
+        default: dot_range<8>(matrix, prepared, first_tile, tile_count, k_tile_begin, k_tile_count, acc, nullptr); break;
+    }
+    return Status::ok;
+#else
+    return Status::unsupported_layout;
+#endif
+}
+
+bool linear_mul1_supported(const MatrixView& matrix) {
+#if EXL3_INTDOT_AVAILABLE
+    return mul1_intdot_enabled() && eligible(matrix);
+#else
+    (void) matrix;
     return false;
 #endif
 }

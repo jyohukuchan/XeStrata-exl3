@@ -86,11 +86,24 @@ struct ExpertJobExl3 {
 
 /// A bounded row/block task used only by the packed EXL3 row-parallel phases.
 struct Exl3RowTask {
-    enum class Kind : uint8_t { input_gate_up, gate_block, up_block, silu_down_input, down_block };
+    enum class Kind : uint8_t {
+        input_gate_up,
+        gate_block,
+        up_block,
+        silu_down_input,
+        down_block,
+        // The K-split kinds: one K range of one 128-output block.  The task
+        // that finishes the block's last range adds up the block's integer
+        // partial sums and applies the block's transform.
+        gate_block_chunk,
+        up_block_chunk,
+        down_block_chunk,
+    };
     Kind kind = Kind::input_gate_up;
     uint16_t job = 0;
     uint16_t row = 0;
     uint16_t block = 0;
+    uint16_t chunk = 0;
 };
 
 /// One logical processor per PHYSICAL core, so a worker is never scheduled onto an SMT sibling of another
@@ -186,7 +199,16 @@ public:
     exl3::Status run_exl3(ExpertJobExl3* jobs, int n);
     /// Prepare and run packed-only output-block phases. Raw or over-bounded jobs return a fallback status before output.
     exl3::Status prepare_exl3_rowparallel(int64_t max_rows, int64_t max_jobs, int64_t max_hidden, int64_t max_ff);
-    exl3::Status run_exl3_rowparallel(ExpertJobExl3* jobs, int n);
+    /// Run the packed output-block phases.  `k_split` is the number of K
+    /// ranges the dot of a block is cut into: 0 chooses the count from the
+    /// worker count and the batch, a positive number is that count, and a
+    /// negative number keeps the whole K in one task.  The values do not
+    /// depend on the count: the ranges' sums are exact integers and the
+    /// block's transform is applied once, after they are added up.
+    exl3::Status run_exl3_rowparallel(ExpertJobExl3* jobs, int n, int k_split = 0);
+    /// The number of K ranges the last row batch cut the gate/up dot into.
+    /// A test reads it to see that the split path ran at all.
+    int last_row_chunks() const { return exl3_row_chunks_gu_; }
     /// run_split_multi's phases, accumulated ms: gate/up rows, the intermediate quantization, down rows.
     double ms_multi_gu = 0, ms_multi_q = 0, ms_multi_down = 0;
     int64_t multi_bytes = 0;
@@ -297,6 +319,13 @@ private:
         std::vector<int32_t> quant_gate, quant_up, quant_down;
         std::vector<exl3::Mul1Input> mul1_gate, mul1_up, mul1_down;
         std::vector<Exl3RowTask> tasks;
+        // The K split's integer partial sums: one 128-output block's sums per
+        // K range.  The counter names the task that adds them up.
+        std::vector<int32_t> partial_gate, partial_up, partial_down;
+        struct alignas(64) CountCell {
+            std::atomic<int32_t> value{0};
+        };
+        std::unique_ptr<CountCell[]> count_gate, count_up, count_down;
     };
     std::vector<Exl3Scratch> exl3_scratch_;
     Exl3Scratch host_exl3_scratch_;
@@ -310,6 +339,12 @@ private:
     int64_t exl3_row_max_jobs_ = 0;
     int64_t exl3_row_max_hidden_ = 0;
     int64_t exl3_row_max_ff_ = 0;
+    /// The 128-output blocks of the gate/up and the down projections, and the
+    /// K ranges the current batch cuts their dot into.
+    int64_t exl3_row_blocks_gu_ = 0, exl3_row_blocks_down_ = 0;
+    int exl3_row_chunks_gu_ = 1, exl3_row_chunks_down_ = 1;
+    /// The most K ranges the prepared workspace holds the sums of.
+    int exl3_row_max_chunks_gu_ = 1, exl3_row_max_chunks_down_ = 1;
     std::atomic<int> exl3_error_{static_cast<int>(exl3::Status::ok)};
     // run_split state: mode 0 = whole experts, 1 = gate/up row parts, 2 = down row parts
     int mode_ = 0;
