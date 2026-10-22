@@ -350,6 +350,23 @@ of that median):
 † Another process took the CPU during the measurement and stretched two tokens (167 and 183 ms);
 this is the median without them. With them the median is 110.2 ms.
 
+**The expert cache's allocation matters too.** `--stage-layers` sets the layer split and
+`STRATA_EXL3_DEVICE_CACHE_ORDER` the order the resident experts are admitted in. Three GPUs, the
+8 GiB limit, the same measurement:
+
+| Condition | tok/s | Resident experts (stage 0/1/2) |
+| --- | ---: | --- |
+| even 16,16,16 + `spread` (the default) | 9.76 | 3563 / 3602 / 3355 |
+| even + `visited` | 7.48 | 3563 / 3602 / 457 |
+| 18,18,12 + `spread` | 9.61 | 3470 / 3513 / 3539 |
+| **18,18,12 + `visited`** | **10.75** | 3470 / 3513 / 3539 |
+
+One card (the R9700, the same limit) reaches 11.14 tok/s, so **the best three-card run is at 96
+percent of it**. `visited` piles the experts up layer by layer, so unless the stage that carries the
+head runs fewer layers its residency falls to 457 and the run is slower. What pays is the room the
+smaller layers leave on that card, so that every stage holds about 3500 experts. Cutting the cache
+budget (`STRATA_EXL3_DEVICE_CACHE_MIB`) to 6 GiB makes no difference (9.82 tok/s, 10273 resident).
+
 What the phase breakdown shows first is that the `post` wait is gone and only `bridge` (the residual
 handover) remains, at 0 to 0.5 ms: `post` falls from 6-8 ms to 0.3-0.7 ms. The pre graph is awaited
 at the doorbell ring, so the CPU's expert work runs beside the rest of the graph and the

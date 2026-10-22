@@ -336,6 +336,22 @@ logits は単一 stage の参照と bit 一致し、device cache ありでも gr
 † 測定中に別のプロセスが CPU を使う spike が2 トークン（167 と 183 ms）混ざった。それを除いた
 中央値。除かない中央値は 110.2 ms。
 
+**expert cache の配分も効く。** `--stage-layers` で層の分割を、`STRATA_EXL3_DEVICE_CACHE_ORDER`
+で常駐させる expert の順を変えられる。3 GPU、VRAM 上限 8 GiB、同じ測定:
+
+| 条件 | tok/s | 常駐 expert（stage 0/1/2） |
+| --- | ---: | --- |
+| 均等 16,16,16 + `spread`（既定） | 9.76 | 3563 / 3602 / 3355 |
+| 均等 + `visited` | 7.48 | 3563 / 3602 / 457 |
+| 18,18,12 + `spread` | 9.61 | 3470 / 3513 / 3539 |
+| **18,18,12 + `visited`** | **10.75** | 3470 / 3513 / 3539 |
+
+1 枚（R9700、同じ上限）は 11.14 tok/s なので、**3 枚の最良はその 96%** まで来る。
+`visited` は層ごとに集中して積むので、head を持つ stage の層数を減らさないとその stage の
+常駐が 457 に落ちて逆に遅くなる。層数を減らした stage に余地が残り、全 stage が約 3500 expert
+を常駐させることが速さに効く。cache の予算（`STRATA_EXL3_DEVICE_CACHE_MIB`）を 6 GiB に
+切っても 9.82 tok/s と変わらない（常駐 10,273 で十分）。
+
 phase の内訳で目につくのは `post` の待ちが消えたことと、`bridge`（residual の受け渡し）が
 0〜0.5 ms だけ残ったことである: `post` は 6〜8 ms が 0.3〜0.7 ms になる。pre graph は doorbell の
 鐘で待つので、expert の CPU 側の仕事が graph の残りと並んで走り、層の終わりから次の層の始めまでの
