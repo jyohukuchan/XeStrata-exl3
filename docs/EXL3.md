@@ -262,6 +262,59 @@ path accumulates in FP64, so the last bits differ. The logits of a run without a
 identical with the reference; with the cache the largest absolute difference of a logit is 1.4e-4 (1e-5
 relative), and the greedy tokens do not change.
 
+### Several GPUs (Qwen3.8 Flash)
+
+The EXL3 Flash layers are split over the devices named by `--stage-devices`. Without the option the
+model makes as many stages as the engine has usable GPUs, and the layers are cut at
+`layer_count * stage / stage_count`, so every stage owns at least one layer. Each stage has its own
+device, session arena, dense weights, expert runtime and device cache.
+
+**Only the residual crosses a stage boundary.** The previous stage's residual (`hc * n_embd` floats)
+goes through a host bridge buffer into the next stage's session. The devices do not share an address
+space, so nothing else can be carried from one device to another. The session arena (the GDN state,
+the QSA KV cache, the PLE's conv history), the dense weights, the expert runtime, the device cache
+and the embedding stay on the device of the stage that owns them.
+
+**The PLE does not cross a stage boundary.** The PLE block belongs to layer 1, and the layer split
+gives that layer to exactly one stage. That stage (the PLE's home stage) holds the PLE's device
+half: the key and value projections' owners, the row the n-gram lookup gathered, the preprojection
+destinations, the scratch and the conv history. The rows are read on the home stage and consumed
+by the same stage's layer 1 pre graph, so no part of the PLE crosses a boundary. The PLE's token
+window (the token being decoded and the two before it) is read on the host, so it belongs to the
+model. The home stage comes from the layer split, so however the stage count and the device order
+change, exactly one stage holds the PLE's layer and the other stages never touch the PLE.
+
+**A buffer is named after the runtime that made it.** The engine's allocations are recorded with the
+runtime that made them (`Runtime::note_allocation`), and `Runtime::owner` reads that record first.
+The record holds the size of the block too, so a pointer *inside* an allocation (a buffer carved
+out of a session arena, a slot of the expert cache) is named after the same runtime. A context scan
+alone cannot tell them apart: device USM answers "device" to `get_pointer_type` for every device,
+so the scan names the first runtime, and with a second card the stage's own buffers are taken for
+another runtime's. That is why the multi-GPU EXL3 path stopped in the stage 1 dense owner, which
+refused buffers that were its own ("input or output belongs to another runtime").
+
+Measured on the V620s at 0000:03:00.0 and 0000:43:00.0 with the Qwen3.8 EXL3 3.05 bpw checkpoint,
+48 layers, 24 layers per stage with two stages, `STRATA_VRAM_LIMIT_MIB=8192`, and the two generated
+tokens of the prompt 16,10,16,28:
+
+| Condition | Stages | Output |
+| --- | ---: | --- |
+| no device cache, the CPU's exact path | 1 | logits SHA256 `1fe719ac...` (the single-stage reference) |
+| no device cache, the CPU's exact path | 2 | logits SHA256 `1fe719ac...` (**bit identical** to the single stage) |
+| device cache, the CPU's integer dot and row-parallel phases | 1 | 1871 experts resident on stage 0 (3.25 GiB), logits SHA256 `e88713bc...` |
+| the same | 2 | 3196 experts resident on stage 0 (5.54 GiB) and 3011 on stage 1 (5.22 GiB), logits SHA256 `51e69318...` |
+
+The one-stage and two-stage values with the device cache do not agree: the cache holds a different
+set of experts in the two configurations, and a GPU-computed expert accumulates in FP32 where the
+CPU's exact path accumulates in FP64. The difference (the largest absolute difference of a logit,
+1.06) is of the same order as the one-stage difference between the exact path and the cache
+(0.83 and 0.98), and the greedy tokens do not change. The device order does not matter either: with
+`--stage-devices 1,0` the logits are bit identical.
+
+A split of three stages or more, the decode speed and running on Windows have not been checked. The
+R9700 (0000:07:00.0) is kept for other work on this host, so the measurements used the two V620s
+only.
+
 ## Qwen3.5 MoE MTP integration
 
 `--spec 2` or greater loads `mtp.fc`, three norms, and `mtp.layers.0` attention, routers and shared/routed experts

@@ -456,6 +456,22 @@ private:
 
 }  // namespace
 
+Exl3FlashStageRange exl3_flash_stage_range(int64_t layer_count, int64_t stage_count, int64_t stage_index) {
+    Exl3FlashStageRange range;
+    if (layer_count <= 0 || stage_count <= 0 || stage_index < 0 || stage_index >= stage_count) return range;
+    range.layer_begin = layer_count * stage_index / stage_count;
+    range.layer_end = layer_count * (stage_index + 1) / stage_count;
+    return range;
+}
+
+int64_t exl3_flash_ple_stage(int64_t layer_count, int64_t stage_count) {
+    for (int64_t index = 0; index < stage_count; ++index) {
+        const Exl3FlashStageRange range = exl3_flash_stage_range(layer_count, stage_count, index);
+        if (range.layer_begin <= PLE_LAYER && PLE_LAYER < range.layer_end) return index;
+    }
+    return -1;
+}
+
 struct Exl3FlashModel::Impl {
     struct Stage {
         int device = -1;
@@ -490,6 +506,12 @@ struct Exl3FlashModel::Impl {
     int embedding_device = -1;
     int ple_device = -1;
     int ple_stage_index = -1;
+    // THE PLE'S TOKEN WINDOW: the token being decoded and the two before it, oldest first.  It is
+    // the MODEL's, not a stage's: the n-gram context is read on the host, and the PLE's device half
+    // lives on the stage that runs the PLE layer (the home stage), which is where the rows are
+    // consumed.  A stage boundary therefore carries no part of the PLE.
+    int32_t ple_prev[2] = {-1, -1};
+    int32_t ple_token = -1;
     void* logits_device = nullptr;
     std::vector<float> logits_host;
     std::vector<float> bridge_host;
@@ -657,8 +679,9 @@ bool Exl3FlashModel::open(const std::filesystem::path& directory, const Exl3Flas
         for (int stage_index = 0; stage_index < stage_count; ++stage_index) {
             Impl::Stage stage;
             stage.device = impl_->options.stage_devices[static_cast<size_t>(stage_index)];
-            stage.layer_begin = layer_count * stage_index / stage_count;
-            stage.layer_end = layer_count * (stage_index + 1) / stage_count;
+            const Exl3FlashStageRange range = exl3_flash_stage_range(layer_count, stage_count, stage_index);
+            stage.layer_begin = range.layer_begin;
+            stage.layer_end = range.layer_end;
             stage.weights = std::make_unique<Exl3WeightSet>();
             stage.source = std::make_unique<Exl3ExpertSource>();
             stage.pool = std::make_unique<strata::kernels::cpu::ExpertPool>(options.pool_workers);
@@ -689,22 +712,24 @@ bool Exl3FlashModel::open(const std::filesystem::path& directory, const Exl3Flas
 
         // The Qwen3.8 PLE owner is stage-local at trunk layer 1, while the
         // sidecar row table remains one host reader shared by the session.
+        //
+        // THE PLE'S HOME STAGE.  The PLE block belongs to one layer, and the layer split gives that
+        // layer to exactly one stage.  That stage holds the PLE's device half - the key and value
+        // projections' owners, the gathered row, the preprojection destinations, the scratch and the
+        // conv history - and it reads the n-gram rows there, so the PLE does not cross a stage
+        // boundary: the other stages never touch it.  Only the residual crosses, through the host
+        // bridge.
         const std::filesystem::path ple_path = find_ple_sidecar(*impl_->archive, options.ple_sidecar);
         if (ple_path.empty()) {
             err = "EXL3 Flash: the Qwen3.8 specialized n-gram PLE sidecar is required";
             return false;
         }
-        int ple_owner_stage_index = -1;
-        for (size_t i = 0; i < impl_->stages.size(); ++i) {
-            if (impl_->stages[i].layer_begin <= 1 && 1 < impl_->stages[i].layer_end) {
-                ple_owner_stage_index = static_cast<int>(i);
-                break;
-            }
-        }
-        if (ple_owner_stage_index < 0) {
+        const int64_t ple_home = exl3_flash_ple_stage(layer_count, stage_count);
+        if (ple_home < 0) {
             err = "EXL3 Flash: no stage owns the required Qwen3.8 PLE layer 1";
             return false;
         }
+        const int ple_owner_stage_index = static_cast<int>(ple_home);
         impl_->ple_stage_index = ple_owner_stage_index;
         impl_->ple = std::make_unique<Exl3Ple>();
         impl_->ple_device = impl_->stages[static_cast<size_t>(ple_owner_stage_index)].device;
@@ -774,8 +799,10 @@ bool Exl3FlashModel::open(const std::filesystem::path& directory, const Exl3Flas
             ple_owner_stage.session.ple.value_exl3 = impl_->ple->value();
             ple_owner_stage.session.ple.pre_key_out = impl_->ple->pre_key();
             ple_owner_stage.session.ple.pre_value_out = impl_->ple->pre_value();
-            ple_owner_stage.session.ple.token = &ple_owner_stage.session.ple_token;
-            ple_owner_stage.session.ple.prev = ple_owner_stage.session.ple_prev;
+            // The token window is the model's; the history is the home stage's, carved from its
+            // session arena like every other per-stage state.
+            ple_owner_stage.session.ple.token = &impl_->ple_token;
+            ple_owner_stage.session.ple.prev = impl_->ple_prev;
             ple_owner_stage.session.ple.hist = ple_owner_stage.session.ple_hist;
             ple_owner_stage.session.ple.consts = strata::kernels::ple_artifact_consts();
             ple_owner_stage.session.ple.emb_dev = static_cast<float*>(strata::gpu::alloc_device(
@@ -820,9 +847,11 @@ bool Exl3FlashModel::open(const std::filesystem::path& directory, const Exl3Flas
             }
             stage_token(impl_->geometry, 0, 0, stage.session);
             if (stage.session.ple.table != nullptr) {
-                stage.session.ple_token = 0;
-                stage.session.ple_prev[0] = -1;
-                stage.session.ple_prev[1] = -1;
+                // The capture's PLE token: the window the model starts from, and the rows the
+                // captured graph reads.  The window is the model's; the rows are the home stage's.
+                impl_->ple_token = 0;
+                impl_->ple_prev[0] = -1;
+                impl_->ple_prev[1] = -1;
             }
             strata::gpu::Stream capture_stream = strata::gpu::stream_create();
             if (capture_stream == nullptr) {
@@ -1120,12 +1149,14 @@ bool Exl3FlashModel::reset(std::string& err) {
                 err = std::string("EXL3 Flash: resetting stage state: ") + strata::gpu::last_error();
                 return false;
             }
-            stage.session.ple_prev[0] = -1;
-            stage.session.ple_prev[1] = -1;
-            stage.session.ple_token = -1;
             std::fill(stage.miss_output.begin(), stage.miss_output.end(), 0.0f);
             std::fill(stage.merge_output.begin(), stage.merge_output.end(), 0.0f);
         }
+        // The PLE's token window is the model's: a new sequence starts with no predecessor, which
+        // is what the n-gram lookup reads as the end of the context.
+        impl_->ple_prev[0] = -1;
+        impl_->ple_prev[1] = -1;
+        impl_->ple_token = -1;
         impl_->initialized = true;
         impl_->seeded = false;
         impl_->next_position = 0;
@@ -1166,7 +1197,7 @@ bool Exl3FlashModel::forward(int32_t token, int64_t pos, int32_t& next_token, fl
             return false;
         }
         auto& ple_stage = impl_->stages[static_cast<size_t>(impl_->ple_stage_index)];
-        ple_stage.session.ple_token = token;
+        impl_->ple_token = token;
         bool ple_collected = ple_stage.session.ple.table == nullptr;
         if (ple_stage.session.ple.table != nullptr) {
             if (!ple_stage.session.ple.ready() ||
@@ -1219,6 +1250,9 @@ bool Exl3FlashModel::forward(int32_t token, int64_t pos, int32_t& next_token, fl
             auto& stage = impl_->stages[stage_index];
             const OnDevice on(stage.device);
             if (stage_index > 0) {
+                // THE RESIDUAL IS THE ONLY THING THAT CROSSES A STAGE BOUNDARY.  It goes through
+                // the host bridge, because the two devices do not share an address space; the
+                // PLE, the embedding and every per-layer state stay on the stage that owns them.
                 if (!strata::gpu::copy(stage.session.block.R, impl_->bridge_host.data(),
                                        impl_->bridge_host.size() * sizeof(float))) {
                     err = std::string("EXL3 Flash: stage boundary residual upload failed: ") + strata::gpu::last_error();
@@ -1335,8 +1369,10 @@ bool Exl3FlashModel::forward(int32_t token, int64_t pos, int32_t& next_token, fl
         if (host_logits != nullptr)
             std::copy(impl_->logits_host.begin(), impl_->logits_host.end(), host_logits);
         if (ple_stage.session.ple.table != nullptr) {
-            ple_stage.session.ple_prev[0] = ple_stage.session.ple_prev[1];
-            ple_stage.session.ple_prev[1] = token;
+            // THE TOKEN WINDOW ADVANCES ONCE PER TOKEN, ON THE MODEL.  The n-gram lookup reads
+            // the two tokens before the one being decoded, oldest first.
+            impl_->ple_prev[0] = impl_->ple_prev[1];
+            impl_->ple_prev[1] = token;
         }
         ++impl_->next_position;
         if (timing.enabled) {
