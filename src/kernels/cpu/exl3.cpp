@@ -180,22 +180,36 @@ inline uint16_t decode_state_half_lut(uint16_t state, int codebook) {
     return codebook_lut()[static_cast<size_t>(codebook)][state];
 }
 
-using CodebookF32Lut = std::array<std::array<float, 65536>, 3>;
+using CodebookF32Lut = std::array<float, 65536>;
 
 // F32 values are derived from the exact F16 LUT once.  The pointer for the
 // selected codebook is hoisted by linear_with_scratch; no function/static guard
 // remains in the per-weight loop.
-const CodebookF32Lut& codebook_lut_f32() {
-    static const CodebookF32Lut table = [] {
+//
+// The table of a codebook is built the first time that codebook is decoded,
+// so a model that uses one codebook builds one table and not three.
+const CodebookF32Lut& codebook_lut_f32(int codebook) {
+    const auto make = [](int which) {
         CodebookF32Lut result{};
         const auto& half_table = codebook_lut();
-        for (int codebook = 0; codebook < 3; ++codebook)
-            for (uint32_t state = 0; state < 65536; ++state)
-                result[static_cast<size_t>(codebook)][state] =
-                    f32_from_f16(half_table[static_cast<size_t>(codebook)][state]);
+        for (uint32_t state = 0; state < 65536; ++state)
+            result[state] = f32_from_f16(half_table[static_cast<size_t>(which)][state]);
         return result;
-    }();
-    return table;
+    };
+    switch (codebook) {
+        case 0: {
+            static const CodebookF32Lut table = make(0);
+            return table;
+        }
+        case 1: {
+            static const CodebookF32Lut table = make(1);
+            return table;
+        }
+        default: {
+            static const CodebookF32Lut table = make(2);
+            return table;
+        }
+    }
 }
 
 #if EXL3_HAVE_TARGET_AVX2
@@ -463,6 +477,8 @@ EXL3_TARGET_AVX2_F16C void linear_dot_range_f32_avx2(const MatrixView& matrix, c
     for (size_t tile_n = first_tile; tile_n < first_tile + tile_count; ++tile_n) {
         double acc[kTileSide] = {};
         for (size_t tile_k = 0; tile_k < tiles_k; ++tile_k) {
+            // The MUL1 codebook's values are computed in arithmetic, so `lut`
+            // is null for it and is read for the other codebooks only.
             if (matrix.codebook == 2)
                 decode_tile_f32_hot_bits_avx2_cb2<Bits>(matrix, static_cast<int64_t>(tile_k),
                                                         static_cast<int64_t>(tile_n), tile_f32.data());
@@ -482,13 +498,15 @@ EXL3_TARGET_AVX2_F16C void linear_dot_range_f32_avx2(const MatrixView& matrix, c
 void linear_dot_range_dispatch(const MatrixView& matrix, const float* input_basis, size_t first_tile,
                                size_t tile_count, float* dot, const Mul1Input* mul1 = nullptr) {
     if (mul1 != nullptr && linear_mul1_dot_range(matrix, *mul1, first_tile, tile_count, dot)) return;
-    const float* const lut = codebook_lut_f32()[static_cast<size_t>(matrix.codebook)].data();
 #if EXL3_HAVE_TARGET_AVX2
     static const bool use_avx2 = [] {
         const char* const force_generic = std::getenv("STRATA_NO_EXL3_AVX2");
         return !(force_generic != nullptr && force_generic[0] == '1') && strata::kernels::cpu::cpu_avx2_ok();
     }();
     if (use_avx2) {
+        // The MUL1 codebook's values are computed in arithmetic, so the table
+        // of them is not built for it.
+        const float* const lut = matrix.codebook == 2 ? nullptr : codebook_lut_f32(matrix.codebook).data();
         switch (matrix.bits) {
             case 1: linear_dot_range_f32_avx2<1>(matrix, input_basis, first_tile, tile_count, dot, lut); break;
             case 2: linear_dot_range_f32_avx2<2>(matrix, input_basis, first_tile, tile_count, dot, lut); break;
@@ -502,6 +520,7 @@ void linear_dot_range_dispatch(const MatrixView& matrix, const float* input_basi
         return;
     }
 #endif
+    const float* const lut = codebook_lut_f32(matrix.codebook).data();
     switch (matrix.bits) {
         case 1: linear_dot_range_f32<1>(matrix, input_basis, first_tile, tile_count, dot, lut); break;
         case 2: linear_dot_range_f32<2>(matrix, input_basis, first_tile, tile_count, dot, lut); break;
