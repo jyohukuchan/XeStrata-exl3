@@ -363,6 +363,74 @@ pre graph に 2.5〜4.2 ms が残る。上限なしでは常駐 expert が3枚�
 
 Windows での実行は確かめていない。
 
+### decode の速度と参照実装（Qwen3.8 Flash）
+
+同じ checkpoint（qwen38-flash-next-exl3-3.05bpw）を同じ V620 2 枚で走らせる rocm_exl3
+（exllamav3 の ROCm port）は batch-1 decode で 23.96 tok/s（41.7 ms/トークン）を出し、XeStrata の
+11.4 tok/s（87 ms/トークン）より 2.09 倍速い。参照実装の構造を読み、移せるものを入れた。
+参照の測定値はコンテナ rocm-exl3-rdna2 の `/work/runs/qwen38/first-bench-512.json`（commit 37a96d50、
+512 トークン prompt、32 トークン decode、repeat 2 の中央値）。
+
+**参照実装の decode の形。** 層ごとに 1 つの graph を replay するのは XeStrata と同じだが、層と層の
+間にホストの同期がない。device ごとに worker プロセスが 1 トークンの全層を 1 回のディスパッチで
+enqueue し、ホストが待つのは stage 境界の hidden state の受け渡し（bench の device copy は
+1 トークン 1 回）と最後の argmax だけで、argmax は GPU 上で行う。EXL3 expert はルーティングから
+計算まで GPU 上に閉じ、層の全 active expert を 1 つの cooperative kernel で計算する。1 層あたりの
+カーネル数は約 22。trellis の復号は使う時にカーネル内で行い（XeStrata と同じ）、codebook 2 (mul1)
+の byte sum も同じ式を dot product 命令で計算する。expert は層と同じ device に全常駐で、expert が
+device をまたぐことはない。活性化は F16、hyper-connection の残差は FP32 のストリーム、KV cache は
+paged の F16/量子化。
+
+**XeStrata 側の内訳**（V620 2 枚、`--stage-devices 0,1`、同じ 512 トークン prompt の decode、device
+cache 全常駐、GPU カーネルの trace の合計）: 1 トークン 3448 カーネルで GPU 実行の合計 64.6 ms、
+壁時計 87 ms。多い順:
+
+| 部品 | カーネル/トークン | GPU ms |
+| --- | ---: | ---: |
+| raw F16 射影（HC down/up/inject、alpha/beta、router） | 460 | 26.8 |
+| EXL3 dense 射影（Hadamard 込みで 3 カーネル/射影） | 650 + 300 | 14.7 |
+| expert の grouped 流れ（7 カーネル/層） | 336 | 9.7 |
+| GDN の step・norm・conv など | ~400 | 6 |
+| router の top-10、RoPE、copy、その他 | ~1200 | 7 |
+| host の隙間（expert の hit 計画、merge の copy など） | - | 22 |
+
+**適用したもの。** いずれも加算の順序を一つも変えないので、値は bit 一致:
+
+* raw F16 射影の 2 カーネル（`linear_fp32_rows` / `linear_fp32_products`）が、32 ずつ離れた位置を
+  1 つずつ読んでいたのを、8 段分の読み出しを先に出してから同じ順に加算する形に変えた。K を
+  wave で分ける products 形と 1・2 行/wave の rows 形の選択も出力数に応じて切り替えた（三つの形は
+  同じ lane の和と同じ subgroup の reduction で、同じ float を返す）。1 トークンの raw 射影は
+  460 カーネルで 26.8 ms から 18.2 ms に、products 形は 17.6 µs から 8.9 µs/発に減った。
+* expert の merge の upload を、2 枚のホスト buffer を交替に使う非同期 copy にした。ホストが次の層で
+  書き始める buffer と upload が読んでいる buffer が重ならず、upload の待ちが消える。
+
+trellis dot（word tile）で次の 4 tile の語を先に読む形も試したが、graph replay の中では
+1 発 43 µs が 72 µs に遅くなり、入れなかった。単体での micro benchmark では速く見えたが、
+変えない Hadamard カーネルも同時に 2.3 倍速く見える測定条件の差であり、graph replay 内の
+trace が正しかった。
+
+測定（V620 2 枚、512 トークン prompt、32 トークン decode、`STRATA_EXL3_FLASH_TIMING=1`）:
+
+| 状態 | decode tok/s | 1 トークン | pre | expert_wait | expert_prep | merge | head/post/bridge/emb |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 適用前 | 11.38 | 87.1 ms | 62.0 ms | 13.9 ms | 4.5 ms | 3.9 ms | 2.8 ms |
+| 適用後 | 12.39 | 80.0 ms | 56.5 ms | 14.2 ms | 3.9 ms | 2.7 ms | 2.6 ms |
+
+生成 token は適用前後で同じ。参照の 23.96 tok/s にはまだ届かず、残りは pre に残る trellis dot
+（300 カーネル 13 ms）、expert の grouped 流れ（336 カーネル 9.7 ms とホストの hit 計画 3.9 ms）、
+GDN・RoPE・router の小さなカーネルと、層ごとの doorbell を挟む host の隙間である。
+
+値は変わらない: `exl3_flash_probe --tokens 16,10,16,28 --max-new 2 --max-context 8 --dump-logits` の
+logits SHA256 は device cache なしで単一 stage・2 stage とも参照値のままで、`raw_linear_parity` も
+通る。
+
+**移せなかったもの。** 参照の `exl3_gemm` は cooperative grid（grid 単位の barrier）で入力 Hadamard・
+GEMV・出力 Hadamard を 1 カーネルに畳んでいるが、grid 単位の barrier は SYCL に portable な形が無く、
+3 カーネルのままにした。expert を GPU 上だけで完結させる形も、XeStrata の device cache が「ホストが
+routed id を見て hit/miss を決める」契約を持つためそのままは取れない（CPU miss の FP64 累算は残る）。
+GPU 上の argmax も、logits を dump する probe がホストの logits を必要とし、greedy の同点の扱いを
+変えないため入れていない。
+
 ## Qwen3.5 MoE の MTP 接続
 
 `--spec 2` 以上は archive の `mtp.fc`、三つの norm、`mtp.layers.0` の attention・router・shared/routed
