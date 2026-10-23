@@ -225,7 +225,11 @@ bool Exl3ExpertRuntime::allocate_images(std::string& err) {
                 const size_t at = pair_index(layer, expert);
                 const int32_t slot = cache_.valid() ? cache_.slot_of(layer, expert) : kNotResident;
                 const uint8_t* blob = slot >= 0 ? cache_.device_slot(slot) : nullptr;
-                if (blob == nullptr && (slot >= 0 || all_resident_)) {
+                // A pair with a cache slot must have its device address.  The coverage question -
+                // whether every pair the runtime serves has a slot - is `all_resident_`'s, answered
+                // from the cache's own admission before this runs; a pair of another stage's layers
+                // has no slot here and no blob here, and that is not an error.
+                if (blob == nullptr && slot >= 0) {
                     err = "exl3 runtime: resident pair table has a missing device slot";
                     return false;
                 }
@@ -278,7 +282,12 @@ bool Exl3ExpertRuntime::open(Exl3ExpertSource& source, strata::kernels::cpu::Exp
         err = "exl3 runtime: source pair table overflows"; close(); return false;
     }
     pair_count_ = static_cast<int64_t>(pairs);
-    all_resident_ = resident.size() == static_cast<size_t>(pairs);
+    // Whether EVERY routed pair is resident is decided after the cache is filled, from the cache's own
+    // admission.  The runtime serves the layers [prewarm_layer_begin, prewarm_layer_end) - the stage's own
+    // range for a stage owner - and a routed expert of those layers is a CPU miss exactly when its pair has
+    // no cache slot, so the served range is what the question is about: a stage whose own layers are fully
+    // resident never misses even though another stage's pairs have no slot here.
+    all_resident_ = false;
     pair_formats_.resize(static_cast<size_t>(pairs));
     pair_format_index_.resize(static_cast<size_t>(pairs));
     std::unordered_map<Exl3ExpertFormatID, int32_t> format_indices;
@@ -401,6 +410,12 @@ bool Exl3ExpertRuntime::open(Exl3ExpertSource& source, strata::kernels::cpu::Exp
     }
     cpu_jobs_.resize(static_cast<size_t>(max_entries_));
     miss_ids_.reserve(static_cast<size_t>(n_expert_));
+    if (cache_.valid() && !resident.empty()) {
+        all_resident_ = true;
+        for (int64_t layer = prewarm_layer_begin; layer < prewarm_layer_end && all_resident_; ++layer)
+            for (int64_t expert = 0; expert < n_expert_; ++expert)
+                if (cache_.slot_of(layer, expert) < 0) { all_resident_ = false; break; }
+    }
     if (!allocate_images(err)) { close(); return false; }
     // selected already excludes GPU residents. Do not preload another stage's
     // layer just because its pairs are absent from this stage's GPU cache.
@@ -666,27 +681,9 @@ bool Exl3ExpertRuntime::record_resident_enqueue(sycl::queue& queue, int64_t laye
     return record_device_hit_enqueue(queue, layer, device_fp32_x, device_ids, n_tokens, gpu_output, ldy, err);
 }
 
-bool Exl3ExpertRuntime::record_device_hit_enqueue(sycl::queue& queue, int64_t layer, const float* device_fp32_x,
-                                                  const int32_t* device_ids, int64_t n_tokens, float* gpu_output,
-                                                  int64_t ldy, std::string& err) {
-    err.clear();
-    if (!opened_) { err = "exl3 runtime: open is required for the device hit plan"; return false; }
-    if (!valid_layer(layer) || n_tokens <= 0 || n_tokens > max_tokens_ || device_fp32_x == nullptr ||
-        device_ids == nullptr || gpu_output == nullptr || !span_fits(n_tokens, hidden_, hidden_) ||
-        !span_fits(max_entries_, ldy, hidden_)) {
-        err = "exl3 runtime: invalid device hit plan geometry";
-        return false;
-    }
-    if (!queue.has_property<sycl::property::queue::in_order>()) {
-        err = "exl3 runtime: device hit replay requires an in-order queue";
-        return false;
-    }
-    Runtime* queue_runtime = Runtime::owner_of_stream(&queue);
-    if (queue_runtime == nullptr || queue_runtime != device_runtime_ || Runtime::owner(device_fp32_x) != queue_runtime ||
-        Runtime::owner(device_ids) != queue_runtime || Runtime::owner(gpu_output) != queue_runtime) {
-        err = "exl3 runtime: device hit pointers belong to another runtime/device";
-        return false;
-    }
+bool Exl3ExpertRuntime::submit_device_hit_plan(sycl::queue& queue, int64_t layer, const int32_t* device_ids,
+                                              int64_t n_tokens, const std::vector<sycl::event>& deps,
+                                              sycl::event& plan, std::string& err) {
     int64_t entries = 0;
     if (!product_fits(n_tokens, routed_k_, max_entries_, entries) || entries <= 0) {
         err = "exl3 runtime: device hit route count is out of range";
@@ -707,7 +704,8 @@ bool Exl3ExpertRuntime::record_device_hit_enqueue(sycl::queue& queue, int64_t la
         const int64_t experts = n_expert_;
         const int64_t route_k = routed_k_;
         const int64_t layer_id = layer;
-        const sycl::event plan = queue.submit([&](sycl::handler& h) {
+        plan = queue.submit([&](sycl::handler& h) {
+            if (!deps.empty()) h.depends_on(deps);
             h.parallel_for(sycl::range<1>(static_cast<size_t>(entries)), [=](sycl::id<1> id) {
                 const int32_t entry = static_cast<int32_t>(id[0]);
                 if (entry == 0) {
@@ -735,6 +733,37 @@ bool Exl3ExpertRuntime::record_device_hit_enqueue(sycl::queue& queue, int64_t la
                 if (pair_blob[pair] == 0) plan_dst[entry] = -1;
             });
         });
+        return true;
+    } catch (const std::exception& e) {
+        err = std::string("exl3 runtime: device hit plan: ") + e.what();
+        return false;
+    }
+}
+
+bool Exl3ExpertRuntime::record_device_hit_enqueue(sycl::queue& queue, int64_t layer, const float* device_fp32_x,
+                                                  const int32_t* device_ids, int64_t n_tokens, float* gpu_output,
+                                                  int64_t ldy, std::string& err) {
+    err.clear();
+    if (!opened_) { err = "exl3 runtime: open is required for the device hit plan"; return false; }
+    if (!valid_layer(layer) || n_tokens <= 0 || n_tokens > max_tokens_ || device_fp32_x == nullptr ||
+        device_ids == nullptr || gpu_output == nullptr || !span_fits(n_tokens, hidden_, hidden_) ||
+        !span_fits(max_entries_, ldy, hidden_)) {
+        err = "exl3 runtime: invalid device hit plan geometry";
+        return false;
+    }
+    if (!queue.has_property<sycl::property::queue::in_order>()) {
+        err = "exl3 runtime: device hit replay requires an in-order queue";
+        return false;
+    }
+    Runtime* queue_runtime = Runtime::owner_of_stream(&queue);
+    if (queue_runtime == nullptr || queue_runtime != device_runtime_ || Runtime::owner(device_fp32_x) != queue_runtime ||
+        Runtime::owner(device_ids) != queue_runtime || Runtime::owner(gpu_output) != queue_runtime) {
+        err = "exl3 runtime: device hit pointers belong to another runtime/device";
+        return false;
+    }
+    try {
+        sycl::event plan;
+        if (!submit_device_hit_plan(queue, layer, device_ids, n_tokens, {}, plan, err)) return false;
         (void) strata::kernels::exl3::exl3_grouped_fp32(queue, device_plan_, device_fp32_x, hidden_, gpu_output, ldy,
                                                         d_scratch_, scratch_elements_, {}, {plan});
     } catch (const std::exception& e) {
@@ -742,6 +771,40 @@ bool Exl3ExpertRuntime::record_device_hit_enqueue(sycl::queue& queue, int64_t la
         return false;
     }
     return true;
+}
+
+bool Exl3ExpertRuntime::enqueue_device_hit(sycl::queue& queue, int64_t layer, const float* device_fp32_x,
+                                           const int32_t* device_ids, int64_t n_tokens, float* gpu_output,
+                                           int64_t ldy, sycl::event& done, const std::vector<sycl::event>& deps,
+                                           std::string& err) {
+    err.clear();
+    if (!opened_) { err = "exl3 runtime: open is required for the device hit plan"; return false; }
+    if (!valid_layer(layer) || n_tokens <= 0 || n_tokens > max_tokens_ || device_fp32_x == nullptr ||
+        device_ids == nullptr || gpu_output == nullptr || !span_fits(n_tokens, hidden_, hidden_) ||
+        !span_fits(max_entries_, ldy, hidden_)) {
+        err = "exl3 runtime: invalid device hit plan geometry";
+        return false;
+    }
+    if (!queue.has_property<sycl::property::queue::in_order>()) {
+        err = "exl3 runtime: device hit enqueue requires an in-order queue";
+        return false;
+    }
+    Runtime* queue_runtime = Runtime::owner_of_stream(&queue);
+    if (queue_runtime == nullptr || queue_runtime != device_runtime_ || Runtime::owner(device_fp32_x) != queue_runtime ||
+        Runtime::owner(device_ids) != queue_runtime || Runtime::owner(gpu_output) != queue_runtime) {
+        err = "exl3 runtime: device hit pointers belong to another runtime/device";
+        return false;
+    }
+    try {
+        sycl::event plan;
+        if (!submit_device_hit_plan(queue, layer, device_ids, n_tokens, deps, plan, err)) return false;
+        done = strata::kernels::exl3::exl3_grouped_fp32(queue, device_plan_, device_fp32_x, hidden_, gpu_output, ldy,
+                                                        d_scratch_, scratch_elements_, {}, {plan});
+        return true;
+    } catch (const std::exception& e) {
+        err = std::string("exl3 runtime: device hit enqueue: ") + e.what();
+        return false;
+    }
 }
 
 bool Exl3ExpertRuntime::publish_window_plan(GpuPlanSink& sink, std::string& err) const {
