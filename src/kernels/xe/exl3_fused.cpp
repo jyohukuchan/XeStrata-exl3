@@ -21,6 +21,7 @@
 namespace strata::kernels::exl3 {
 namespace {
 
+using had::fwht128_input;
 using had::fwht128_input_registers;
 using had::fwht128_output;
 
@@ -161,6 +162,37 @@ sycl::event submit_gdn_tail(sycl::queue& queue, const MatrixView& gate, const Ma
     });
 }
 
+// The two input transforms of one activation, one work-group per 128-wide block per transform
+// pair: each transform is `fwht128_input` on its own view's `suh`, the same call the standalone
+// transform kernel makes, so each output is that kernel's value in the same order.
+sycl::event submit_input_hadamard_dual(sycl::queue& queue, const MatrixView& a, const MatrixView& b,
+                                       const float* x, int64_t ldx, float* a_out, float* b_out, int64_t rows,
+                                       const std::vector<sycl::event>& deps) {
+    const size_t blocks = static_cast<size_t>(a.k / 128);
+    return queue.submit([&](sycl::handler& h) {
+        if (!deps.empty()) h.depends_on(deps);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(rows) * blocks * 32),
+                                         sycl::range<1>(32)),
+                       [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+            const sycl::sub_group sg = item.get_sub_group();
+            const int lane = static_cast<int>(sg.get_local_id()[0]);
+            const size_t group = static_cast<size_t>(item.get_group_linear_id());
+            const int64_t row = static_cast<int64_t>(group / blocks);
+            const int64_t block = static_cast<int64_t>(group % blocks) * 128;
+            const float* xr = x + row * ldx;
+            float* da = a_out + row * a.k;
+            float* db = b_out + row * b.k;
+            float a0, a1, a2, a3;
+            fwht128_input(sg, lane, xr, a.suh, block, a0, a1, a2, a3);
+            da[block + lane + 0 * 32] = a0; da[block + lane + 1 * 32] = a1;
+            da[block + lane + 2 * 32] = a2; da[block + lane + 3 * 32] = a3;
+            fwht128_input(sg, lane, xr, b.suh, block, a0, a1, a2, a3);
+            db[block + lane + 0 * 32] = a0; db[block + lane + 1 * 32] = a1;
+            db[block + lane + 2 * 32] = a2; db[block + lane + 3 * 32] = a3;
+        });
+    });
+}
+
 }  // namespace
 
 bool exl3_fused_tail_supported(void* stream) {
@@ -214,6 +246,15 @@ void exl3_fused_gdn_tail_fp32(const MatrixView& gate, const MatrixView& out, con
     }
     // Like gdn_out_norm: a caller on the default stream wants the norm's result before it returns.
     finish(stream, done, "exl3_fused_gdn_tail_fp32");
+}
+
+void exl3_input_hadamard_dual_fp32(const MatrixView& a, const MatrixView& b, const float* x, int64_t ldx,
+                                   float* a_out, float* b_out, int64_t rows, void* stream) {
+    if (x == nullptr || a_out == nullptr || b_out == nullptr || a.suh == nullptr || b.suh == nullptr ||
+        rows <= 0 || a.k != b.k || a.k % 128 != 0 || ldx < a.k ||
+        !block_shape_ok(a, rows, a.k) || !block_shape_ok(b, rows, b.k))
+        throw std::invalid_argument("exl3_input_hadamard_dual_fp32: invalid spans");
+    (void) submit_input_hadamard_dual(queue_for(stream), a, b, x, ldx, a_out, b_out, rows, {});
 }
 
 }  // namespace strata::kernels::exl3

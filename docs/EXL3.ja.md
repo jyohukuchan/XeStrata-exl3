@@ -532,6 +532,48 @@ GPU の FP32 と CPU の FP64 で計算される expert の分担が変わるの
 `STRATA_EXL3_DEVICE_CACHE_MIB` で揃えた比較（14638 常駐）では、この一手の前・後、融合の off・on
 の4通りがすべて bit 一致した。
 
+**常駐 expert の流れを graph に収め、shared expert と GDN の小さな起動を畳んだ（起動数 2848 から
+2656 に）。** カーネル1起動の外の境界は dispatch の費用なので、次の3か所で起動そのものを減らした:
+
+1. **常駐 expert の流れを層ごとの graph に。** cache が全常駐の時、expert の流れ（expert 行の
+   clear、device route 計画のカーネル、grouped expert の5カーネル）はどのトークンでも同じ形で、
+   それまでは pre/post graph の間に8起動が graph の外の境界（11〜27 µs）で走っていた。同じ
+   ポインタを毎回そのまま引数に渡す起動のままで層ごとにキャプチャし、pre/post graph と同じに
+   replay する（計画の層はキャプチャした graph の属性なので、層ごとに1つ）。host は1回の
+   graph launch を出すだけになり、起動の境界は graph replay の値になる。doorbell probe の
+   event record は常駐経路では何も待たないのでそこでは落とした。`STRATA_EXL3_RESIDENT_GRAPH=0`
+   で従来の起動に戻る（比較用）。
+2. **shared expert の入力2変換を1起動に。** gate/up の入力 basis 変換は同じ x を読むので、
+   参照実装の `had_r_128_dual` の形で1つのカーネルにした。1 work group が1つの 128 幅 block の
+   2つの変換を持ち、それぞれの view の `suh` で単独のカーネルと同じ式を同じ順に計算するので、
+   値は2つのカーネルのものそのままで、48 層で48起動少ない。
+3. **GDN の層の小さな起動を畳んだ（36 層）。** conv とその activation への copy と SiLU は
+   `gdn_conv_silu` の1起動（conv の加算と conv state の送りは `gdn_conv_step` の順のまま、
+   活性化は `silu_inplace` の式）。`gdn_beta_gate` と `gdn_gate` は `gdn_gate_beta` の1起動
+   （参照実装も2つの epilogue を1つの kernel で計算する）。q の 1/sqrt(S) の prescale は q の
+   l2 norm の起動に乗り（scale の範囲は q だけで、k は従来どおり）、`scale_inplace` の起動が
+   消える。`STRATA_EXL3_FUSED_TAILS=0` で2と dot の間の融合は従来のカーネルに戻る。
+
+計測（V620 2 枚、512 トークン prompt、32 トークン decode、`STRATA_EXL3_FLASH_TIMING=1`）:
+
+| 状態 | decode tok/s | 1 トークン | pre | expert_prep | post | bridge | head | emb/ple |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 適用前 | 14.96 | 66.29 ms | 0.79 | 1.88 | 0.35 | 30.27 | 32.09 | 0.93 |
+| 適用後 | 15.63 | 63.72 ms | 0.30 | 0.28 | 0.26 | 29.75 | 32.17 | 0.95 |
+
+カーネル trace（1 decode トークン、2 device 合計、1 トークンを head の起動の間で切った区間）では
+起動数が 2848 から 2656 に減り、カーネルの外の隙間が 21.77 ms から 18.68 ms に減った。減った
+192 起動は入力2変換のまとめ（96 → 48）、conv の畳み込み（3 起動 → 1、36 層）、
+gate/beta（2 → 1、36 層）、prescale（norm 2 起動 + scale 1 起動 → 2、36 層）で、カーネルの合計は
+run 間の揺れ（±5%）の中にあり 52.4 ms から 53.2 ms。expert の流れの8起動は graph の replay に
+なり、層ごとのホストの提出も 1 回の launch になった（expert_prep のホスト時間 1.88 → 0.28 ms）。
+生成 token は前後で同じ。
+
+値は変わらない: device cache なしの probe SHA256 は単一 stage・2 stage とも参照値の
+`1fe719aca5e9...`。device cache ありの dump は常駐数を `STRATA_EXL3_DEVICE_CACHE_MIB` で揃えた
+比較（1 stage 14638 常駐、2 stage 7319 常駐×2）でも、常駐数がそのままの比較（1 stage 部分常駐・
+2 stage 全常駐）でも前後で bit 一致。全常駐の2 stage では常駐 expert の流れがこの graph で走る。
+
 ## Qwen3.5 MoE の MTP 接続
 
 `--spec 2` 以上は archive の `mtp.fc`、三つの norm、`mtp.layers.0` の attention・router・shared/routed

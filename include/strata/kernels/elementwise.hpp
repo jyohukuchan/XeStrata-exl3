@@ -46,6 +46,13 @@ void embedding_gather(const uint8_t* codes, const float* scales, const float* of
 void gdn_gate(const float* alpha, const float* dt, const float* ssm_a, float* gate, int64_t n_tokens,
               int64_t h_v, void* stream);
 
+/// `gdn_gate` and `beta = sigmoid(beta)` in one launch, one thread per (t, h) doing both its
+/// values: the two epilogues the GDN layer chains (`gdn_beta_gate` and `gdn_gate`) are one pass
+/// over the heads, and each value is exactly what its own kernel computes - the reference folds
+/// the two the same way.  `beta` is written in place.
+void gdn_gate_beta(const float* alpha, const float* dt, const float* ssm_a, float* gate, float* beta,
+                   int64_t n_tokens, int64_t h_v, void* stream);
+
 /// `x[i] *= s`, in place.
 void scale_inplace(float* x, int64_t n, float s, void* stream);
 /// `dst[i] += src[i]`.  **ADDED FOR R4's HIT/MISS SPLIT, WHERE THE TWO HALVES COME FROM DIFFERENT

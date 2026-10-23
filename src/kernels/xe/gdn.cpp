@@ -114,10 +114,30 @@ void gdn_conv_step(float* conv_state, const float* x, const float* kW, float* ou
     finish(stream, e, "gdn_conv_step");
 }
 
+void gdn_conv_silu(float* conv_state, const float* x, const float* kW, float* out, int64_t channels,
+                   int64_t d_conv, void* stream) {
+    if (channels <= 0 || d_conv < 1) return;
+    const int C = (int) channels, dc = (int) d_conv;
+    const auto done = queue_for(stream).parallel_for(sycl::range<1>((size_t) C), [=](sycl::id<1> id) {
+        const int c = (int) id[0];
+        float* st = conv_state + (size_t) c * (dc - 1);
+        const float* w = kW + (size_t) c * dc;
+        float acc = 0.0f;
+        for (int i = 0; i < dc - 1; ++i) acc += st[i] * w[i];   // the accumulation of gdn_conv_step, its order
+        acc += x[c] * w[dc - 1];
+        // silu_inplace's expression, on the value the copy left in the activation buffer
+        const float e = sycl::exp(-sycl::fabs(acc));
+        out[c] = acc >= 0.0f ? acc / (1.0f + e) : (acc * e) / (1.0f + e);
+        for (int i = 0; i < dc - 2; ++i) st[i] = st[i + 1];
+        st[dc - 2] = x[c];
+    });
+    finish(stream, done, "gdn_conv_silu");
+}
+
 namespace {
 // D: double where the device has FP64 (the reference's sums), float elsewhere (device_caps.hpp)
 template <typename D>
-sycl::event gdn_l2_norm_t(sycl::queue& q, float* x, int64_t rows, int ncols, float eps) {
+sycl::event gdn_l2_norm_t(sycl::queue& q, float* x, int64_t rows, int ncols, float eps, float scale) {
     return q.parallel_for(sycl::nd_range<1>((size_t) rows * WARP, WARP),
                           [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
         const sycl::sub_group sg = it.get_sub_group();
@@ -127,7 +147,12 @@ sycl::event gdn_l2_norm_t(sycl::queue& q, float* x, int64_t rows, int ncols, flo
         for (int i = t; i < ncols; i += WARP) acc += (D) p[i] * (D) p[i];
         const D ssum = sycl::group_broadcast(sg, warp_sum(sg, acc), 0);
         const float inv = (float) ((D) 1 / sycl::sqrt(ssum + (D) eps));
-        for (int i = t; i < ncols; i += WARP) p[i] *= inv;
+        for (int i = t; i < ncols; i += WARP) {
+            p[i] *= inv;
+            // the layer's prescale of the normalised value, in the order the two kernels applied
+            // the two multiplications; unscaled callers multiply by nothing at all
+            if (scale != 1.0f) p[i] *= scale;
+        }
     });
 }
 template <typename D>
@@ -158,9 +183,20 @@ void gdn_l2_norm(float* x, int64_t rows, int64_t cols, float eps, void* stream) 
     if (cols > 1024) throw core::DeviceError("gdn_l2_norm: cols = " + std::to_string(cols) + " exceeds 1024");
     const int ncols = (int) cols;
     auto& q = queue_for(stream);
-    const auto e = xe::has_fp64(q) ? gdn_l2_norm_t<double>(q, x, rows, ncols, eps)
-                                   : gdn_l2_norm_t<float>(q, x, rows, ncols, eps);
+    const auto e = xe::has_fp64(q) ? gdn_l2_norm_t<double>(q, x, rows, ncols, eps, 1.0f)
+                                   : gdn_l2_norm_t<float>(q, x, rows, ncols, eps, 1.0f);
     finish(stream, e, "gdn_l2_norm");
+}
+
+void gdn_l2_norm_scaled(float* x, int64_t rows, int64_t cols, float eps, float scale, void* stream) {
+    if (rows <= 0 || cols <= 0) return;
+    if (cols > 1024)
+        throw core::DeviceError("gdn_l2_norm_scaled: cols = " + std::to_string(cols) + " exceeds 1024");
+    const int ncols = (int) cols;
+    auto& q = queue_for(stream);
+    const auto e = xe::has_fp64(q) ? gdn_l2_norm_t<double>(q, x, rows, ncols, eps, scale)
+                                   : gdn_l2_norm_t<float>(q, x, rows, ncols, eps, scale);
+    finish(stream, e, "gdn_l2_norm_scaled");
 }
 
 void gdn_beta_gate(float* beta, int64_t h_v, void* stream) {

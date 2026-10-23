@@ -57,6 +57,23 @@ void gdn_gate(const float* alpha, const float* dt, const float* ssm_a, float* ga
     sync_if_needed(stream, event);
 }
 
+void gdn_gate_beta(const float* alpha, const float* dt, const float* ssm_a, float* gate, float* beta,
+                   int64_t n_tokens, int64_t h_v, void* stream) {
+    if (n_tokens <= 0) return;
+    if (h_v <= 0 || n_tokens > std::numeric_limits<int64_t>::max() / h_v)
+        throw core::DeviceError("invalid gate dimensions");
+    const auto event = queue_for(stream).parallel_for(sycl::range<1>(n_tokens * h_v), [=](sycl::id<1> index) {
+        const int64_t i = index[0], h = i % h_v;
+        // gdn_beta_gate's sigmoid on this head's beta
+        const float b = beta[i];
+        beta[i] = 1.0f / (1.0f + sycl::exp(-b));
+        // gdn_gate's softplus on this head's gate
+        const float x = alpha[i] + dt[h];
+        gate[i] = (x > 20.0f ? x : sycl::log1p(sycl::exp(x))) * ssm_a[h];
+    });
+    sync_if_needed(stream, event);
+}
+
 void scale_inplace(float* x, int64_t n, float s, void* stream) {
     if (n <= 0) return;
     const auto event = queue_for(stream).parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) { x[i] *= s; });

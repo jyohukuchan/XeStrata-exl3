@@ -2,10 +2,12 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // Fused transform tails around EXL3 dots: the stages that sit between two dots and pass their
 // values on - an output-basis transform, the elementwise stage that consumes it, and the next
-// projection's input-basis transform - as one launch.  Every stage computes exactly what the
-// separate kernels compute, in the same order, so the values do not change; the fusion only
-// removes the launches between them.  A caller runs the surrounding dots with the stages these
-// own disabled (`GemvOptions`), which leaves their own bias to the tail in the same position.
+// projection's input-basis transform - as one launch, and the two input transforms of one
+// activation where two projections of a shared expert read the same input.  Every stage computes
+// exactly what the separate kernels compute, in the same order, so the values do not change; the
+// fusion only removes the launches between them.  A caller runs the surrounding dots with the
+// stages these own disabled (`GemvOptions`), which leaves their own bias to the tail in the same
+// position.
 #pragma once
 
 #include "strata/kernels/exl3_format.hpp"
@@ -43,5 +45,14 @@ void exl3_fused_swiglu_tail_fp32(const MatrixView& gate, const MatrixView& up, c
 /// like `gdn_out_norm`, the call waits when `stream` is the default one.
 void exl3_fused_gdn_tail_fp32(const MatrixView& gate, const MatrixView& out, const float* o, float* z_values,
                               const float* ssm_norm, float* y, int64_t rows, bool silu, float eps, void* stream);
+
+/// The two input-basis transforms of one activation in one launch (exllamav3's `had_r_128_dual`
+/// shape): the shared expert's gate and up projections read the same `x`, so one work-group per
+/// 128-wide block runs both transforms - each against its own view's `suh`, exactly the values
+/// `exl3_gemv_fp32`'s input transform writes for it.  `a_out` and `b_out` are the two transformed
+/// images (rows x `a.k` and rows x `b.k`); `a.k` must equal `b.k`, a multiple of 128.  The dots
+/// that follow run on their own image with `GemvOptions::input_hadamard` off.
+void exl3_input_hadamard_dual_fp32(const MatrixView& a, const MatrixView& b, const float* x, int64_t ldx,
+                                   float* a_out, float* b_out, int64_t rows, void* stream);
 
 }  // namespace strata::kernels::exl3

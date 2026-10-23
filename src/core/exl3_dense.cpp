@@ -417,6 +417,43 @@ bool Exl3Dense::prepare_stream(void* stream, std::string& err) {
     }
 }
 
+bool Exl3Dense::input_scratch(void* stream, int64_t rows, float*& plane, std::string& err) {
+    err.clear();
+    plane = nullptr;
+    if (runtime_ == nullptr || raw_ || view_.trellis == nullptr || view_.suh == nullptr) {
+        err = "exl3 dense: the owner has no packed input transform";
+        return false;
+    }
+    if (rows <= 0 || rows > max_rows_) {
+        err = "exl3 dense: invalid input scratch row count";
+        return false;
+    }
+    try {
+        Runtime* stream_runtime = stream == nullptr ? &Runtime::get() : Runtime::owner_of_stream(stream);
+        if (stream_runtime == nullptr || stream_runtime != runtime_) {
+            err = "exl3 dense: the stream belongs to another runtime";
+            return false;
+        }
+        sycl::queue& queue = stream_runtime->stream(stream);
+        if (!pointers_owned_by(stream_runtime)) {
+            err = "exl3 dense: the descriptor or scratch belongs to another runtime";
+            return false;
+        }
+        const void* queue_identity = &queue;
+        for (const StreamScratch& prepared : streams_)
+            if (prepared.queue == queue_identity) {
+                if (prepared.data == nullptr) break;
+                plane = static_cast<float*>(prepared.data);
+                return true;
+            }
+        err = "exl3 dense: stream was not prepared before graph capture";
+        return false;
+    } catch (const std::exception& e) {
+        err = std::string("exl3 dense: ") + e.what();
+        return false;
+    }
+}
+
 bool Exl3Dense::run(const float* x, int64_t ldx, float* y, int64_t ldy, int64_t rows, void* stream,
                     std::string& err) {
     return run(x, ldx, y, ldy, rows, stream, strata::kernels::exl3::GemvOptions{}, err);
