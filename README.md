@@ -7,6 +7,10 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 
 English | [日本語](README.ja.md)
 
+> This branch's engine is EXL3-only. GGUF native packs and `--pack` / `--native` have been removed.
+> Start EXL3 with the [command-line example](#the-exl3-format-in-development) below.
+> The inherited upstream setup, release-package and Web UI instructions below do not install this EXL3 engine.
+
 Run a 125-billion-parameter AI model on one Intel Arc, AMD Radeon or NVIDIA GPU and an ordinary PC.
 
 XeStrata runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)**, a large AI model that
@@ -43,8 +47,8 @@ How it differs from Strata:
 | --- | --- |
 | GPU | Intel Arc (A series, B series), AMD Radeon (RDNA2 or later, [AMD GPUs](#amd-gpus)), or an NVIDIA GPU (Pascal or later; Pascal has no tensor cores and runs the slower paths). 12 GB of VRAM or more is recommended (less works, but slower). |
 | CPU | x86-64 with AVX2. With AVX-512 (F, BW, VL, VNNI, VBMI) the CPU's part runs on AVX-512. |
-| RAM | 32-62 GB, depending on the model's size ([Choosing a model](#choosing-a-model)). |
-| Disk | About 60-110 GB for the model, and about 6 GB for the MTP layer. An SSD (NVMe) is strongly recommended. |
+| RAM | Enough for the model's experts ([Choosing a model](#choosing-a-model)). |
+| Disk | About the size of the model's checkpoint. An SSD (NVMe) is strongly recommended. |
 | OS | Linux (WSL 2 may work; pull requests welcome). The packages are for Ubuntu 26.04 and Fedora 44; on other distributions, [install from the source](docs/BUILD.md#installing-from-the-source). Windows 10 and 11 (x64) get a 7z ([Windows](#windows)). |
 | BIOS | For a discrete GPU: Above 4G Decoding and Re-Size BAR on, CSM off. |
 
@@ -85,102 +89,6 @@ So XeStrata runs only on the GPUs the distribution's rocBLAS has code for.
 - The table is that of ROCm 7.1's rocBLAS on both distributions. Only the RX 9060 XT (gfx1200) has been checked.
 
 ## Choosing a model
-
-| Model | Parameters | RAM (about) | VRAM | Good for |
-| --- | --- | ---: | ---: | --- |
-| **[Qwen3.8-Flash-Next](#qwen38-flash-next)** | 125B | 32-62 GB | 12 GB or more recommended | the smartest; for a PC with a lot of RAM |
-| **[Ornith-1.5](#ornith-15-beta)** (BETA) | 35B (3B a token) | 22-80 GB | from 4 GB | a PC with less RAM |
-| **[llm-jp-4.1](#llm-jp-41-beta)** (BETA) | 32B (3B a token) | 30-73 GB | from 4 GB | a thinking model for Japanese and English |
-| **[Qwen3.6-35B-A3B](#qwen36-35b-a3b-beta)** (BETA) | 35B (3B a token) | 31-46 GB | from 4 GB | a thinking model; a PC with less RAM |
-
-The three BETA models do not yet take images, two or more GPUs, or Intel's integrated GPUs
-([details](docs/DETAILS.md#or-models-other-than-qwen38-flash-next-ornith-15-llm-jp-41-qwen36-35b-a3b)).
-
-Not sure? On a PC with 48 GB of RAM or more, take Qwen3.8-Flash-Next's **IQ2_XS**.
-With less RAM than that, Qwen3.8-Flash-Next's Coder (32 GB) or Ornith-1.5 is the one to choose.
-To add another model later, run `xestrata --setup`.
-
-### Qwen3.8-Flash-Next
-
-**The version and the size** (the size: the same model, compressed more or less):
-
-| Version | Size | Download | RAM (about) | Speed | Quality |
-| --- | --- | ---: | ---: | --- | --- |
-| the original, Swift 1.5 | **Q2_0** | 66 GB | 48 GB | fastest | good |
-| the original, Swift 1.5 | **IQ2_XS** | 68 GB | 48 GB | fast | better (**recommended**) |
-| the original, Swift 1.5 | **IQ3_XXS** | 76 GB | 60 GB | slower | great |
-| the original, Swift 1.5 | **IQ3_S** | 84 GB | 62 GB | slow | as the original model |
-| Coder | **IQ1_M** | 58 GB | 32 GB | fast | good at code, weaker elsewhere |
-| Unsloth | **UD-IQ4_XS** | 94 GB | 48 GB | slow with less than about 80 GB of RAM | between IQ3_S and UD-Q4_K_XL |
-| Unsloth (experimental) | **UD-Q4_K_XL** | 111 GB | 48 GB | slowest | best |
-
-All of the model's experts ([How it works](#how-it-works)) are kept in RAM. With less RAM than that but a GPU with a
-lot of VRAM, it runs in the **low-RAM mode**: the experts are read from the model files instead of copied into RAM
-([details](docs/DETAILS.md#less-ram-than-the-model-the-low-ram-mode)).
-The two Unsloth files read the experts that do not fit the RAM from the SSD while they answer.
-
-**The version:**
-
-- **Qwen3.8-Flash-Next:** the original.
-- **[Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF):** UkisAI's fine-tune. It
-  thinks for a shorter time before it answers, so the answer comes sooner, at about the same quality. Its own license
-  applies.
-- **[Coder](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF):** ISTA-DASLab's version for
-  code. Of each layer's 512 experts it keeps the 256 that code uses. With half the experts it is weaker outside code
-  and in languages other than English.
-- **[Unsloth's UD-IQ4_XS](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF):** a ~4-bit i-quant of the
-  original. Its experts take 59.5 GB; with about 80 GB of RAM or more, all of them stay in RAM
-  ([details](docs/DETAILS.md#or-unsloths-ud-iq4_xs)).
-- **[Unsloth's UD-Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)** (experimental): a 4-bit file
-  of the original. Its experts take 77 GB, and it is slower than the 2-3-bit sizes
-  ([details](docs/DETAILS.md#or-unsloths-ud-q4_k_xl-experimental)).
-
-OrcaRouter's Flash-Next Uncensored IQ3_XXS is not in setup's menu.
-How to convert it is in [docs/ORCA.md](docs/ORCA.md).
-
-### Ornith-1.5 (BETA)
-
-[Ornith-1.5-35B-A3B](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF) (Ornith AI, MIT): a Qwen3.5 MoE, with a
-context of up to 256K. Its official files (Q4_K_M to BF16) draft tokens with the model's MTP layer, which makes the
-decode faster.
-
-| Size | Download | RAM (about) | VRAM |
-| --- | ---: | ---: | ---: |
-| Q4_K_M | 21.7 GB | 30 GB | from 4 GB |
-| Q5_K_M | 25.3 GB | 34 GB | from 6 GB |
-| Q6_K | 29.2 GB | 38 GB | from 6 GB |
-| Q8_0 | 37.8 GB | 46 GB | from 6 GB |
-| BF16 | 71.1 GB | 80 GB | from 8 GB |
-| GSQ-RCO-3BIT | 13.0 GB | 22 GB | from 4 GB |
-| GSQ-RCO-3.5BIT | 15.2 GB | 24 GB | from 6 GB |
-
-The two GSQ-RCO files are pfeifferj's [community reproduction](https://huggingface.co/pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF)
-and have no MTP layer.
-
-### llm-jp-4.1 (BETA)
-
-[llm-jp-4.1-32b-a3b-thinking](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf) (LLM-jp, Apache-2.0):
-a thinking model for Japanese and English, with a context of up to 256K.
-
-| Size | Download | RAM (about) | VRAM |
-| --- | ---: | ---: | ---: |
-| Q4_K_M | 21.5 GB | 30 GB | from 4 GB |
-| BF16 | 64.3 GB | 73 GB | from 8 GB |
-
-### Qwen3.6-35B-A3B (BETA)
-
-[Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) (Qwen, Apache-2.0; the GGUFs with the MTP
-layer by Unsloth): a thinking Qwen3.5-family MoE, with a context of up to 256K.
-It drafts tokens with the model's MTP layer, which makes decode faster.
-
-| Size | Download | RAM (about) | VRAM |
-| --- | ---: | ---: | ---: |
-| UD-Q4_K_XL | 22.9 GB | 31 GB | from 4 GB |
-| UD-Q6_K_XL | 32.6 GB | 41 GB | from 6 GB |
-| Q8_0 | 37.8 GB | 46 GB | from 6 GB |
-
-For the three BETA models, the RAM is about the download plus 8 GB. With less, the experts are read from the model
-file instead of loaded into RAM, which is slower.
 
 ### The EXL3 format (in development)
 
@@ -279,14 +187,6 @@ or `sudo dnf install ./<file>.rpm`. The model's settings are updated at the next
 **Fitting it to your PC:** `xestrata --calibrate` measures some of the engine's settings on this PC and keeps the
 fastest (about 5-10 minutes).
 
-**Measuring its speed:** `xestrata --bench` measures the installed IQ3_XXS's speed on this PC (another model: `--model IQ2_XS`, for example) and where the time goes,
-and writes a record to the data folder's `records/bench-<time>/` (about 40 minutes; stop a running xestrata first).
-Each case runs twice; `--bench-rounds 3`, for example, changes that (about 20 minutes more a round).
-`--bench-verbose` also takes each kernel's time and the GPU's temperature. With `--original-strata v0.1.41` it fetches that tag of
-upstream Strata with git and measures the two in turns on the same model. The record is not sent anywhere: read
-`summary.md` before you paste it into a report.
-What it measures and what the record holds: [docs/BENCH.md](docs/BENCH.md).
-
 **Changing the package:** on Ubuntu, `sudo apt install` the other one and it replaces the first.
 On Fedora, name the installed one and the new one, for example `sudo dnf swap xestrata-contrib-cuda13.4 ./xestrata-free-*.rpm`.
 
@@ -336,7 +236,7 @@ it keeps the conversation and reads only what is new, so follow-ups start right 
 **My PC froze or got very slow the first time it started.**
 That is common while it starts, most of all the first time: it is loading the model into RAM and working out how many
 experts the GPU holds. Don't close the window; wait. Still frozen after 10 minutes? Restart the PC, close other
-programs (browsers above all) and try again. If it keeps happening, pick a smaller size (Q2_0 or IQ2_XS).
+programs (browsers above all) and try again. If it keeps happening, pick a smaller model.
 
 **It stopped while downloading or installing.**
 Run `xestrata` again. It continues where it stopped.
@@ -363,7 +263,7 @@ XeStrata is already running: look for its window. If another program uses the po
 `xestrata --port 8081`.
 
 **It is very slow and the disk light stays on.**
-The RAM is not enough. Close other programs, or pick a smaller size (Q2_0 or IQ2_XS).
+The RAM is not enough. Close other programs, or pick a smaller model.
 
 **An answer stopped with "the engine stopped unexpectedly".**
 Usually too little RAM (Linux stops the engine). Send your message again: the engine starts again by itself. If it

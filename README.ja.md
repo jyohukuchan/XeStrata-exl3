@@ -7,6 +7,10 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 
 [English](README.md) | 日本語
 
+> このブランチのエンジンは EXL3 専用です。GGUF native pack と `--pack` / `--native` は削除しました。
+> EXL3 は下の[コマンドライン例](#exl3-の形式開発用)から起動してください。
+> 以下の upstream 由来の setup・配布パッケージ・Web UI の案内は、EXL3 向けの導入手順ではありません。
+
 1,250 億パラメーターの AI モデルを、Intel Arc、AMD Radeon、NVIDIA のどれかの GPU 1 枚と普通の PC で動かします。
 
 XeStrata は、ふつうはサーバーで動かす大きな AI モデル
@@ -43,8 +47,8 @@ Strata との主な違い:
 | --- | --- |
 | GPU | Intel Arc（A シリーズ、B シリーズ）、AMD Radeon（RDNA2 以降、[AMD の GPU](#amd-の-gpu)）か、NVIDIA の GPU（Pascal 以降。Tensor Core のない Pascal は遅い経路で動きます）。VRAM は 12 GB 以上を勧めます（それより少なくても動きますが、遅くなります）。 |
 | CPU | x86-64 で AVX2 があるもの。AVX-512（F、BW、VL、VNNI、VBMI）があれば、CPU の計算に AVX-512 を使います。 |
-| RAM | モデルの大きさによって 32〜62 GB（[モデルの選び方](#モデルの選び方)）。 |
-| ディスク | モデルに 60〜110 GB ほど、ほかに MTP 層に約 6 GB。SSD（NVMe）を強く勧めます。 |
+| RAM | モデルのエキスパートが入るだけ（[モデルの選び方](#モデルの選び方)）。 |
+| ディスク | モデルのチェックポイントの大きさだけ。SSD（NVMe）を強く勧めます。 |
 | OS | Linux（WSL 2 は動くかもしれません。プルリクエスト歓迎）。パッケージは Ubuntu 26.04 と Fedora 44 向けです。ほかのディストリビューションでは[ソースから入れます](docs/BUILD.ja.md#ソースから入れる)。Windows 10 と 11（x64）は 7z で配ります（[Windows](#windows)）。 |
 | BIOS | 単体の GPU では Above 4G Decoding と Re-Size BAR を有効にし、CSM を無効にします。 |
 
@@ -82,93 +86,6 @@ AMD の GPU では、prefill の密な行列積をディストリビューショ
 - 表は、どちらのディストリビューションも ROCm 7.1 の rocBLAS のものです。確かめたのは RX 9060 XT（gfx1200）だけです。
 
 ## モデルの選び方
-
-| モデル | パラメーター | RAM の目安 | VRAM | 向いていること |
-| --- | --- | ---: | ---: | --- |
-| **[Qwen3.8-Flash-Next](#qwen38-flash-next)** | 1,250 億 | 32〜62 GB | 12 GB 以上を勧めます | いちばん賢い。RAM の多い PC 向け |
-| **[Ornith-1.5](#ornith-15beta)**（BETA） | 350 億（1 トークンで 30 億） | 22〜80 GB | 4 GB から | RAM の少ない PC 向け |
-| **[llm-jp-4.1](#llm-jp-41beta)**（BETA） | 320 億（1 トークンで 30 億） | 30〜73 GB | 4 GB から | 日本語と英語の思考するモデル |
-| **[Qwen3.6-35B-A3B](#qwen36-35b-a3bbeta)**（BETA） | 350 億（1 トークンで 30 億） | 31〜46 GB | 4 GB から | 思考するモデル。RAM の少ない PC 向け |
-
-BETA の 3 つは、画像、2 枚以上の GPU、Intel の CPU 内蔵の GPU にまだ対応していません（[詳細](docs/DETAILS.ja.md#qwen38-flash-next-以外のモデルornith-15llm-jp-41qwen36-35b-a3b)）。
-
-迷ったら、RAM が 48 GB 以上の PC では Qwen3.8-Flash-Next の **IQ2_XS** を選んでください。
-RAM がそれより少ない PC では、Qwen3.8-Flash-Next の Coder（32 GB）か Ornith-1.5 が選べます。
-あとから別のモデルを足すときは `xestrata --setup` を実行します。
-
-### Qwen3.8-Flash-Next
-
-**版と大きさ**（大きさは、同じモデルをどれだけ圧縮するかの違い）:
-
-| 版 | 大きさ | ダウンロード | RAM の目安 | 速さ | 品質 |
-| --- | --- | ---: | ---: | --- | --- |
-| 元のモデル、Swift 1.5 | **Q2_0** | 66 GB | 48 GB | いちばん速い | 良い |
-| 元のモデル、Swift 1.5 | **IQ2_XS** | 68 GB | 48 GB | 速い | より良い（**おすすめ**） |
-| 元のモデル、Swift 1.5 | **IQ3_XXS** | 76 GB | 60 GB | 遅め | とても良い |
-| 元のモデル、Swift 1.5 | **IQ3_S** | 84 GB | 62 GB | 遅い | 元のモデルと同等 |
-| Coder | **IQ1_M** | 58 GB | 32 GB | 速い | コードでは良い、ほかは弱い |
-| Unsloth | **UD-IQ4_XS** | 94 GB | 48 GB | RAM が約 80 GB より少ないと遅い | IQ3_S と UD-Q4_K_XL の間 |
-| Unsloth（実験的） | **UD-Q4_K_XL** | 111 GB | 48 GB | いちばん遅い | いちばん良い |
-
-モデルのエキスパート（[しくみ](#しくみ)）は、すべて RAM に置きます。RAM が目安より少なくても、GPU の VRAM が大きければ
-**省 RAM モード**で動きます。このモードでは、エキスパートを RAM にコピーせずにモデルのファイルから読みます
-（[詳細](docs/DETAILS.ja.md#ram-がモデルより少ないとき省-ram-モード)）。
-Unsloth の 2 つは、RAM に入りきらないエキスパートを答えている間に SSD から読みます。
-
-**版:**
-
-- **Qwen3.8-Flash-Next**: 元のモデル。
-- **[Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF)**: UkisAI による調整版です。
-  答える前の思考が短く、答えが早く出ます。品質はほぼ同じです。このモデル自身のライセンスに従います。
-- **[Coder](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF)**: ISTA-DASLab によるコード向けの版です。
-  各層 512 個のエキスパートのうち、コードで使う 256 個だけを残しています。エキスパートが半分なので、コード以外や、英語以外の言語では弱くなります。
-- **[Unsloth の UD-IQ4_XS](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)**: 元のモデルの約 4 ビットの i-quant です。
-  エキスパートが 59.5 GB あり、RAM が約 80 GB 以上あればすべて RAM に置けます（[詳細](docs/DETAILS.ja.md#unsloth-の-ud-iq4_xs)）。
-- **[Unsloth の UD-Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)**（実験的）: 元のモデルの 4 ビット版です。
-  エキスパートが 77 GB あり、2〜3 ビットの大きさより遅くなります（[詳細](docs/DETAILS.ja.md#unsloth-の-ud-q4_k_xl実験的)）。
-
-OrcaRouter の Flash-Next Uncensored IQ3_XXS は、setup のメニューにはありません。
-変換の手順は [docs/ORCA.ja.md](docs/ORCA.ja.md) にあります。
-
-### Ornith-1.5（BETA）
-
-[Ornith-1.5-35B-A3B](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF)（Ornith AI、MIT）: Qwen3.5 系の MoE で、文脈は 256K までです。
-公式の版（Q4_K_M〜BF16）は、モデルの MTP の層で下書きを作り、decode を速くします。
-
-| 大きさ | ダウンロード | RAM の目安 | VRAM |
-| --- | ---: | ---: | ---: |
-| Q4_K_M | 21.7 GB | 30 GB | 4 GB から |
-| Q5_K_M | 25.3 GB | 34 GB | 6 GB から |
-| Q6_K | 29.2 GB | 38 GB | 6 GB から |
-| Q8_0 | 37.8 GB | 46 GB | 6 GB から |
-| BF16 | 71.1 GB | 80 GB | 8 GB から |
-| GSQ-RCO-3BIT | 13.0 GB | 22 GB | 4 GB から |
-| GSQ-RCO-3.5BIT | 15.2 GB | 24 GB | 6 GB から |
-
-GSQ-RCO の 2 つは、pfeifferj による[コミュニティの再現](https://huggingface.co/pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF)で、MTP の層がありません。
-
-### llm-jp-4.1（BETA）
-
-[llm-jp-4.1-32b-a3b-thinking](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf)（LLM-jp、Apache-2.0）: 日本語と英語の思考するモデルで、文脈は 256K までです。
-
-| 大きさ | ダウンロード | RAM の目安 | VRAM |
-| --- | ---: | ---: | ---: |
-| Q4_K_M | 21.5 GB | 30 GB | 4 GB から |
-| BF16 | 64.3 GB | 73 GB | 8 GB から |
-
-### Qwen3.6-35B-A3B（BETA）
-
-[Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF)（Qwen、Apache-2.0。GGUF は Unsloth が MTP の層付きで作ったもの）: Qwen3.5 系の思考する MoE で、文脈は 256K までです。
-モデルの MTP の層で下書きを作り、decode を速くします。
-
-| 大きさ | ダウンロード | RAM の目安 | VRAM |
-| --- | ---: | ---: | ---: |
-| UD-Q4_K_XL | 22.9 GB | 31 GB | 4 GB から |
-| UD-Q6_K_XL | 32.6 GB | 41 GB | 6 GB から |
-| Q8_0 | 37.8 GB | 46 GB | 6 GB から |
-
-BETA の 3 つの RAM の目安は、ダウンロードの大きさに約 8 GB を足したものです。
-RAM がそれより少ないと、エキスパートを RAM に読み込まずにモデルのファイルから読むので、遅くなります。
 
 ### EXL3 の形式（開発用）
 
@@ -262,13 +179,6 @@ podman compose up -d                         # http://127.0.0.1:8095（止める
 **自分の PC に合わせる**: `xestrata --calibrate` は、エンジンの設定のいくつかをこの PC で測り、速いものを残します
 （5〜10 分ほど）。
 
-**速さを測る**: `xestrata --bench` は、入れた IQ3_XXS（ほかのモデルは `--model IQ2_XS` などで指定）のこの PC での速さと、どこに時間がかかっているかを測り、
-データフォルダの `records/bench-<日時>/` に記録を書きます（40 分ほど。動いている xestrata は先に止めます）。
-各計測は 2 回ずつで、`--bench-rounds 3` のように回数を変えられます（1 回あたり 20 分ほど増えます）。
-`--bench-verbose` はカーネルごとの時間や GPU の温度も取ります。`--original-strata v0.1.41` を足すと、そのタグの upstream Strata を
-git で取ってきて、同じモデルで交互に測ります。記録はどこにも送りません。報告に貼るときは `summary.md` の中身を確かめてから貼ります。
-測るものと記録の中身は [docs/BENCH.ja.md](docs/BENCH.ja.md) にあります。
-
 **別のパッケージに替える**: Ubuntu では入れたい方を `sudo apt install` すると入れ替わります。
 Fedora では `sudo dnf swap xestrata-contrib-cuda13.4 ./xestrata-free-*.rpm` のように、入っているものと入れたいものを指定します。
 
@@ -316,7 +226,7 @@ sudo dnf remove xestrata-contrib-cuda13.4    # Fedora（同じ）
 **最初の起動で PC が固まった、とても遅くなった**
 起動中、とくに初回はよくあります。モデルを RAM に読み込み、GPU に置くエキスパートの量を決めているところです。
 ウィンドウを閉じずに待ってください。10 分たっても固まったままなら、PC を再起動し、ほかのプログラム
-（とくにブラウザ）を閉じてからやり直してください。何度も起きるなら、小さい大きさ（Q2_0 か IQ2_XS）を選んでください。
+（とくにブラウザ）を閉じてからやり直してください。何度も起きるなら、小さいモデルを選んでください。
 
 **ダウンロードやインストールの途中で止まった**
 `xestrata` をもう一度実行してください。止まったところから続けます。
@@ -342,7 +252,7 @@ XeStrata がすでに動いています。そのウィンドウを探してく�
 `xestrata --port 8081` のように別のポートを選べます。
 
 **とても遅く、ディスクのランプが点きっぱなし**
-RAM が足りていません。ほかのプログラムを閉じるか、小さい大きさ（Q2_0 か IQ2_XS）を選んでください。
+RAM が足りていません。ほかのプログラムを閉じるか、小さいモデルを選んでください。
 
 **答えの途中で「the engine stopped unexpectedly」と出た**
 たいていは RAM 不足です（Linux がエンジンを止めます）。同じメッセージをもう一度送れば、エンジンは自動で起動し直します。

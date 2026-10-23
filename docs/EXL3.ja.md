@@ -190,9 +190,8 @@ AR では `--prompt-chunk 0 --spec 0` を使う。`--spec 1` も MTP 無効と�
 Qwen3.8 の projection map と n-gram codec/table はあり、同モデルの起動時 binding は別に行う。
 
 開発用 `plain_model_logits` は `qbench-trace/1` の token ID を再 tokenize せず順に入力し、指定した行の
-FP32 logits と manifest を保存する。`--exl3 DIR --metadata-gguf GGUF` または `--native GGUF` を選び、
-`--trace TRACE.json --out-dir DIR` を指定する。`--rows 0,4` で対象行を限定でき、native 経路の
-`--expert-profile FILE` は同じ residency 条件で照合するために使える。精度判定は元の BF16 教師に対する
+FP32 logits と manifest を保存する。`--exl3 DIR --metadata-gguf GGUF` と
+`--trace TRACE.json --out-dir DIR` を指定する。`--rows 0,4` で対象行を限定できる。精度判定は元の BF16 教師に対する
 `KL(P_BF16 || P_candidate)` だけを使う。速度の判定にはこの診断用 dump の実行時間を使わない。
 
 ## Qwen3.8 Flash の AR 接続
@@ -603,16 +602,14 @@ plain_model_bench --exl3 /path/to/exl3-model --metadata-gguf /path/to/metadata-o
     --tokens-file /path/to/token-ids.txt --context 512 --warmup 16 --steps 128 --repeats 5 --max-t 1
 ```
 
-native IQuant は `--native GGUF --expert-profile FILE` に置き換える。JSON 出力には各 repeat と全体の
+JSON 出力には各 repeat と全体の
 mean/median/p90 latency、token/s、expert の hit/miss、resident/slot 数を含む。token 列、context、
 max-t、常駐条件と実行環境をそろえ、最適化と精度確認の後に速度ゲートへ使う。
 
 ## 出力 head の早期接続
 
-Flash の CLI に `--exl3-head DIR` を加えると、その archive の `lm_head` を canonical の
-`output.weight` に明示的に対応付ける。shape は一致が必要で、黙って行を切ったり別形式へ変換したりしない。
-現在の接続は single GPU の CLI 用で、GGUF native head、MTP、serve、batch、pipeline windows との併用は
-拒否する。trunk と embedding は既存の pack/native 経路を使う。
+旧 pack/native 経路に EXL3 head だけを差し込む `--exl3-head` は、旧 CLI とともに削除した。
+現在の `--exl3` は trunk、embedding、head を同じ archive から読み込む。
 
 `Exl3Dense` が圧縮成分を device へ転送して所有する。非量子化の `lm_head.weight` がある場合は
 F16/BF16/F32 の元 dtype を保って転送し、専用の raw linear で計算する。bias は shape を検証して FP32 にする。
@@ -620,7 +617,6 @@ F16/BF16/F32 の元 dtype を保って転送し、専用の raw linear で計算
 準備し、owner はその graph より長く生存する。`lm_head()` は canonical の plane を解釈する前に EXL3 を
 選び、head mixer の FP32 出力をそのまま渡す。
 開発用の `Exl3Dense::load()` overload は任意の canonical 行名を明示でき、複数の owner を独立に保持する。
-CLI の `--exl3-head` が選ぶ対象は引き続き `output.weight` である。
 `load_remapped()` は H128 単位の入力並べ替えと出力の選択・並べ替えを行い、trellis と scale を
 再量子化せずに移す。raw tensor の非空の block map は拒否する。
 `load_detached()` は外部の canonical table を使わず、明示した shape と同じ検証で projection を所有する。

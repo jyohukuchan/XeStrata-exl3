@@ -199,9 +199,9 @@ in decode windows bounded by `max-t`, returning the last row. Compressed weights
 a fallback distinct from dedicated batched prefill. MTP uses the integration below. Qwen3.8 projection maps and n-gram codecs/tables exist; its startup binding remains separate.
 
 The development tool `plain_model_logits` feeds `qbench-trace/1` token IDs in order without retokenizing,
-saving FP32 logits and a manifest for selected rows. Choose `--exl3 DIR --metadata-gguf GGUF` or `--native GGUF`,
-and supply `--trace TRACE.json --out-dir DIR`. `--rows 0,4` limits rows; native `--expert-profile FILE` supports
-checks with matched residency. Quality acceptance uses only `KL(P_BF16 || P_candidate)` against the original
+saving FP32 logits and a manifest for selected rows. Supply `--exl3 DIR --metadata-gguf GGUF`
+and `--trace TRACE.json --out-dir DIR`. `--rows 0,4` limits rows.
+Quality acceptance uses only `KL(P_BF16 || P_candidate)` against the original
 BF16 teacher. The diagnostic dump's runtime is not a decode speed acceptance measurement.
 
 ## Qwen3.8 Flash AR integration
@@ -659,16 +659,14 @@ plain_model_bench --exl3 /path/to/exl3-model --metadata-gguf /path/to/metadata-o
     --tokens-file /path/to/token-ids.txt --context 512 --warmup 16 --steps 128 --repeats 5 --max-t 1
 ```
 
-For native IQuant, replace the source with `--native GGUF --expert-profile FILE`. JSON output includes each repeat's
+JSON output includes each repeat's
 and aggregate mean/median/p90 latency and token/s, expert hit/miss counts, and resident/slot counts. Match token IDs,
 context, max-t, residency and execution environment, then apply the speed gate after optimization and quality checks.
 
 ## Early output-head integration
 
-The Flash CLI's `--exl3-head DIR` explicitly maps that archive's `lm_head` to canonical `output.weight`.
-Shapes must match: rows are neither silently truncated nor converted to another format. This connection
-currently serves single-GPU CLI runs and rejects combinations with a GGUF native head, MTP, serve, batch
-or pipeline windows. The trunk and embedding keep using the existing pack/native paths.
+The old `--exl3-head` option, which inserted only an EXL3 head into the pack/native path, was removed with that CLI.
+The current `--exl3` entry loads the trunk, embedding and head from the same archive.
 
 `Exl3Dense` uploads and owns the compressed device components. When an unquantized `lm_head.weight`
 is present, it retains the original F16/BF16/F32 dtype on upload and uses a dedicated raw linear operation.
@@ -676,7 +674,7 @@ Bias shapes are validated before conversion to FP32. Each participating stream's
 prepared before graph capture, and the owner outlives those graphs. `lm_head()` selects EXL3 before
 interpreting canonical planes and passes the head mixer's FP32 output directly.
 The development `Exl3Dense::load()` overload accepts an explicit canonical row name, allowing multiple
-independent owners. The CLI's `--exl3-head` continues to select `output.weight`.
+independent owners.
 `load_remapped()` permutes input H128 blocks and selects or permutes output blocks, moving trellis words and
 scales without requantization. Raw tensors reject nonempty block maps.
 `load_detached()` owns a projection without an external canonical table, retaining the same explicit shape validation.

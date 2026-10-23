@@ -145,7 +145,7 @@ Built with sm_70 code only and run on an RTX 3070, CTest passed its 71 tests wit
 
 ### The engine's parts and tests
 
-The parts and tests that need no model build without llama.cpp (`STRATA_NATIVE_EXPERTS=OFF`).
+The engine and tests build without llama.cpp's ggml-cpu.
 The free mode (intel/llvm in `.tools/intel-llvm/install`):
 
 ```bash
@@ -153,7 +153,6 @@ L=$PWD/.tools/intel-llvm/install
 cmake -S . -B build/free \
   -DCMAKE_CXX_COMPILER=$L/bin/clang++ -DCMAKE_C_COMPILER=$L/bin/clang -DSTRATA_LICENSE=free \
   -DSTRATA_ENABLE_XE=ON \
-  -DSTRATA_NATIVE_EXPERTS=OFF \
   -DSTRATA_BUILD_TESTS=ON
 cmake --build build/free --target strata-device strata-load elementwise_parity \
   gguf_reader_test suffix_drafter_test controller_test draft_policy_test conv_cache_test \
@@ -173,14 +172,13 @@ cmake --build build/free --target strata-device strata-load elementwise_parity \
 
 ### The engine
 
-The engine (the `strata` executable) uses llama.cpp for the native i-quant experts.
-llama.cpp goes in `third_party/main/llama.cpp` at the pinned commit (`3cf03257f219afbe7334045ff7c6a06ac68c627d`).
-setup.py fetches it; the image encoder also uses its `tools/mtmd`.
+The engine (the `strata` executable) reads EXL3 checkpoints directly.
+It does not depend on I-Quant experts or ggml-cpu.
 
 ```bash
 L=$PWD/.tools/intel-llvm/install
 cmake -S . -B build/free -DCMAKE_CXX_COMPILER=$L/bin/clang++ -DCMAKE_C_COMPILER=$L/bin/clang -DSTRATA_ENABLE_XE=ON \
-  -DSTRATA_LICENSE=free -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_GGML_DIR=$PWD/third_party/main/llama.cpp
+  -DSTRATA_LICENSE=free
 cmake --build build/free --target strata -j6
 ```
 
@@ -190,7 +188,7 @@ For NVIDIA GPUs (contrib-llvm), with intel/llvm built by `tools/intel_llvm_build
 C=$PWD/.tools/intel-llvm-contrib/install
 cmake -S . -B build/contrib-llvm -DCMAKE_CXX_COMPILER=$C/bin/clang++ -DCMAKE_C_COMPILER=$C/bin/clang \
   -DSTRATA_LICENSE=contrib \
-  -DSTRATA_ENABLE_XE=ON -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_GGML_DIR=$PWD/third_party/main/llama.cpp
+  -DSTRATA_ENABLE_XE=ON
 cmake --build build/contrib-llvm --target strata -j6
 LD_LIBRARY_PATH=$C/lib build/contrib-llvm/strata-device
 ```
@@ -202,7 +200,7 @@ The same executable runs on Intel GPUs too.
 - **Jobs**: one SYCL translation unit takes several GB to compile.
   On the validated machine (92 GiB) a build with 16 jobs was killed for lack of memory, one with 6 was not.
   setup uses at most one job per 12 GB of RAM.
-- **`STRATA_PORTABLE`** (default ON): builds ggml-cpu for any CPU with AVX2.
+- **`STRATA_PORTABLE`** (default ON): builds for portability to CPUs with AVX2.
   `-DSTRATA_PORTABLE=OFF` builds it with `-march=native` for this machine, which may stop running when the CPU is changed.
   On the i7-14700 both decode equally fast.
   setup always passes ON (an existing build folder keeps its cached value otherwise).

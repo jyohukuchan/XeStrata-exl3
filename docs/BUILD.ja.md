@@ -147,7 +147,7 @@ sm_70 だけのコードを作って RTX 3070 で動かすと、既定でも両�
 
 ### エンジンの部品とテスト
 
-モデルを使わない部品とテストは、llama.cpp なしでビルドできます（`STRATA_NATIVE_EXPERTS=OFF`）。
+エンジンとテストは、llama.cpp の ggml-cpu なしでビルドできます。
 free の方式では次のとおりです（intel/llvm は `.tools/intel-llvm/install`）。
 
 ```bash
@@ -155,7 +155,6 @@ L=$PWD/.tools/intel-llvm/install
 cmake -S . -B build/free \
   -DCMAKE_CXX_COMPILER=$L/bin/clang++ -DCMAKE_C_COMPILER=$L/bin/clang -DSTRATA_LICENSE=free \
   -DSTRATA_ENABLE_XE=ON \
-  -DSTRATA_NATIVE_EXPERTS=OFF \
   -DSTRATA_BUILD_TESTS=ON
 cmake --build build/free --target strata-device strata-load elementwise_parity \
   gguf_reader_test suffix_drafter_test controller_test draft_policy_test conv_cache_test \
@@ -175,14 +174,13 @@ cmake --build build/free --target strata-device strata-load elementwise_parity \
 
 ### エンジン本体
 
-エンジン本体（実行ファイル `strata`）は、ネイティブの i-quant のエキスパートに llama.cpp を使います。
-llama.cpp は固定したコミット（`3cf03257f219afbe7334045ff7c6a06ac68c627d`）のものを `third_party/main/llama.cpp` に置きます。
-setup.py が取ってきます。画像のエンコーダーは、その `tools/mtmd` も使います。
+エンジン本体（実行ファイル `strata`）は EXL3 の checkpoint を直接読み込みます。
+I-Quant のエキスパートと ggml-cpu への依存はありません。
 
 ```bash
 L=$PWD/.tools/intel-llvm/install
 cmake -S . -B build/free -DCMAKE_CXX_COMPILER=$L/bin/clang++ -DCMAKE_C_COMPILER=$L/bin/clang -DSTRATA_ENABLE_XE=ON \
-  -DSTRATA_LICENSE=free -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_GGML_DIR=$PWD/third_party/main/llama.cpp
+  -DSTRATA_LICENSE=free
 cmake --build build/free --target strata -j6
 ```
 
@@ -192,7 +190,7 @@ NVIDIA の GPU 向け（contrib-llvm）では、`tools/intel_llvm_build.py --con
 C=$PWD/.tools/intel-llvm-contrib/install
 cmake -S . -B build/contrib-llvm -DCMAKE_CXX_COMPILER=$C/bin/clang++ -DCMAKE_C_COMPILER=$C/bin/clang \
   -DSTRATA_LICENSE=contrib \
-  -DSTRATA_ENABLE_XE=ON -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_GGML_DIR=$PWD/third_party/main/llama.cpp
+  -DSTRATA_ENABLE_XE=ON
 cmake --build build/contrib-llvm --target strata -j6
 LD_LIBRARY_PATH=$C/lib build/contrib-llvm/strata-device
 ```
@@ -204,7 +202,7 @@ AMD の GPU は `STRATA_HIP_ARCHS` に並べます（RX 6800 は `gfx1030`、RX 
 - **ジョブ数**: SYCL の翻訳単位 1 つのコンパイルに数 GB のメモリを使います。
   確かめた機械（92 GiB）では、16 ジョブのビルドがメモリ不足で止められ、6 ジョブでは止められませんでした。
   setup は RAM 12 GB あたり 1 ジョブまでにします。
-- **`STRATA_PORTABLE`**（既定 ON）: ggml-cpu を AVX2 のある CPU ならどれでも動くようにビルドします。
+- **`STRATA_PORTABLE`**（既定 ON）: AVX2 のある CPU に持ち運べるビルドにします。
   `-DSTRATA_PORTABLE=OFF` はこの機械に合わせた `-march=native` でビルドするので、CPU を替えると動かなくなることがあります。
   i7-14700 では、どちらも decode の速さは同じでした。
   setup はいつも ON を渡します（渡さないと、既存のビルドフォルダーはキャッシュした値を使い続けます）。
