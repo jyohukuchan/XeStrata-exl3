@@ -430,6 +430,13 @@ bool host_timing_enabled() {
     return on;
 }
 
+/// STRATA_EXL3_DEVICE_PLAN: 0 keeps the per-layer host plan (the doorbell wait, the host hit plan and the
+/// merge round trip) even where the device-resident plan would apply.
+bool device_route_plan_enabled() {
+    const char* text = std::getenv("STRATA_EXL3_DEVICE_PLAN");
+    return !(text != nullptr && text[0] == '0' && text[1] == '\0');
+}
+
 double ms_since(std::chrono::steady_clock::time_point& mark) {
     const auto now = std::chrono::steady_clock::now();
     const double value = std::chrono::duration<double, std::milli>(now - mark).count();
@@ -1462,6 +1469,7 @@ bool Exl3FlashModel::forward(int32_t token, int64_t pos, int32_t& next_token, fl
                 }
                 timing.bridge_ms += ms_since(mark);
             }
+            const bool resident_route = stage.runtime->fully_resident();
             for (int64_t layer = stage.layer_begin; layer < stage.layer_end; ++layer) {
                 const size_t local = static_cast<size_t>(layer - stage.layer_begin);
                 doorbell_reset(stage.doorbell);
@@ -1486,6 +1494,42 @@ bool Exl3FlashModel::forward(int32_t token, int64_t pos, int32_t& next_token, fl
                     err = "EXL3 Flash: pre graph launch layer " + std::to_string(layer) + ": " +
                           strata::gpu::last_error();
                     return false;
+                }
+                if (resident_route && device_route_plan_enabled()) {
+                    // THE EXPERTS RUN FROM THE DEVICE-RESIDENT PLAN.  The pre graph published the
+                    // routed ids and the layer's activation on the device, and the plan kernel
+                    // resolves every route against the cache's pair table itself: the host does
+                    // not wait at the doorbell, builds no plan and moves no rows.  A fully
+                    // resident cache has no CPU miss to merge, so the hit rows land in their
+                    // `parts` rows directly and the post graph follows them on the queue.  The
+                    // doorbell keeps publishing the ids and the weights to its mapped memory, so
+                    // the host still sees them and the split they imply - it sees them off the
+                    // decode's critical path rather than in it.
+                    timing.pre_graph_ms += ms_since(mark);
+                    if (!strata::gpu::memset_async(stage.parts_device, 0,
+                                                   stage.merge_output.size() * sizeof(float), nullptr)) {
+                        err = std::string("EXL3 Flash: clearing expert output: ") + strata::gpu::last_error();
+                        return false;
+                    }
+                    sycl::event resident_done;
+                    mark = std::chrono::steady_clock::now();
+                    if (!stage.runtime->enqueue_device_hit(Runtime::at(stage.device).stream(nullptr), layer,
+                                                           static_cast<const float*>(stage.session.block.mixed),
+                                                           stage.doorbell.d_ids, 1,
+                                                           static_cast<float*>(stage.parts_device),
+                                                           impl_->geometry.n_embd, resident_done, {}, err)) {
+                        err = "EXL3 Flash: expert window layer " + std::to_string(layer) + ": " + err;
+                        return false;
+                    }
+                    timing.expert_prepare_ms += ms_since(mark);
+                    mark = std::chrono::steady_clock::now();
+                    if (!strata::gpu::graph_launch(stage.post_graphs[local], nullptr)) {
+                        err = "EXL3 Flash: post graph launch layer " + std::to_string(layer) + ": " +
+                              strata::gpu::last_error();
+                        return false;
+                    }
+                    timing.post_graph_ms += ms_since(mark);
+                    continue;
                 }
                 // The host waits at the doorbell - the window crossing to it - and not for the
                 // queue: the poll returns at the ring, which the pre graph rings before its end,

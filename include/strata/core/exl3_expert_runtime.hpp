@@ -76,6 +76,14 @@ public:
     bool record_device_hit_enqueue(sycl::queue& queue, int64_t layer, const float* device_fp32_x,
                                    const int32_t* device_ids, int64_t n_tokens, float* gpu_output, int64_t ldy,
                                    std::string& err);
+    /// The same device route-plan builder and grouped kernels, enqueued outside a capture and returning the
+    /// final event: the routed ids are device data and the builder resolves each route against the immutable
+    /// cache's pair table itself, so the host neither builds nor uploads a plan and nothing is read back.  A
+    /// route the cache holds lands in its output row; one it misses gets no GPU destination and stays the CPU
+    /// path's.  The ids reach the host through the doorbell's mapped memory, off the decode's critical path.
+    bool enqueue_device_hit(sycl::queue& queue, int64_t layer, const float* device_fp32_x, const int32_t* device_ids,
+                            int64_t n_tokens, float* gpu_output, int64_t ldy, sycl::event& done,
+                            const std::vector<sycl::event>& deps, std::string& err);
     /// Publish only the hit entry list through the legacy window sink so its CPU-row merge can reuse the existing
     /// mapped plan and flag protocol.  EXL3's own grouped plan remains in the persistent runtime images.
     bool publish_window_plan(GpuPlanSink& sink, std::string& err) const;
@@ -119,6 +127,8 @@ public:
 private:
     bool enqueue_impl(sycl::queue& queue, const float* device_fp32_x, int64_t ldx, float* gpu_output, int64_t ldy,
                       sycl::event& done, const std::vector<sycl::event>& deps, bool require_cpu, std::string& err);
+    bool submit_device_hit_plan(sycl::queue& queue, int64_t layer, const int32_t* device_ids, int64_t n_tokens,
+                                const std::vector<sycl::event>& deps, sycl::event& plan, std::string& err);
     bool allocate_images(std::string& err);
     bool copy_plan(sycl::queue& queue, const std::vector<sycl::event>& deps, std::vector<sycl::event>& copies,
                    std::string& err);

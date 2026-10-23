@@ -438,23 +438,58 @@ Measured (two V620s, the 512-token prompt, 32 decode tokens, `STRATA_EXL3_FLASH_
 | before | 11.38 | 87.1 ms | 62.0 ms | 13.9 ms | 4.5 ms | 3.9 ms | 2.8 ms |
 | after | 12.39 | 80.0 ms | 56.5 ms | 14.2 ms | 3.9 ms | 2.7 ms | 2.6 ms |
 
-The generated tokens are the same before and after. The reference's 23.96 tok/s is not reached
-yet: what remains is the trellis dots still inside `pre` (300 kernels, 13 ms), the experts'
-grouped flow (336 kernels, 9.7 ms of GPU plus 3.9 ms of the host's hit plan), the GDN, RoPE and
-router kernels, and the host gaps around each layer's doorbell.
+The generated tokens are the same before and after.
 
 The values do not change: the logits SHA256 of
 `exl3_flash_probe --tokens 16,10,16,28 --max-new 2 --max-context 8 --dump-logits` keeps the
-reference value with the device cache off on both one and two stages, and `raw_linear_parity`
-passes.
+reference value with the device cache off on both one and two stages, the device-cache runs
+(fully resident and partially resident) dump bit for bit what the run before this step dumped,
+and `raw_linear_parity` passes.
 
-**What does not transfer.** The reference's `exl3_gemm` folds the input Hadamard, the GEMV and
-the output Hadamard into one kernel with a cooperative grid (a grid-wide barrier), and SYCL has
-no portable form of that barrier, so the three kernels stay. The reference's experts staying
-wholly on the GPU cannot be taken as is either: XeStrata's device cache is a contract in which
-the host reads the routed ids to decide hits and misses (the CPU misses keep their FP64
-accumulation). The GPU-side argmax is not applied because the probe that dumps logits needs the
-host logits and the treatment of greedy ties must not change.
+**Taking the host out of the layer loop (a device-resident route plan).** The next step moved the
+routed experts' route plan to a device-resident table. The pre graph publishes the routed ids and
+the layer's activation on the device, and a plan kernel resolves each route against the device's
+`(layer, expert)` to blob table: an expert the cache holds writes its output row directly, and a
+route it does not hold gets no GPU destination (its row stays the CPU's FP64 path). Where every
+route of a stage's layers is in the cache (the measured configuration), the host does not wait at
+the doorbell, does not build or upload a plan, and makes no merge round trip (D2H + add + H2D).
+The routed ids keep arriving in the doorbell's mapped memory, so the CPU-miss handling and the
+logits dump see them as before - they are simply seen off the decode's critical path. The
+per-layer host plan remains behind `STRATA_EXL3_DEVICE_PLAN=0`, and whether a runtime is fully
+resident is decided over the layers it serves (a stage's own layers for a stage).
+
+Measured on the same 512-token prompt, 32 decode tokens, two V620s, `STRATA_EXL3_FLASH_TIMING=1`:
+
+| state | decode tok/s | per token | pre | expert_prep | expert_wait | merge | post | bridge | head | emb/ple |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| before this step | 12.50 | 79.45 ms | 56.30 | 3.42 | 14.42 | 2.65 | 0.36 | 0.10 | 1.86 | 0.30 |
+| after | 13.69 | 72.53 ms | 0.66 | 2.44 | 0 | 0 | 0.30 | 32.71 | 35.51 | 0.92 |
+
+Afterwards the GPU's work shows up where the host waits at the stage boundary and at the head.
+The about 7 ms that came off the wall is the gaps the per-layer host round trip used to put into
+the GPU's timeline. The generated tokens are the same before and after.
+
+**The Hadamard fold into the GEMV was measured and not kept.** Two shapes were built for folding
+the input and output H128 into the dot's single kernel, and both measured slower here. A work
+group owning one 128-column block (with the K partitions' partials in local memory) took the
+trellis dots from 43 µs to 76 µs per launch, and one wave owning one output tile end to end (the
+reduction tree in registers) took them to 197 µs. Without a grid-wide barrier a block's K split
+stays inside its work group and cannot return to the dot's own parallelism (the K split across
+waves per output tile), so the three-kernel chain (a 43 µs dot plus the two H128 launches,
+2 ms) is faster on this GPU.
+
+**What remains is kernel speed.** The wall time is now bound by the GPU execution itself: the
+kernel trace of the same run puts one decode token at 56.3 ms of kernel time over 3160 kernels
+across the two devices, with about 16 ms of gaps around them. The largest parts are the raw F16
+projections (244 kernels, 18.6 ms), the trellis dots (300 kernels, 15.5 ms), the experts'
+grouped flow (336 kernels including the plan kernel, about 9 ms), the GDN, RoPE and router
+kernels (about 8 ms), and the two H128 stages (650 kernels, 2.5 ms). The gap to the reference's
+23.96 tok/s is now in these kernels, not in per-layer host synchronization. The expert flow is
+still seven kernels per layer: the host's plan is gone, the kernel count is not.
+
+The GPU-side argmax is not applied either: the probe that dumps logits needs the host logits and
+the treatment of greedy ties must not change, so the logits transfer to the host stays the one
+copy at the head.
 
 ## Qwen3.5 MoE MTP integration
 

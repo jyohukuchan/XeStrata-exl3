@@ -416,20 +416,49 @@ trace が正しかった。
 | 適用前 | 11.38 | 87.1 ms | 62.0 ms | 13.9 ms | 4.5 ms | 3.9 ms | 2.8 ms |
 | 適用後 | 12.39 | 80.0 ms | 56.5 ms | 14.2 ms | 3.9 ms | 2.7 ms | 2.6 ms |
 
-生成 token は適用前後で同じ。参照の 23.96 tok/s にはまだ届かず、残りは pre に残る trellis dot
-（300 カーネル 13 ms）、expert の grouped 流れ（336 カーネル 9.7 ms とホストの hit 計画 3.9 ms）、
-GDN・RoPE・router の小さなカーネルと、層ごとの doorbell を挟む host の隙間である。
+生成 token は適用前後で同じ。
 
 値は変わらない: `exl3_flash_probe --tokens 16,10,16,28 --max-new 2 --max-context 8 --dump-logits` の
-logits SHA256 は device cache なしで単一 stage・2 stage とも参照値のままで、`raw_linear_parity` も
-通る。
+logits SHA256 は device cache なしで単一 stage・2 stage とも参照値のままで、device cache ありの
+構成（全常駐・部分常駐）の dump もこの一手の前の run と bit 一致、`raw_linear_parity` も通る。
 
-**移せなかったもの。** 参照の `exl3_gemm` は cooperative grid（grid 単位の barrier）で入力 Hadamard・
-GEMV・出力 Hadamard を 1 カーネルに畳んでいるが、grid 単位の barrier は SYCL に portable な形が無く、
-3 カーネルのままにした。expert を GPU 上だけで完結させる形も、XeStrata の device cache が「ホストが
-routed id を見て hit/miss を決める」契約を持つためそのままは取れない（CPU miss の FP64 累算は残る）。
-GPU 上の argmax も、logits を dump する probe がホストの logits を必要とし、greedy の同点の扱いを
-変えないため入れていない。
+**decode のホストを層の外へ出す（device 常駐の route 計画）。** 次の一手として、routed expert の
+route 計画を device 常駐の表に移した。pre の graph が routed id と層の活性化を device 上に出し、
+計画を作るカーネルが各 route を device 常駐の (layer, expert) → blob の表で引く。cache が持つ
+expert はその出力の行に直接書き、持たない route は GPU の行き先を持たない（その行は CPU の
+FP64 経路のもの）。stage の層の route が全部 cache にある時（この計測の構成）、ホストは doorbell
+を待たず、計画を組まず upload せず、merge の D2H + add + H2D の往復もしない。routed id は
+doorbell の mapped memory に届き続けるので、CPU miss の処理も logits の dump も従来どおり
+ホストから見える - decode の律速経路の外で見える、というだけの話。層ごとのホスト計画は
+`STRATA_EXL3_DEVICE_PLAN=0` で残してある。層の全 pair が常駐かどうかは、その runtime が請け負う
+層の範囲（stage ならその stage の層）で判定する。
+
+計測（同じ 512 トークン prompt、32 トークン decode、V620 2 枚、`STRATA_EXL3_FLASH_TIMING=1`）:
+
+| 状態 | decode tok/s | 1 トークン | pre | expert_prep | expert_wait | merge | post | bridge | head | emb/ple |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| この一手の前 | 12.50 | 79.45 ms | 56.30 | 3.42 | 14.42 | 2.65 | 0.36 | 0.10 | 1.86 | 0.30 |
+| 後 | 13.69 | 72.53 ms | 0.66 | 2.44 | 0 | 0 | 0.30 | 32.71 | 35.51 | 0.92 |
+
+後では GPU の仕事が bridge（stage 境界の残差の待ち）と head の待ちの中にそのまま現れる。減った
+約 7 ms は、層ごとのホストの往復が GPU の時間軸に入れていた隙間である。生成 token は前後で同じ。
+
+**Hadamard の GEMV への畳み込みは測って入れなかった。** 入力・出力の H128 を dot の 1 カーネルに
+畳む形を 2 通り作り、実測でどちらも遅いので残さなかった。128 列の block を 1 つの work group が
+持つ形（K 分割の部分和を LDS に置く）は trellis dot を 1 発 43 µs から 76 µs に、1 wave が 1 tile を
+通しで持ち部分和の木をレジスタで作る形は 197 µs に遅くなった。grid 単位の barrier が無い以上、
+128 列の block の K 分割は work group の中だけに閉じ、dot 単体の並列度（出力 tile ごとに K を
+wave で割る）に戻せない。3 カーネルの連鎖（dot 43 µs + H128 2 発 2 ms）の方がこの GPU では速い。
+GPU 上の argmax も入れていない: logits を dump する probe がホストの logits を必要とし、greedy の
+同点の扱いを変えないためで、logits のホストへの転送は head の 1 回に残る。
+
+**残りはカーネルの速さにある。** 今は壁時計が GPU の実行そのものに律速されている。同じ run の
+カーネル trace で、1 トークンの実行の合計は 56.3 ms / 3160 カーネル（2 device の合計）、外の隙間が
+その外に約 16 ms。多い順に raw F16 射影 244 カーネル 18.6 ms、trellis dot 300 カーネル 15.5 ms、
+expert の grouped 流れ（計画のカーネルを含め 336 カーネル）約 9 ms、GDN・RoPE・router など約 8 ms、
+H128 の 2 段 650 カーネル 2.5 ms。参照の 23.96 tok/s との差は、層ごとのホスト同期ではなくこれらの
+カーネルの速さに残っている。expert の流れはまだ 7 カーネル/層で、ホストの計画は消えたがカーネルの
+数は減っていない。
 
 ## Qwen3.5 MoE の MTP 接続
 
