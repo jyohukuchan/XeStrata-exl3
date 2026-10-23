@@ -94,11 +94,7 @@ bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std
     int64_t max_ff = 0;
     bf16_ = false;
     if (exl3) max_ff = tier.exl3_runtime->max_ff();
-    else
-        for (int64_t l = 0; l < lay.n_layers; ++l) {
-            max_ff = std::max<int64_t>(max_ff, lay.native ? lay.fmt[(size_t) l].n_ff : strata::kernels::cpu::FF);
-            bf16_ = bf16_ || (lay.native && lay.fmt[(size_t) l].gu_type == 30);
-        }
+    else max_ff = strata::kernels::cpu::FF;
 
     const uint64_t T = (uint64_t) shape.max_t, N = (uint64_t) shape.n_embd, K = (uint64_t) shape.k;
     bool ok = mapped(T * N * 4, (void**) &h_x_, (void**) &m_x_) &&
@@ -374,19 +370,9 @@ bool MoeWindow::experts(int64_t layer, uint32_t ring, int grp, int tb, int n, st
     try {
         // the VRAM groups now; the PCIe groups once the copy engine has landed them in staging
         auto grouped = [&](const unsigned long long* gp, const int32_t* gs, const int32_t* gn, int64_t grid_groups) {
-            if (lay.native) {
-                const auto& f = lay.fmt[(size_t) layer];
-                const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff, f.up_type);
-                if (f.gu_type == 30)
-                    native_expert_grouped_bf16(L, gp, gs, gn, p_dst, p_tok, cap, cap, nat_xf_ + (size_t) tb * N,
-                                               hit_scratch_, hit_out, cs, grid_groups);
-                else
-                    native_expert_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap, nat_xq_ + (size_t) tb * (N / 32) * 36,
-                                          hit_scratch_, hit_out, cs, grid_groups);
-            } else {
-                moe_grouped_s2(gp, gs, gn, p_dst, p_tok, cap, cap, hit_xq_ + (size_t) tb * (N / 32) * 34,
-                               hit_xs_ + (size_t) tb * (N / 32), hit_scratch_, hit_out, cs);
-            }
+            (void) grid_groups;
+            moe_grouped_s2(gp, gs, gn, p_dst, p_tok, cap, cap, hit_xq_ + (size_t) tb * (N / 32) * 34,
+                           hit_xs_ + (size_t) tb * (N / 32), hit_scratch_, hit_out, cs);
         };
         grouped(p_ptr, p_start, p_counts, cap);
         if (!segmented_) wait_flag_ge(m_flagB_, ring, cs);   // the PCIe share is in staging (DMA) or mapped

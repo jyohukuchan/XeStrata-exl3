@@ -257,7 +257,6 @@ endif()
 # ---- strata_plan ----------------------------------------------------------
 # Also header-only.  A "planner" that hides state would be one whose decision is not inspectable, and the
 # whole point of P1.S9 is that the decision is arithmetic you can check by hand.
-option(STRATA_NATIVE_EXPERTS "Native (IQ) expert support through ggml-cpu" ON)
 
 add_library(strata_plan INTERFACE)
 target_include_directories(strata_plan INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -485,7 +484,7 @@ if(STRATA_ENABLE_XE)
                                    src/core/exl3_expert_source.cpp src/core/exl3_expert_formats.cpp
                                    src/core/exl3_expert_runtime.cpp
                                    src/core/moe_window.cpp
-                                   src/core/plain_model.cpp src/core/pcie_split.cpp src/core/mtp.cpp
+                                   src/core/plain_model.cpp src/core/mtp.cpp
                                    src/core/conversation_snapshot.cpp src/core/conversation_state.cpp
                                    src/core/conversation_memory.cpp src/core/conversation_disk.cpp
                                    src/core/conversation_file.cpp src/core/vmm.cpp)
@@ -553,11 +552,6 @@ if(STRATA_ENABLE_XE)
     target_link_libraries(exchange_storage_test PRIVATE Threads::Threads)
     add_test(NAME exchange_storage_test COMMAND exchange_storage_test)
     add_test(NAME file_expert_source_rotation_test COMMAND file_expert_source_test --rotation-gpu)
-    if(STRATA_NATIVE_EXPERTS)
-      add_executable(expert_layout_test tests/core/expert_layout_test.cpp)
-      target_link_libraries(expert_layout_test PRIVATE strata_engine)
-      add_test(NAME expert_layout_test COMMAND expert_layout_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/native_experts)
-    endif()
     # a parked conversation's K/V and running state saved and restored byte for byte in every KV format and
     # residency mode (on the GPU), and invalid images refused before any write (host only)
     add_executable(conversation_snapshot_test src/core/conversation_snapshot_test.cpp)
@@ -898,13 +892,6 @@ if(STRATA_ENABLE_XE)
     # it is built but not registered, as in the CUDA build.
     add_executable(iq_parity src/kernels/iq_parity.cpp)
     target_link_libraries(iq_parity PRIVATE strata_kernels)
-    # the prompt's int8 expert products, in the form the GPU takes (Intel's XMX, NVIDIA's and AMD's matrix engines,
-    # dp4a), against ggml's dequantizers on synthetic weights
-    add_executable(iq_mmq_parity src/kernels/iq_mmq_parity.cpp)
-    target_include_directories(iq_mmq_parity PRIVATE third_party/main/ggml)
-    target_link_libraries(iq_mmq_parity PRIVATE strata_kernels strata_kernels_cpu)
-    add_test(NAME iq_mmq_parity COMMAND iq_mmq_parity --selftest)
-    set_tests_properties(iq_mmq_parity PROPERTIES SKIP_RETURN_CODE 77)
     add_executable(rope_parity src/kernels/rope_parity.cpp)
     target_link_libraries(rope_parity PRIVATE strata_kernels)
     add_test(NAME rope_parity COMMAND rope_parity --selftest)
@@ -1131,8 +1118,8 @@ endif()
 set(STRATA_AVX512_FLAGS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
 set_source_files_properties(src/kernels/cpu/expert.cpp PROPERTIES COMPILE_OPTIONS "${STRATA_AVX512_FLAGS}")
 set_source_files_properties(src/kernels/cpu/q2_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
-# AVX-VNNI (Alder Lake, Sapphire Rapids and later; upstream b211ba17): the AVX-2 expert kernels' vpdpwssd / vpdpbusd
-# copies (q2_avx2.cpp, iq_avx2.cpp; *_rows.inl), taken at run time where cpu_avxvnni_ok().  Only those functions are
+# AVX-VNNI (Alder Lake, Sapphire Rapids and later; upstream b211ba17): the AVX-2 expert kernel's vpdpwssd / vpdpbusd
+# copies (q2_avx2.cpp; q2_avx2_rows.inl), taken at run time where cpu_avxvnni_ok().  Only those functions are
 # compiled with target("avxvnni") - never -mavxvnni on a file, which would let the compiler use it anywhere.  A compiler
 # without the intrinsics builds the files without the copies.
 include(CheckCXXSourceCompiles)
@@ -1153,115 +1140,10 @@ if(STRATA_HAVE_AVXVNNI_INTRINSICS)
 else()
   set(_strata_avxvnni STRATA_AVXVNNI=0)
 endif()
-set_property(SOURCE src/kernels/cpu/q2_avx2.cpp src/kernels/cpu/canon_expert.cpp APPEND PROPERTY COMPILE_DEFINITIONS
+set_property(SOURCE src/kernels/cpu/q2_avx2.cpp APPEND PROPERTY COMPILE_DEFINITIONS
              ${_strata_avxvnni})
 find_package(Threads REQUIRED)
 target_link_libraries(strata_kernels_cpu PUBLIC Threads::Threads)
-
-# ---- plan v0.3 P6: the i-quant models' CPU experts (IQ2_XS / IQ3_XXS files) ----
-#
-# The CPU computes a native expert with ggml-cpu's own dot products (`ggml_get_type_traits_cpu`), so an IQ
-# weight means exactly what it means in llama.cpp.  ggml is built static from a llama.cpp checkout: a local one
-# with -DSTRATA_GGML_DIR=..., otherwise the pinned upstream commit (third_party/main/ggml/VERSION.txt).
-set(STRATA_GGML_DIR "" CACHE PATH "llama.cpp checkout to take ggml from (empty: fetch the pinned commit)")
-if(STRATA_NATIVE_EXPERTS)
-  enable_language(C)
-  set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
-  set(GGML_STATIC ON CACHE BOOL "" FORCE)
-  set(GGML_CUDA OFF CACHE BOOL "" FORCE)
-  set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
-  set(GGML_BACKEND_DL OFF CACHE BOOL "" FORCE)
-  set(GGML_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-  set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-  if(STRATA_PORTABLE)
-    set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
-    foreach(ggml_isa GGML_AVX GGML_AVX2 GGML_FMA GGML_F16C GGML_BMI2)
-      set(${ggml_isa} ON CACHE BOOL "" FORCE)
-    endforeach()
-  else()
-    set(GGML_NATIVE ON CACHE BOOL "" FORCE)
-  endif()
-  if(STRATA_GGML_DIR)
-    add_subdirectory(${STRATA_GGML_DIR}/ggml ${CMAKE_BINARY_DIR}/ggml EXCLUDE_FROM_ALL)
-  else()
-    include(FetchContent)
-    FetchContent_Declare(strata_llamacpp
-      GIT_REPOSITORY https://github.com/ggml-org/llama.cpp.git
-      GIT_TAG 3cf03257f219afbe7334045ff7c6a06ac68c627d
-      GIT_SHALLOW FALSE)
-    FetchContent_GetProperties(strata_llamacpp)
-    if(NOT strata_llamacpp_POPULATED)
-      FetchContent_Populate(strata_llamacpp)
-    endif()
-    add_subdirectory(${strata_llamacpp_SOURCE_DIR}/ggml ${CMAKE_BINARY_DIR}/ggml EXCLUDE_FROM_ALL)
-  endif()
-  # part of strata_kernels_cpu (the pool calls these and they call its CPU probe: one library, so GNU ld's
-  # one-pass static linking has no cycle to resolve)
-  target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels/cpu/iq_avx512.cpp
-                                           src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/canon_expert.cpp)
-  target_include_directories(strata_kernels_cpu PRIVATE third_party/main/ggml)
-  set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS "${STRATA_AVX512_FLAGS}")
-  set_source_files_properties(src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/canon_expert.cpp
-                              PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
-  set_property(SOURCE src/kernels/cpu/iq_avx2.cpp APPEND PROPERTY COMPILE_DEFINITIONS ${_strata_avxvnni})
-  target_link_libraries(strata_kernels_cpu PUBLIC ggml-cpu ggml-base)
-  target_compile_definitions(strata_kernels_cpu PUBLIC STRATA_NATIVE_EXPERTS=1)
-  if(STRATA_BUILD_TESTS)
-    # the Q5_1 block dequantizer (a Q5_1 PLE table, upstream #651) against ggml's, synthetic blocks: no model, no GPU
-    add_executable(dequant_q5_1_test tests/core/dequant_q5_1_test.cpp)
-    target_link_libraries(dequant_q5_1_test PRIVATE strata_artifact ggml-base)
-    add_test(NAME dequant_q5_1_test COMMAND dequant_q5_1_test)
-    # the AVX-2 expert kernels' variants (iq_avx2.cpp, q2_avx2.cpp: gathered, AVX-VNNI) bit for bit against each other
-    # at 1..8 tokens and against ggml-cpu's dot, on random blocks (upstream a7336175, b211ba17); --bench: ms per expert
-    add_executable(iq_avx2_parity src/kernels/cpu/iq_avx2_parity.cpp)
-    target_link_libraries(iq_avx2_parity PRIVATE strata_kernels_cpu)
-    add_test(NAME iq_avx2_parity COMMAND iq_avx2_parity)
-    # the AVX-2 Q8_K activation quantizer against ggml's, byte for byte (upstream 5208b320; --bench: its time)
-    add_executable(q8k_quant_parity src/kernels/cpu/q8k_quant_parity.cpp)
-    target_link_libraries(q8k_quant_parity PRIVATE strata_kernels_cpu)
-    add_test(NAME q8k_quant_parity COMMAND q8k_quant_parity)
-    # the AVX-2 Q2_0 bit-plane kernel (the default; upstream 2467bb68: opt-in) against the plain one
-    add_executable(q2_bitplane_parity src/kernels/cpu/q2_bitplane_parity.cpp)
-    target_link_libraries(q2_bitplane_parity PRIVATE strata_kernels_cpu)
-    add_test(NAME q2_bitplane_parity COMMAND q2_bitplane_parity)
-    # --pool-tasks: the batched expert phases cut into any task count, bitwise the default cut (upstream 6b1e303f)
-    add_executable(pool_tasks_test src/kernels/cpu/pool_tasks_test.cpp)
-    target_link_libraries(pool_tasks_test PRIVATE strata_kernels_cpu)
-    add_test(NAME pool_tasks_test COMMAND pool_tasks_test)
-    set_tests_properties(pool_tasks_test PROPERTIES TIMEOUT 180)
-  endif()
-  if(STRATA_ENABLE_XE AND STRATA_BUILD_TESTS)
-    # one native expert three ways on real GGUF rows (float reference, CPU, GPU): needs shard 1, not in CTest
-    add_executable(native_expert_parity src/kernels/native_expert_parity.cpp)
-    target_include_directories(native_expert_parity PRIVATE third_party/main/ggml)
-    target_link_libraries(native_expert_parity PRIVATE strata_kernels strata_kernels_cpu strata_artifact)
-    # the BF16 token embedding (--embd-gguf) gathered and dequantized bit for bit: synthetic, so in CTest
-    add_test(NAME native_expert_parity_bf16_embd COMMAND native_expert_parity --bf16-embd)
-    # Grid-format down projections keep an independent activation scale for every 32 values.
-    add_test(NAME native_expert_parity_iq_down COMMAND native_expert_parity --iq-down)
-    set_tests_properties(native_expert_parity_iq_down PROPERTIES TIMEOUT 120)
-    # UD-Q4_K_XL's expert pairs (and Q8_0 alone) and OrcaRouter Q4_K_S's q4_K/q5_0 on synthetic ggml-quantized
-    # weights at 2560/640 (upstream efeffd8, d652cd6): GPU and CPU experts against the float reference, GPU
-    # dequantizers against to_float
-    # q5_0/q8_0 (Q5_0 gate/up, a llama-quantize "_M" file), q4_0/q4_0 and q4_0/q4_1 (a plain llama-quantize Q4_0 file:
-    # gate/up Q4_0, down Q4_0 on 42 layers and Q4_1 on 6; upstream 16bdc707)
-    # q6_K/q8_0: Unsloth's UD-Q6_K_XL experts (upstream 87659162)
-    # at Ornith-1.5's shape (2048/512): its official files' experts (Q6_K, Q4_K and Q5_K down, Q8_0, BF16) and its
-    # GSQ-RCO files' (Q2_K and Q3_K both ways); at llm-jp-4.1's (2560/960): Q4_K with its Q8_0 and Q5_0 down
-    foreach(pair q4_K/q5_1 q4_K/q8_0 q5_K/q8_0 q8_0/q8_0 q4_K/q5_0 iq3_xxs/iq4_nl q5_0/q8_0 q4_0/q4_0 q4_0/q4_1
-                 iq4_nl/iq4_nl@2048x512 iq4_nl/q8_0@2048x512 iq4_nl/q8_0
-                 q6_K/q8_0 q6_K/q6_K@2048x512 q4_K/q4_K@2048x512 q5_K/q5_K@2048x512 q8_0/q8_0@2048x512
-                 bf16/bf16@2048x512 q2_K/q3_K@2048x512 q3_K/q2_K@2048x512 q4_K/q8_0@2560x960 q4_K/q5_0@2560x960)
-      string(REPLACE "/" "_" pair_name "${pair}")
-      string(REPLACE "@" "_" pair_name "${pair_name}")
-      add_test(NAME native_expert_parity_${pair_name} COMMAND native_expert_parity --synthetic ${pair})
-      set_tests_properties(native_expert_parity_${pair_name} PROPERTIES TIMEOUT 120)
-    endforeach()
-    # the device dequantizers on one real tensor of each type: needs the model's shards, so not in CTest
-    add_executable(dequant_bf16_test src/kernels/dequant_bf16_test.cpp)
-    target_link_libraries(dequant_bf16_test PRIVATE strata_kernels strata_artifact)
-  endif()
-endif()
 
 if(STRATA_BUILD_TESTS)
   # Plan v0.3 P6: one expert applied to several tokens, bitwise vs the single-token kernel (synthetic, CPU only).
@@ -1286,12 +1168,23 @@ if(STRATA_BUILD_TESTS)
   target_link_libraries(pool_stress PRIVATE strata_kernels_cpu)
   add_test(NAME pool_stress COMMAND pool_stress 20)
 
+  # the AVX-2 Q2_0 bit-plane kernel (the default; upstream 2467bb68: opt-in) against the plain one
+  add_executable(q2_bitplane_parity src/kernels/cpu/q2_bitplane_parity.cpp)
+  target_link_libraries(q2_bitplane_parity PRIVATE strata_kernels_cpu)
+  add_test(NAME q2_bitplane_parity COMMAND q2_bitplane_parity)
+
+  if(STRATA_ENABLE_XE)
+    # the device dequantizers on one real tensor of each type: needs the model's shards, so not in CTest
+    add_executable(dequant_bf16_test src/kernels/dequant_bf16_test.cpp)
+    target_link_libraries(dequant_bf16_test PRIVATE strata_kernels strata_artifact)
+  endif()
+
   # #795 (upstream 90dd021a): nothing an AVX2-only CPU can reach may hold AVX-512 / AVX-VNNI-class instructions.
   # (1) the kernel library is disassembled and any function with such instructions must be a kernel of a wide-ISA
   # file, not a weak / COMDAT copy and not a probe or helper that every CPU runs; (2) with -DSTRATA_SDE=<sde> (Intel
   # SDE) the CPU tests run on an emulated AVX2-only Haswell and on an Alder Lake (AVX-VNNI, no AVX-512): SDE stops at
   # the first instruction the chip does not have.
-  if(TARGET iq_avx2_parity)
+  if(TARGET strata_kernels_cpu)
     find_package(Python3 QUIET COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
       add_test(NAME isa_guard_check COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_isa_guard.py
@@ -1301,9 +1194,9 @@ if(STRATA_BUILD_TESTS)
   endif()
   set(STRATA_SDE "" CACHE FILEPATH
       "Intel SDE (sde / sde64): also run the CPU tests on an emulated AVX2-only and an AVX-VNNI-only CPU")
-  if(STRATA_SDE AND TARGET iq_avx2_parity)
+  if(STRATA_SDE)
     foreach(sde_chip hsw adl)
-      foreach(sde_test iq_avx2_parity q8k_quant_parity router_dot_parity pool_tasks_test q2_bitplane_parity)
+      foreach(sde_test router_dot_parity q2_bitplane_parity)
         if(TARGET ${sde_test})
           add_test(NAME sde_${sde_chip}_${sde_test} COMMAND ${STRATA_SDE} -${sde_chip} -- $<TARGET_FILE:${sde_test}>)
           set_tests_properties(sde_${sde_chip}_${sde_test} PROPERTIES TIMEOUT 900)

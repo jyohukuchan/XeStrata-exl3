@@ -5,10 +5,6 @@
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 
-#if defined(STRATA_NATIVE_EXPERTS)
-#include "strata/kernels/cpu/native_expert.hpp"
-#include "ggml.h"
-#endif
 
 #include "strata/core/gpu.hpp"
 
@@ -128,69 +124,6 @@ void test_canonical_layout() {
     source.close();
 }
 
-#if defined(STRATA_NATIVE_EXPERTS)
-void test_native_variable_layout() {
-    using namespace strata::core;
-    using namespace strata::kernels::cpu;
-    constexpr int64_t layers = 2;
-    constexpr int64_t experts = 3;
-    constexpr int64_t embedding = 2560;
-    constexpr int64_t feed_forward = 640;
-    TempDirectory dir;
-
-    NativeFmt first_fmt, second_fmt;
-    std::string err;
-    const bool first_ok = native_fmt(GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_NL, embedding, feed_forward, first_fmt, err);
-    require(first_ok, "IQ3_XXS/IQ4_NL synthetic format is unavailable: " + err);
-    err.clear();
-    const bool second_ok = native_fmt(GGML_TYPE_IQ2_XS, GGML_TYPE_IQ4_NL, embedding, feed_forward, second_fmt, err);
-    require(second_ok, "IQ2_XS/IQ4_NL synthetic format is unavailable: " + err);
-    require(first_fmt.bytes != second_fmt.bytes, "chosen native formats do not exercise variable layer sizes");
-
-    const uint64_t layer0_bytes = (uint64_t) first_fmt.bytes * experts;
-    const uint64_t total = layer0_bytes + (uint64_t) second_fmt.bytes * experts;
-    {
-        std::ofstream metadata(dir.path / "native_experts.txt");
-        require((bool) metadata, "could not create synthetic native_experts.txt");
-        metadata << "0 " << GGML_TYPE_IQ3_XXS << ' ' << GGML_TYPE_IQ4_NL << " 0 " << first_fmt.bytes << '\n';
-        metadata << "1 " << GGML_TYPE_IQ2_XS << ' ' << GGML_TYPE_IQ4_NL << ' ' << layer0_bytes << ' '
-                 << second_fmt.bytes << '\n';
-        require((bool) metadata, "could not write synthetic native_experts.txt");
-    }
-    create_pack(dir.path, total, {{0, 'a'}, {(uint64_t) first_fmt.bytes, 'b'},
-                                  {layer0_bytes, 'c'}, {layer0_bytes + (uint64_t) second_fmt.bytes, 'd'}});
-
-    const bool layout_ok = expert_layout_load(dir.path.string(), layers, experts, err);
-    require(layout_ok, "could not load synthetic native layout: " + err);
-    FileExpertSource source;
-    bool opened = source.open(dir.path.string(), layers, experts, err);
-    require(opened, "could not map native pack: " + err);
-    require(source.blobs() == layers * experts, "native blob count is wrong");
-    const uint8_t* first = source.blob(0, 0);
-    const uint8_t* second = source.blob(0, 1);
-    const uint8_t* next_layer = source.blob(1, 0);
-    const uint8_t* next_layer_second = source.blob(1, 1);
-    require(first && second && next_layer && next_layer_second, "valid native blob lookup failed");
-    require(second - first == (ptrdiff_t) first_fmt.bytes && next_layer - first == (ptrdiff_t) layer0_bytes &&
-                next_layer_second - next_layer == (ptrdiff_t) second_fmt.bytes,
-            "native per-layer expert stride is wrong");
-    require(first[0] == 'a' && second[0] == 'b' && next_layer[0] == 'c' && next_layer_second[0] == 'd',
-            "native blob lookup returned bytes from the wrong expert");
-    require(source.blob(-1, 0) == nullptr && source.blob(0, -1) == nullptr &&
-                source.blob(layers, 0) == nullptr && source.blob(0, experts) == nullptr,
-            "native bounds check accepted an invalid layer or expert");
-    require(source.reads() == 4, "invalid native lookups changed the read count");
-
-    check_file_size_rejection(source, dir.path, layers, experts, total);
-    create_pack(dir.path, total, {{layer0_bytes, 'c'}});
-    err.clear();
-    opened = source.open(dir.path.string(), layers, experts, err);
-    require(opened, "source failed to reopen after size errors: " + err);
-    const uint8_t* reopened = source.blob(1, 0);
-    require(reopened && source.reads() == 1 && reopened[0] == 'c', "reopened native source kept stale state");
-    source.close();
-}
-#endif
 
 void test_complement_plan() {
     using namespace strata::core::detail;
@@ -547,9 +480,6 @@ int main(int argc, char** argv) {
 #endif
         test_page_cache_hint();
         test_canonical_layout();
-#if defined(STRATA_NATIVE_EXPERTS)
-        test_native_variable_layout();
-#endif
         std::cout << "file_expert_source_test: PASS\n";
         return 0;
     } catch (const std::exception& error) {

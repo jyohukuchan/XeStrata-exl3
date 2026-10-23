@@ -282,15 +282,7 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
         }
         const float* xin = zero_copy_ ? h_x_ : d_x_;
         float* out = zero_copy_ ? h_out_ : d_out_;
-        const auto& lay = strata::kernels::cpu::expert_layout();
-        if (lay.native) {
-            strata::kernels::quantize_q8_1_rows(xin, n_tok, H, d_q8_, s);
-            const auto& fmt = lay.fmt[(size_t) layer];
-            const auto L = strata::kernels::native_expert_layout(fmt.gu_type, fmt.d_type, fmt.n_embd, fmt.n_ff,
-                                                                 fmt.up_type);
-            strata::kernels::native_expert_grouped(L, d_ptr_, d_start_, d_count_, d_dst_, d_tok_, groups_,
-                                                   (int64_t) dst_.size(), d_q8_, d_scratch_, out, s);
-        } else {
+        {
             strata::kernels::quantize_q8_0_scaled(xin, d_q8_, d_scales_, n_tok * H, s);
             strata::kernels::moe_grouped_s2(d_ptr_, d_start_, d_count_, d_dst_, d_tok_, groups_,
                                             (int64_t) dst_.size(), d_q8_, d_scales_, d_scratch_, out, s);

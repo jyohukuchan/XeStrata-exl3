@@ -23,7 +23,6 @@
 #include "strata/kernels/native_ple_postops.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
-#include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/kv_stream.hpp"
@@ -568,8 +567,6 @@ struct Prefill::Impl {
     float *cpu_x = nullptr, *cpu_rows = nullptr;
     size_t cpu_x_n = 0, cpu_rows_n = 0;
     bool cpu_dead = false;   // a pinned buffer of the share could not be had (host memory is short): the GPU does it all
-    std::vector<strata::kernels::cpu::NativeAct> cpu_nact;
-    std::vector<strata::kernels::cpu::ExpertJobMulti> cpu_jobs;
     // the measured share: running means of the CPU's ms per expert and the GPU's per streamed expert
     double cpu_c_ms = 0, cpu_g_ms = 0, cpu_share_now = 0.5;
     strata::gpu::Event* cpu_ev[2] = {};   // the GPU's expert work of the last CPU-sharing layer
@@ -2643,53 +2640,11 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     // set_cpu_pool: the CPU's experts on a thread while this one streams and runs the GPU's; their
                     // unweighted rows land in Dm's row order, so the combine weights them as any other row.  The
                     // blobs are taken here: the thread calls no ExpertSource (upstream 667f2eca)
+                    // The CPU expert share computed native (GGUF-form) rows on the pool; those kernels went with
+                    // the native expert path, so every expert of a prompt chunk is streamed to the GPU.
                     std::future<bool> cpu_fut;
                     double cpu_ms = 0;
-                    if (rows_cpu > 0) {
-                        // (the rows buffer was had at its largest after the routing sync)
-                        const strata::kernels::cpu::NativeFmt& cf = lay.fmt[(size_t) l];
-                        m.cpu_jobs.clear();
-                        for (int32_t e = 0; e < m.g->n_expert; ++e) {
-                            if (!on_cpu[(size_t) e]) continue;
-                            strata::kernels::cpu::ExpertJobMulti j;
-                            j.blob = cpu_blob[(size_t) e];
-                            j.nt = m.cnt[(size_t) e];
-                            for (int r = 0; r < j.nt; ++r)   // the activations are set on the thread
-                                j.out[r] = m.cpu_rows + (size_t) ((int64_t) m.off[(size_t) e] + r - rows_gpu) * N;
-                            m.cpu_jobs.push_back(j);
-                        }
-                        if (cpu_share_env() < 0.0) {
-                            if (m.cpu_ev[0] == nullptr &&
-                                (!strata::gpu::event_create(&m.cpu_ev[0], true) || !strata::gpu::event_create(&m.cpu_ev[1], true))) {
-                                err = "prefill: CPU share events";
-                                return false;
-                            }
-                            strata::gpu::event_record(m.cpu_ev[0], m.cs);
-                        }
-                        cpu_fut = std::async(std::launch::async, [&m, &cf, &cpu_ms, T, rows_gpu, rows_cpu, pool = cpu_pool_]() -> bool {
-                            const auto t0 = std::chrono::steady_clock::now();
-                            if (m.cpu_nact.size() < (size_t) T) m.cpu_nact.resize((size_t) T);
-                            std::vector<char> need((size_t) T, 0);   // the tokens the CPU's experts read
-                            for (int64_t p = rows_gpu; p < rows_gpu + rows_cpu; ++p) need[(size_t) m.src_host[(size_t) p]] = 1;
-                            for (int64_t t = 0; t < T; ++t) {
-                                if (!need[(size_t) t]) continue;
-                                strata::kernels::cpu::native_quant_act(cf, m.cpu_x + (size_t) t * N, m.cpu_nact[(size_t) t].bytes);
-                            }
-                            for (auto& j : m.cpu_jobs)
-                                for (int r = 0; r < j.nt; ++r) {
-                                    const int64_t p = rows_gpu + (int64_t) (j.out[r] - m.cpu_rows) / N;
-                                    const int64_t tok = m.src_host[(size_t) p];
-                                    j.nact[r] = m.cpu_nact[(size_t) tok].bytes;
-                                }
-                            pool->run_split_multi_native(cf, m.cpu_jobs.data(), (int) m.cpu_jobs.size());
-                            cpu_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-                            return true;
-                        });
-                    }
-                    struct CpuJoin {   // an early return waits for the thread (it reads this layer's tables)
-                        std::future<bool>& f;
-                        ~CpuJoin() { if (f.valid()) f.wait(); }
-                    } cpu_join{cpu_fut};
+                    (void) cpu_ms;
                     const int mmq_gt = lay.native ? lay.fmt[(size_t) l].gu_type : 42;
                     const int mmq_dt = lay.native ? lay.fmt[(size_t) l].d_type : 42;
                     const size_t mmq_gub = use_mmq ? mmq::matrix_bytes(mmq_gt, 1280, N) : 0;

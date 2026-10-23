@@ -29,7 +29,7 @@ struct Options {
 
 void usage() {
     std::fprintf(stderr,
-        "usage: plain_model_bench (--native GGUF [--expert-profile FILE] | --exl3 DIR --metadata-gguf GGUF) "
+        "usage: plain_model_bench --exl3 DIR --metadata-gguf GGUF "
         "--tokens-file FILE [--context N] [--steps N] [--warmup N] [--repeats N] "
         "[--max-t N] [--pool-workers N]\n");
 }
@@ -50,10 +50,8 @@ bool parse(int argc, char** argv, Options& opt, std::string& err) {
         if (name == "--help" || name == "-h") { usage(); return false; }
         if (i + 1 == argc) { err = "missing value for " + name; return false; }
         const std::string value = argv[++i];
-        if (name == "--native") opt.model.gguf = value;
-        else if (name == "--exl3") opt.model.exl3_dir = value;
+        if (name == "--exl3") opt.model.exl3_dir = value;
         else if (name == "--metadata-gguf") opt.model.metadata_gguf = value;
-        else if (name == "--expert-profile") opt.model.profile = value;
         else if (name == "--tokens-file") opt.token_file = value;
         else {
             int64_t n = 0;
@@ -70,10 +68,8 @@ bool parse(int argc, char** argv, Options& opt, std::string& err) {
         }
     }
     const bool exl3 = !opt.model.exl3_dir.empty();
-    if (exl3 == !opt.model.gguf.empty() || opt.token_file.empty() ||
-        (exl3 && (opt.model.metadata_gguf.empty() || !opt.model.profile.empty())) ||
-        (!exl3 && !opt.model.metadata_gguf.empty())) {
-        err = "choose one model source, its required metadata, and a token file; expert profiles require --native";
+    if (!exl3 || opt.token_file.empty() || opt.model.metadata_gguf.empty()) {
+        err = "an EXL3 model, its metadata GGUF and a token file are required";
         return false;
     }
     if (opt.steps < 1 || opt.repeats < 1 || opt.model.max_t < 1 || opt.warmup > opt.context ||

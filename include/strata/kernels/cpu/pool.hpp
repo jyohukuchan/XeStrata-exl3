@@ -31,7 +31,6 @@
 #pragma once
 
 #include "strata/kernels/cpu/expert.hpp"
-#include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/exl3_expert.hpp"
 #include "strata/kernels/cpu/exl3_mul1_intdot.hpp"
 
@@ -65,8 +64,6 @@ struct ExpertJobMulti {
     int nt = 0;
     const ActQ* act[MAXT] = {};
     float* out[MAXT] = {};
-    /// Plan v0.3 P6: a native pack's activations (native_quant_act's, in a NativeAct), one per token.
-    const void* nact[MAXT] = {};
 };
 
 using ExpertView = strata::kernels::exl3::ExpertView;
@@ -186,8 +183,6 @@ public:
     /// Plan v0.3 P6: `run_split` for multi-token jobs (at most `kMaxSplitMulti`); the rows of each expert are
     /// read once for all of its tokens.
     void run_split_multi(ExpertJobMulti* jobs, int n);
-    /// Plan v0.3 P6: the same for a native pack's layer (ggml-cpu arithmetic, `nact` activations).
-    void run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n);
     static constexpr int kMaxSplitMulti = 96;
 
     /// Allocate bounded EXL3 scratch for every worker before publishing any
@@ -362,15 +357,12 @@ private:
     std::vector<SplitBuf> split_;
     // run_split_multi state: mode 3 = gate/up row parts, 4 = down row parts
     ExpertJobMulti* mjobs_ = nullptr;
-    int64_t mrows_ = 0;     // rows of the current multi phase across all its experts (n * FF, then n * H;
-                            // a native layer's n_ff and n_embd)
+    int64_t mrows_ = 0;     // rows of the current multi phase across all its experts (n * FF, then n * H)
     int mtasks_ = 1;        // equal row ranges the phase is cut into
     struct SplitBufMulti {
-        alignas(64) float ff[MAXT][FF > kNativeMaxFF ? FF : kNativeMaxFF];
+        alignas(64) float ff[MAXT][FF];
         ActQ a2[MAXT];
-        alignas(64) uint8_t hq[MAXT][kNativeHBytes];   // plan v0.3 P6: native down activations
     };
-    const NativeFmt* nfmt_ = nullptr;
     std::vector<SplitBufMulti> split_multi_;
 };
 

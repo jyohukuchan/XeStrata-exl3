@@ -288,9 +288,9 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
 
 static void plain_usage(const std::string& arch) {
     std::fprintf(stderr,
-                 "strata --native GGUF --tokens \"1,2,3\" [options]   (%s: the models other than Qwen3.8-Flash-Next)\n"
+                 "strata --exl3 DIR --metadata-gguf GGUF --tokens \"1,2,3\" [options]   (%s: the models other "
+                 "than Qwen3.8-Flash-Next)\n"
                  "\n"
-                 "  --native PATH        the model's GGUF (its first shard)\n"
                  "  --tokens LIST        the prompt as comma-separated token ids\n"
                  "  --tokens-file PATH   pretokenized prompt, commas or whitespace (alternative to --tokens)\n"
                  "  --max-new N          tokens to generate (default 16)\n"
@@ -304,15 +304,10 @@ static void plain_usage(const std::string& arch) {
                  "  --eos-ids LIST       those tokens (default the GGUF's end-of-sequence and end-of-turn tokens;\n"
                  "                       implies --stop-eos)\n"
                  "  --pool-workers N     the CPU's expert threads (default every physical core but one)\n"
-                 "  --expert-profile PATH        fill the VRAM tier from this profile at load\n"
-                 "  --expert-profile-save PATH   write what this run learned as a profile\n"
-                 "  --expert-profile-save-every MIN   with --serve: also every MIN minutes between requests (default\n"
-                 "                       10; 0: at QUIT only)\n"
                  "  --adapt-every N      windows between the tier's adaptive rounds (default 4; 0 off)\n"
                  "  --adapt-swaps N      the most experts one round moves into the VRAM tier (default 96)\n"
                  "  --adapt-mib-per-token N   and at most N MiB of them for each token read since the last round\n"
                  "                       (default 48; 0: no such bound)\n"
-                 "  --mmap-experts       read the experts from the GGUF through mmap instead of pinned RAM\n"
                  "  --no-pcie-split      the CPU computes every expert the VRAM tier misses\n"
                  "  --prompt-chunk N     the prompt's most tokens a chunk through the batched products (default\n"
                  "                       4096; 0: the prompt in windows)\n"
@@ -333,8 +328,7 @@ int plain_main(int argc, char** argv) {
     std::string gguf;
     std::string exl3_dir, metadata_gguf;
     for (int i = 1; i + 1 < argc; ++i)
-        if (std::strcmp(argv[i], "--native") == 0) gguf = argv[i + 1];
-        else if (std::strcmp(argv[i], "--exl3") == 0) exl3_dir = argv[i + 1];
+        if (std::strcmp(argv[i], "--exl3") == 0) exl3_dir = argv[i + 1];
         else if (std::strcmp(argv[i], "--metadata-gguf") == 0) metadata_gguf = argv[i + 1];
     if (gguf.empty() && !metadata_gguf.empty()) gguf = metadata_gguf;
     if (!exl3_dir.empty() && metadata_gguf.empty()) {
@@ -362,8 +356,7 @@ int plain_main(int argc, char** argv) {
             if (i + 1 >= argc) { std::fprintf(stderr, "%s needs a value\n", what); std::exit(2); }
             return argv[++i];
         };
-        if (a == "--native") (void) next("--native");
-        else if (a == "--exl3") exl3_dir = next("--exl3");
+        if (a == "--exl3") exl3_dir = next("--exl3");
         else if (a == "--metadata-gguf") metadata_gguf = next("--metadata-gguf");
         else if (a == "--tokens") {
             if (!parse_ids(next("--tokens"), prompt)) { std::fprintf(stderr, "--tokens: a list of token ids\n"); return 2; }
@@ -396,16 +389,12 @@ int plain_main(int argc, char** argv) {
         else if (a == "--adapt-mib-per-token")
             opt.adapt_mib_per_token = (int) std::strtol(next("--adapt-mib-per-token"), nullptr, 10);
         else if (a == "--gpu") (void) next("--gpu");
-        else if (a == "--mmap-experts") opt.mmap_experts = true;
         else if (a == "--no-pcie-split") opt.pcie_split = false;
-        else if (a == "--expert-profile") opt.profile = next("--expert-profile");
         else if (a == "--draft-vocab") opt.draft_vocab = next("--draft-vocab");
         else if (a == "--prompt-chunk") { opt.prompt_chunk = std::strtoll(next("--prompt-chunk"), nullptr, 10); prompt_chunk_set = true; }
         else if (a == "--rope-scaling") opt.rope_scaling = next("--rope-scaling");
         else if (a == "--rope-scale") opt.rope_scale = std::strtod(next("--rope-scale"), nullptr);
         else if (a == "--yarn-orig-ctx") opt.yarn_orig_ctx = std::strtod(next("--yarn-orig-ctx"), nullptr);
-        else if (a == "--expert-profile-save") profile_save = next("--expert-profile-save");
-        else if (a == "--expert-profile-save-every") save_min = std::strtod(next("--expert-profile-save-every"), nullptr);
         else {
             switch (option_scope(a)) {
                 case OptionScope::qwen38_only:

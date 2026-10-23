@@ -54,7 +54,6 @@ struct ExpertLayout;
 namespace strata::core {
 
 class RemoteExperts;
-struct LoadStats;
 class Exl3ExpertRuntime;
 
 namespace detail {
@@ -199,8 +198,7 @@ public:
     virtual void prefetch(int64_t layer, const int64_t* experts, int64_t n) { (void) layer; (void) experts; (void) n; }
 protected:
     /// What model_inputs() returns; set by a source's open().
-    void record_inputs(const std::string& pack_experts, const std::string& gguf,
-                       const strata::kernels::cpu::ExpertLayout& lay, bool from_gguf);
+    void record_inputs(const std::string& pack_experts);
     std::vector<std::pair<std::string, std::string>> inputs_;
 };
 
@@ -348,8 +346,6 @@ struct ExpertDispatch {
     /// Plan v0.3 P6 verify window: one quantized activation per token, the multi-token jobs, and the expert ->
     /// job map (reset after every layer).
     std::vector<strata::kernels::cpu::ActQ> act_multi;
-    /// Plan v0.3 P6: a native pack's per-token activations (MAXT).
-    std::vector<strata::kernels::cpu::NativeAct> nact_multi;
     std::vector<strata::kernels::cpu::ExpertJobMulti> jobs_multi;
     /// EXL3 routed jobs: one descriptor triple per selected expert, resized by the CPU dispatch adapter.
     std::vector<strata::kernels::cpu::ExpertJobExl3> jobs_exl3;
@@ -420,23 +416,12 @@ struct PcieSplitTimes {
     double cb0 = 0.0, cb = 0.0, pb0 = 0.0, pb = 0.0;
     int64_t layer = -1;   ///< the layer every side was measured on (its experts' size and format)
 };
-/// The CPU side: `d`'s pool on 1 and 8 experts of one layer that are in RAM and not in VRAM (`d.host_res`), the layer's
-/// native format; `layer` < 0 picks the first such layer and gets it.  False, with `why`, when no layer has enough such
-/// experts or the pack is not native.
-bool measure_cpu_expert_ms(ExpertDispatch& d, int64_t n_layers, double& c0, double& c, int64_t& layer, std::string& why);
 /// Of `f` missed experts of a group with `h` VRAM hits: the number read over PCIe.  The GPU computes its hits, then
 /// (`overlap`: beside them) fetches the `m` and computes them; the CPU computes the other `f - m`; both at their times
 /// beside each other when both work.  The `m` that makes the later side earliest, taken only when that is at least 10%
 /// earlier than the CPU taking all `f` (the times are measured alone and on few experts: a split by a thin margin
 /// lost on the B70 with the VRAM of a small card); else 0.
 int pcie_split_m(const PcieSplitTimes& t, bool overlap, int f, int h);
-/// All of `t`, measured once at start on the window's own kernels: the CPU's side (measure_cpu_expert_ms), the GPU
-/// computing experts from its memory, the PCIe fetch of experts in RAM, and the CPU's and the link's sides beside each
-/// other from the rate the memory serves.  False, with `why`, when a side cannot be timed (too few experts in RAM).
-bool measure_pcie_split(ExpertDispatch& d, int64_t n_layers, PcieSplitTimes& t, std::string& why);
-/// The memory's rate for measure_pcie_split, read now (before a long prompt, where the split is set up after it: after a
-/// 64K prompt the reading came out up to 3x low on the RX 9060 XT's machine).
-void read_memory_rate_before(const ExpertDispatch& d, int64_t n_layers);
 
 /// STRATA_ROUTE_TAIL_SKIP rank (0: off).  Unset in the environment: 0 until the serve start-up sets the default.
 int tail_skip_rank();
@@ -479,21 +464,12 @@ public:
     FileExpertSource(const FileExpertSource&) = delete;
     FileExpertSource& operator=(const FileExpertSource&) = delete;
 
-    /// Maps `<pack_dir>/experts.bin` and checks its size against the loaded expert layout.  Canonical packs use
-    /// `n_layers * n_expert * BLOB`; native packs use their variable per-layer blob sizes and offsets.
+    /// Maps `<pack_dir>/experts.bin` and checks its size against the loaded expert layout
+    /// (`n_layers * n_expert * BLOB`).
     ///
     /// The size check is not a formality: a short file would fault at the END of a long sequence, and an
     /// over-long one means the pack is not the one the geometry came from.  Refuses with the two numbers.
-    ///
-    /// CS-T: a native pack WITHOUT experts.bin, after `set_gguf`, maps the model's GGUF shards instead (every file
-    /// native_experts.txt names, after `check_experts_gguf`), and assembles a blob from its three role slices when
-    /// it is asked for: the SSD tier, read in place through the OS file cache, with no 30-77 GB experts.bin copy.
-    /// With experts.bin present nothing changes.
     bool open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err);
-    /// CS-T: the --native shard (native_experts.txt names the other files beside it); see `open`.
-    void set_gguf(const std::string& native) { gguf_ = native; }
-    /// Whether the experts are read from the GGUF shards in place (no experts.bin).
-    bool gguf_mode() const { return !role_ptr_.empty(); }
     /// Pin a compact host mirror of experts absent from a fully filled static GPU cache. The mmap remains open
     /// as a fallback for later cache reloads. This is opt-in because the complement may still be a large allocation.
     ///
@@ -636,7 +612,6 @@ private:
     const uint8_t* mapped_blob(int64_t layer, int64_t expert) const;
     /// The blob's bytes from the mapped file(s) - experts.bin, or the three GGUF role slices - into `dst`.
     bool copy_from_files(int64_t layer, int64_t expert, uint8_t* dst) const;
-    bool open_gguf(std::string& err);
     const uint8_t* staged_blob(int64_t layer, int64_t expert);
     bool claim_stage(int64_t key, size_t& v, bool& fill);
     bool fill_stage(size_t v, int64_t layer, int64_t expert, uint8_t* dst);
@@ -647,22 +622,10 @@ private:
     /// #286: the blobs from the drive, unbuffered: every role's 4 KiB-aligned window is read at once (overlapped)
     /// into this thread's aligned buffer, then copied into place.  False when a read fails.
     bool read_direct(const Fill* fills, size_t n) const;
-    std::vector<std::string> paths_;          ///< the mapped files, as maps_
     std::vector<void*> direct_;               ///< #286: per file, an unbuffered overlapped handle (Windows)
-    std::vector<int> role_file_;              ///< 3 x n_layers: index into maps_ / direct_
-    /// blobs assembled in the stage buffers (`blob` hands those out): the GGUF in place, or any unbuffered source
-    bool staged() const { return !role_ptr_.empty() || !direct_.empty(); }
+    /// blobs assembled in the stage buffers (`blob` hands those out): any unbuffered source
+    bool staged() const { return !direct_.empty(); }
     static constexpr uint64_t kNoComplement = detail::kNoCacheComplement;
-    // ---- CS-T: the GGUF shards in place
-    std::string gguf_;
-    struct Map {
-        const uint8_t* base = nullptr;
-        uint64_t bytes = 0;
-        int fd = -1;
-    };
-    std::vector<Map> maps_;
-    std::vector<const uint8_t*> role_ptr_;    ///< 3 x n_layers: gate / up / down of the layer's expert 0
-    std::vector<uint64_t> role_bytes_;        ///< 3 x n_layers: bytes per expert of that role
     // the blobs assembled for `blob()`: a small pool of buffers, one per recent (layer, expert).  A buffer is
     // reused only once `kStageAge` layer changes have passed since its blob was last asked for, so a pointer holds
     // through the layer it was asked in and the next ones (the pool computes a layer's misses before the next).
@@ -764,8 +727,6 @@ public:
     /// rate, because those are the two numbers that say whether the arena is the one that was asked for.
     bool open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, int threads, std::string& err,
               const std::string& shared_arena_file = {});
-    /// Plan v0.3 P6: a native pack without experts.bin takes its experts from the model's shard 1.
-    void set_gguf(const std::string& shard1) { gguf_ = shard1; }
     void close();
 
     bool mapped() const { return base_ != nullptr; }
@@ -811,17 +772,6 @@ private:
     double load_read_s_ = 0.0;
     double load_copy_s_ = 0.0;
     uint64_t pinned_bytes_ = 0;
-    std::string gguf_;
 };
-
-bool check_experts_gguf(const std::string& gguf, const strata::kernels::cpu::ExpertLayout& lay, std::string& err);
-/// The routed experts of a GGUF model read in place (no pack, no experts.bin) as the process-wide expert layout: per
-/// MoE layer i (the model's block moe_blocks[i]), the gate / up / down types, the blob, and the tensors' files and
-/// offsets in the shards of `gguf`'s model (any of its shards).  Gate and up are [n_embd, n_ff, n_expert], down
-/// [n_ff, n_embd, n_expert].  A FileExpertSource reads it with set_gguf(`gguf`) and no experts.bin.
-bool expert_layout_from_gguf(const std::string& gguf, const std::vector<int64_t>& moe_blocks, int64_t n_expert,
-                             int64_t n_embd, int64_t n_ff, std::string& err);
-LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst,
-                          const strata::kernels::cpu::ExpertLayout& lay, int threads);
 
 }  // namespace strata::core

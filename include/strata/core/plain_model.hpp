@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
-// include/strata/core/plain_model.hpp - an MoE model with one residual stream, run from its GGUF.
+// include/strata/core/plain_model.hpp - an EXL3 MoE model with one residual stream.
 //
 // qwen35moe (Ornith-1.5: Gated DeltaNet layers and full-attention layers, a shared expert) and qwen3moe (llm-jp-4.1:
 // full attention in every block, no shared expert) - the models whose block is
@@ -11,13 +11,11 @@
 // and whose head is rms_norm, then the output projection.  Qwen3.8 (four residual streams, the QSA indexer, PLE) keeps
 // its own engine; GLM-5.3 will have its own.
 //
-// The dense weights are uploaded once in their GGUF form and read by the native kernels.  The routed experts go
-// through the engine's expert tiers, as Qwen3.8's do: a VRAM cache of slots (expert_cache) refilled between windows by
-// the adaptive rule, the GGUF read in place (FileExpertSource: the page cache, the drive), the CPU pool for what the
-// VRAM does not hold, all in one window protocol (MoeWindow).  A window is 1..max_t tokens at consecutive positions,
-// recorded once per size as a graph.
+// Dense projections and routed experts are read from the EXL3 archive. Metadata and tokenizer information come
+// from a bootstrap GGUF; none of its weights are used. A window is 1..max_t tokens at consecutive positions,
+// recorded once per size as a graph. The EXL3 expert runtime shares a VRAM cache and CPU pool.
 //
-// A qwen35moe file with its multi-token-prediction layer (`blk.<n_layer>.nextn.*`, Ornith's official K-quants) drafts
+// A qwen35moe archive with its multi-token-prediction layer drafts
 // with it (`spec`): that layer is a full-attention block of the trunk's form with its own K/V, after a projection of
 // [rms_norm(embedding of token p) | rms_norm(the trunk's final normed row at p - 1)] (llama.cpp's graph_mtp), and its
 // routed experts are one more MoE layer of the tiers.  A window checks the last token and the drafts; the recurrent
@@ -49,8 +47,8 @@ class GgufModel;
 namespace strata::core {
 
 struct PlainOptions {
-    std::string gguf;               ///< any shard of the model, or metadata bootstrap for EXL3
-    std::string exl3_dir;           ///< EXL3 archive directory; empty keeps the legacy GGUF path
+    std::string gguf;               ///< metadata bootstrap, retained as an API alias for metadata_gguf
+    std::string exl3_dir;           ///< required EXL3 archive directory
     std::string metadata_gguf;      ///< optional explicit metadata/tokenizer bootstrap for EXL3
     int64_t max_cells = 4096;       ///< the context the K/V cache holds
     int max_t = 8;                  ///< the largest window
@@ -176,13 +174,6 @@ private:
         W sh_gate, sh_up, sh_down;
     };
 
-    /// `f32`: an F32 matrix is taken as it is (Qwen3.6's GDN alpha and beta: llama.cpp's float product)
-    bool upload(const GgufModel& m, const std::string& name, W& w, std::string& err, bool f32 = false);
-    /// Block `l`'s weights (blk.<l>.*): its mixer, norms, router and shared expert.
-    bool load_block(const GgufModel& m, int64_t l, Block& b, std::string& err);
-    /// An F32 vector or matrix, or a BF16 one widened to F32 at load (exact: Qwen3.6's MTP layer keeps its two routers
-    /// in BF16).
-    bool upload_f32(const GgufModel& m, const std::string& name, uint64_t elements, const float*& out, std::string& err);
     bool load_exl3(std::string& err);
     bool load_exl3_block(int64_t layer, Block& b, std::string& err);
     bool run_projection(const W& w, const float* x, float* y, int rows, bool quantize, strata::gpu::Stream cs,

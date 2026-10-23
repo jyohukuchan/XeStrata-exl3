@@ -333,65 +333,22 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
         err = "FileExpertSource: the loaded expert layout has an invalid size";
         return false;
     }
-    if (!layout.native) {
-        if (blob_count > std::numeric_limits<uint64_t>::max() / (uint64_t) strata::kernels::cpu::BLOB) {
-            err = "FileExpertSource: the canonical expert size overflows";
-            return false;
-        }
-        const uint64_t canonical_size = blob_count * (uint64_t) strata::kernels::cpu::BLOB;
-        if (want != canonical_size) {
-            err = "FileExpertSource: the canonical expert layout has an inconsistent size";
-            return false;
-        }
-        const uint64_t bytes = (uint64_t) strata::kernels::cpu::BLOB;
-        const uint64_t layer_bytes = (uint64_t) n_expert * bytes;
-        for (int64_t layer = 0; layer < n_layers; ++layer) {
-            layer_offsets[(size_t) layer] = (uint64_t) layer * layer_bytes;
-            layer_blob_bytes[(size_t) layer] = bytes;
-        }
-    } else {
-        if (layout.offset.size() != (size_t) n_layers || layout.bytes.size() != (size_t) n_layers ||
-            layout.fmt.size() != (size_t) n_layers) {
-            err = "FileExpertSource: the native expert layout is incomplete";
-            return false;
-        }
-        uint64_t at = 0;
-        for (int64_t layer = 0; layer < n_layers; ++layer) {
-            const size_t i = (size_t) layer;
-            const uint64_t bytes = (uint64_t) layout.fmt[i].bytes;
-            if (layout.offset[i] != at || bytes == 0 || layout.bytes[i] != bytes ||
-                bytes > std::numeric_limits<uint64_t>::max() / (uint64_t) n_expert) {
-                err = "FileExpertSource: the native expert layout is invalid at layer " + std::to_string(layer);
-                return false;
-            }
-            const uint64_t layer_bytes = bytes * (uint64_t) n_expert;
-            if (at > want || layer_bytes > want - at) {
-                err = "FileExpertSource: the native expert layout exceeds its declared size at layer " +
-                      std::to_string(layer);
-                return false;
-            }
-            layer_offsets[i] = layout.offset[i];
-            layer_blob_bytes[i] = bytes;
-            at += layer_bytes;
-        }
-        if (at != want) {
-            err = "FileExpertSource: the native expert layout has an inconsistent size";
-            return false;
-        }
+    if (blob_count > std::numeric_limits<uint64_t>::max() / (uint64_t) strata::kernels::cpu::BLOB) {
+        err = "FileExpertSource: the canonical expert size overflows";
+        return false;
+    }
+    const uint64_t canonical_size = blob_count * (uint64_t) strata::kernels::cpu::BLOB;
+    if (want != canonical_size) {
+        err = "FileExpertSource: the canonical expert layout has an inconsistent size";
+        return false;
+    }
+    const uint64_t bytes = (uint64_t) strata::kernels::cpu::BLOB;
+    const uint64_t layer_bytes = (uint64_t) n_expert * bytes;
+    for (int64_t layer = 0; layer < n_layers; ++layer) {
+        layer_offsets[(size_t) layer] = (uint64_t) layer * layer_bytes;
+        layer_blob_bytes[(size_t) layer] = bytes;
     }
     const std::string path = pack_dir + "/experts.bin";
-    if (layout.native && !gguf_.empty() && !std::filesystem::exists(path)) {
-        // CS-T: no experts.bin - the model's GGUF shards, read in place
-        blobs_ = (int64_t) blob_count;
-        n_layers_ = n_layers;
-        n_expert_ = n_expert;
-        layer_offsets_ = std::move(layer_offsets);
-        layer_blob_bytes_ = std::move(layer_blob_bytes);
-        if (!open_gguf(err)) { close(); return false; }
-        record_inputs(path, gguf_, layout, true);
-        return true;
-    }
-
     const int fd = open_read_only(path);
     if (fd < 0) { err = "FileExpertSource: cannot open " + path; return false; }
     uint64_t have = 0;
@@ -416,7 +373,7 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
     mapped_bytes_ = want;
     layer_offsets_ = std::move(layer_offsets);
     layer_blob_bytes_ = std::move(layer_blob_bytes);
-    record_inputs(path, gguf_, layout, false);
+    record_inputs(path);
     return true;
 }
 
@@ -494,18 +451,6 @@ void FileExpertSource::close() {
     complement_ready_ = false;
     complement_locked_ = 0;
     complement_lent_slots_ = 0;
-    if (!maps_.empty()) {
-        for (Map& m : maps_) {
-            if (m.base != nullptr) unmap_read_only(m.base, m.bytes);
-            if (m.fd >= 0) close_file(m.fd);
-        }
-        maps_.clear();
-        base_ = nullptr;   // one of the views above
-    }
-    role_ptr_.clear();
-    role_bytes_.clear();
-    role_file_.clear();
-    paths_.clear();
     direct_.clear();
     {
         std::lock_guard<std::mutex> lk(stage_mu_);
@@ -546,79 +491,11 @@ bool ExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
     return true;
 }
 
-// ================================ CS-T: THE GGUF SHARDS IN PLACE ================================
-//
-// A native pack without experts.bin: every file native_experts.txt names is mapped (MapViewOfFile / mmap, no
-// flag - the same retention argument as experts.bin above), and an expert's blob [gate rows | up rows | down rows]
-// is three slices of three tensors, possibly in two shards (UD-Q4_K_XL's layer 11).  Nothing is read at open; a
-// blob is assembled when it is asked for (`blob`, into a small pool of buffers) or copied where it is needed
-// (`copy_blob`: the RAM copy, the prompt path's pinned stager buffers).
-bool FileExpertSource::open_gguf(std::string& err) {
-    const auto& lay = strata::kernels::cpu::expert_layout();
-    if (!check_experts_gguf(gguf_, lay, err)) { err = "FileExpertSource: " + err; return false; }
-    const size_t cut = gguf_.find_last_of("/\\");
-    const std::string dir = cut == std::string::npos ? std::string() : gguf_.substr(0, cut + 1);
-    std::map<std::string, size_t> index;
-    role_ptr_.assign((size_t) (3 * n_layers_), nullptr);
-    role_bytes_.assign((size_t) (3 * n_layers_), 0);
-    role_file_.assign((size_t) (3 * n_layers_), 0);
-    for (int64_t l = 0; l < n_layers_; ++l) {
-        const auto& fm = lay.fmt[(size_t) l];
-        const uint64_t per[3] = {fm.up_off, fm.down_off - fm.up_off, lay.bytes[(size_t) l] - fm.down_off};
-        for (int r = 0; r < 3; ++r) {
-            const size_t i = (size_t) (3 * l + r);
-            const std::string path = lay.gguf_file.size() > i && !lay.gguf_file[i].empty() ? dir + lay.gguf_file[i]
-                                                                                            : gguf_;
-            auto it = index.find(path);
-            if (it == index.end()) {
-                Map m;
-                const int fd = open_read_only(path);
-                uint64_t size = 0;
-                if (fd < 0 || !file_bytes(fd, size) || size == 0) {
-                    if (fd >= 0) close_file(fd);
-                    err = "FileExpertSource: cannot open " + path;
-                    return false;
-                }
-                const uint8_t* view = map_read_only(fd, size);
-                if (view == nullptr) { close_file(fd); err = "FileExpertSource: cannot map " + path; return false; }
-                m.fd = fd;
-                m.bytes = size;
-                m.base = view;
-                maps_.push_back(m);
-                paths_.push_back(path);
-                it = index.emplace(path, maps_.size() - 1).first;
-            }
-            const Map& m = maps_[it->second];
-            role_file_[i] = (int) it->second;
-            const uint64_t at = lay.gguf_off[i], bytes = per[r] * (uint64_t) n_expert_;
-            if (at > m.bytes || bytes > m.bytes - at) {   // check_experts_gguf proved it; the mapping must agree
-                err = "FileExpertSource: an expert span runs past the end of " + path;
-                return false;
-            }
-            role_ptr_[i] = m.base + (size_t) at;
-            role_bytes_[i] = per[r];
-        }
-    }
-    base_ = maps_.front().base;       // "opened"; mapped_blob answers nullptr in this mode
-    for (uint64_t b : layer_blob_bytes_) stage_blob_ = std::max(stage_blob_, b);
-    return true;
-}
-
 bool FileExpertSource::copy_from_files(int64_t layer, int64_t expert, uint8_t* dst) const {
     if (dst == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return false;
     if (!direct_.empty()) {   // #286: from the drive; a failed read falls back to the mapping below
         const Fill f{0, layer, expert, dst};
         if (read_direct(&f, 1)) return true;
-    }
-    if (!role_ptr_.empty()) {
-        uint64_t at = 0;
-        for (int r = 0; r < 3; ++r) {
-            const size_t i = (size_t) (3 * layer + r);
-            const uint64_t per = role_bytes_[i];
-            std::memcpy(dst + at, role_ptr_[i] + (size_t) ((uint64_t) expert * per), (size_t) per);
-            at += per;
-        }
-        return true;
     }
     const uint8_t* b = mapped_blob(layer, expert);
     if (b == nullptr) return false;
@@ -764,14 +641,7 @@ bool FileExpertSource::advise_pairs(const std::pair<int32_t, int32_t>* pairs, in
     for (int64_t i = 0; pairs != nullptr && i < n; ++i) {
         const int64_t l = pairs[i].first, e = pairs[i].second;
         if (l < 0 || e < 0 || l >= n_layers_ || e >= n_expert_) continue;
-        if (role_ptr_.empty()) {   // experts.bin: the blob is one contiguous range
-            if (const uint8_t* b = mapped_blob(l, e)) strata::platform::advise_willneed(b, layer_blob_bytes_[(size_t) l]);
-            continue;
-        }
-        for (int r = 0; r < 3; ++r) {
-            const size_t k = (size_t) (3 * l + r);
-            strata::platform::advise_willneed(role_ptr_[k] + (size_t) ((uint64_t) e * role_bytes_[k]), role_bytes_[k]);
-        }
+        if (const uint8_t* b = mapped_blob(l, e)) strata::platform::advise_willneed(b, layer_blob_bytes_[(size_t) l]);
     }
     return true;
 }
@@ -847,34 +717,10 @@ bool FileExpertSource::transient(int64_t layer, int64_t expert) const {
 }
 
 double FileExpertSource::cached_share(int64_t samples) const {
-#if defined(__linux__)
-    if (role_ptr_.empty() || samples <= 0 || n_layers_ <= 0 || n_expert_ <= 0) return -1.0;
-    // an even spread over the (layer, expert) grid, every page of each of the expert's three slices through mincore
-    const int64_t total = (int64_t) n_layers_ * (int64_t) n_expert_;
-    const int64_t n = std::min<int64_t>(samples, total);
-    uint64_t pages = 0, resident = 0;
-    std::vector<unsigned char> vec;
-    for (int64_t s = 0; s < n; ++s) {
-        const int64_t idx = std::min<int64_t>(total - 1, (s * total) / n + (s * 7919) % std::max<int64_t>(1, total / n));
-        const int64_t layer = idx / n_expert_, expert = idx % n_expert_;
-        if (!transient(layer, expert)) continue;
-        for (int r = 0; r < 3; ++r) {
-            const size_t i = (size_t) (3 * layer + r);
-            if (role_ptr_[i] == nullptr || role_bytes_[i] == 0) continue;
-            const uint8_t* p = role_ptr_[i] + (size_t) ((uint64_t) expert * role_bytes_[i]);
-            const uintptr_t pg = 4096, a = (uintptr_t) p & ~(pg - 1);
-            const size_t len = (size_t) ((uintptr_t) p + role_bytes_[i] - a), np = (len + pg - 1) / pg;
-            vec.assign(np, 0);
-            if (mincore((void*) a, len, vec.data()) != 0) return -1.0;
-            pages += np;
-            for (unsigned char v : vec) resident += v & 1;
-        }
-    }
-    return pages ? (double) resident / (double) pages : -1.0;
-#else
+    // The page-cache sampling of the GGUF slices went with the GGUF-in-place tier: a mapped experts.bin is
+    // read through the OS page cache whole, so the caller keeps its SSD assumption.
     (void) samples;
-    return -1.0;   // no cheap residency query for a file mapping here: the caller keeps its SSD assumption
-#endif
+    return -1.0;
 }
 
 bool FileExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
@@ -900,7 +746,6 @@ bool FileExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
 }
 
 const uint8_t* FileExpertSource::mapped_blob(int64_t layer, int64_t expert) const {
-    if (!role_ptr_.empty()) return nullptr;   // the GGUF in place: no contiguous blob in any file
     if (base_ == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return nullptr;
     const size_t i = (size_t) layer;
     if (i >= layer_offsets_.size() || i >= layer_blob_bytes_.size()) return nullptr;
@@ -1312,7 +1157,7 @@ bool FileExpertSource::pin_cache_complement(
             }
 #if !defined(_WIN32)
             // a copied layer's pages handed back; Windows leaves them to its memory manager, as upstream does
-            if (role_ptr_.empty()) {   // experts.bin; the GGUF in place leaves its pages to the OS
+            {
             const uint64_t layer_offset = layer_offsets_[(size_t) layer];
             const uint64_t layer_bytes = blob_bytes * (uint64_t) n_expert_;
             const uint64_t layer_end = layer_offset + layer_bytes;
@@ -1705,13 +1550,6 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
         d.fail_layer = d.layers;
         return;
     }
-    if (expert_layout().native) {
-        // plan v0.3 P6: a native pack runs its experts in verify windows only (the driver guarantees it)
-        d.failed = true;
-        d.fail = "the single-token expert path does not take a native (IQ) pack";
-        d.fail_layer = d.layers;
-        return;
-    }
     if (k > (int64_t) d.jobs.size()) d.jobs.resize((size_t) k);
 
     d.src->begin_layer(d.layers, ids, k);
@@ -1818,95 +1656,6 @@ namespace {
 constexpr int64_t kMaxWindowEntries = 128;
 static_assert((int64_t) strata::kernels::cpu::MAXT * 10 <= kMaxWindowEntries, "a verify window's entries overflow the tables");
 }  // namespace
-
-namespace {
-// The CPU side's calibration calls: up to 8 experts a call, taken in turn from 64 of one layer that are in RAM
-// (pinned: blob() reads no file) and not in VRAM, one token each, in the layer's native format.  64 experts are past
-// any CPU cache (8 were not: their calls ran 3x faster than a decode's), so the calls read memory as a decode does.
-// `layer` < 0 picks the first such layer.
-struct CpuCalJobs {
-    static constexpr int kCall = 8, kRing = 64;
-    strata::kernels::cpu::NativeFmt f{};
-    std::vector<float> x, out;
-    strata::kernels::cpu::NativeAct act;
-    const uint8_t* ring[kRing] = {};
-    int cursor = 0;
-    strata::kernels::cpu::ExpertJobMulti jobs[kCall];
-    void next(int k) {   // the next k experts of the ring into jobs[0, k)
-        for (int j = 0; j < k; ++j) {
-            jobs[j].blob = ring[cursor];
-            cursor = (cursor + 1) % kRing;
-        }
-    }
-};
-bool cpu_cal_jobs(ExpertDispatch& d, int64_t n_layers, int64_t& layer, CpuCalJobs& cj, std::string& why) {
-    using namespace strata::kernels::cpu;
-    const ExpertLayout& lay = expert_layout();
-    if (!lay.native) { why = "not a native pack"; return false; }
-    if (d.pool == nullptr || d.src == nullptr || d.host_res == nullptr) { why = "no CPU pool or residency table"; return false; }
-    const int64_t l0 = layer >= 0 ? layer : 0, l1 = layer >= 0 ? layer + 1 : n_layers;
-    layer = -1;
-    for (int64_t l = l0; l < l1 && layer < 0; ++l) {
-        int n = 0;
-        for (int64_t e = 0; e < d.n_expert && n < CpuCalJobs::kRing; ++e)
-            if (d.host_res[(size_t) l * (size_t) d.n_expert + (size_t) e] < 0 && d.src->pinned(l, e)) {
-                const uint8_t* b = d.src->blob(l, e);
-                if (b != nullptr) cj.ring[n++] = b;
-            }
-        if (n == CpuCalJobs::kRing) layer = l;
-    }
-    if (layer < 0) { why = "no layer has 64 experts in RAM outside VRAM"; return false; }
-    cj.f = lay.fmt[(size_t) layer];
-    const int64_t H = cj.f.n_embd;
-    cj.x.assign((size_t) H, 0.0f);
-    cj.out.assign((size_t) CpuCalJobs::kCall * (size_t) H, 0.0f);
-    for (int64_t i = 0; i < H; ++i) cj.x[(size_t) i] = 0.01f * (float) ((i * 37) % 101 - 50);
-    native_quant_act(cj.f, cj.x.data(), cj.act.bytes);
-    for (int j = 0; j < CpuCalJobs::kCall; ++j) {
-        cj.jobs[j] = ExpertJobMulti{};
-        cj.jobs[j].nt = 1;
-        cj.jobs[j].nact[0] = cj.act.bytes;
-        cj.jobs[j].out[0] = cj.out.data() + (size_t) j * (size_t) H;
-    }
-    return true;
-}
-}  // namespace
-
-bool measure_cpu_expert_ms(ExpertDispatch& d, int64_t n_layers, double& c0, double& c, int64_t& layer, std::string& why) {
-    CpuCalJobs cj;
-    if (!cpu_cal_jobs(d, n_layers, layer, cj, why)) return false;
-    constexpr int kCall = CpuCalJobs::kCall;
-    // three rounds, each after 100 ms of calls that keep the clocks up (an idle CPU takes tens of ms to raise them; a
-    // decode keeps them up): 1 and 8 experts a call in turns, 32 calls each, the median; the lowest round.  One round's
-    // mean read an expert 4-8x slow in 2 of 32 starts on the RX 9060 XT's machine (0.18 and 0.39 against 0.05 ms, the
-    // same beside the link: the whole round slow), and the split then sent the missed experts over PCIe for most of a
-    // 256-token decode
-    const auto now = [] { return std::chrono::steady_clock::now(); };
-    double ms[2] = {1e30, 1e30};
-    for (int round = 0; round < 3; ++round) {
-        for (const auto t0 = now(); now() - t0 < std::chrono::milliseconds(100);) {
-            cj.next(kCall);
-            d.pool->run_split_multi_native(cj.f, cj.jobs, kCall);
-        }
-        double one[2][32];
-        for (int rep = 0; rep < 32; ++rep)
-            for (int w = 0; w < 2; ++w) {
-                const int k = w == 0 ? 1 : kCall;
-                cj.next(k);
-                const auto t0 = now();
-                d.pool->run_split_multi_native(cj.f, cj.jobs, k);
-                one[w][rep] = std::chrono::duration<double, std::milli>(now() - t0).count();
-            }
-        for (int w = 0; w < 2; ++w) {
-            std::nth_element(one[w], one[w] + 16, one[w] + 32);
-            ms[w] = std::min(ms[w], one[w][16]);
-        }
-    }
-    c = (ms[1] - ms[0]) / (kCall - 1);
-    c0 = std::max(0.0, ms[0] - c);
-    if (!(c > 0.0)) { why = "the CPU times did not grow with the experts"; return false; }
-    return true;
-}
 
 int pcie_split_m(const PcieSplitTimes& t, bool overlap, int f, int h) {
     if (f <= 0) return 0;
@@ -2124,10 +1873,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     }
     if ((int64_t) d.act_multi.size() < n_tok) d.act_multi.resize((size_t) MAXT);
     const ExpertLayout& lay = expert_layout();
-    const bool native = lay.native;
-    // the activation width: a native layer's own (models other than Qwen3.8), else the S2 kernels' compiled H
-    const int64_t W = native ? lay.fmt[(size_t) d.layers].n_embd : (int64_t) H;
-    if (native && d.nact_multi.size() < (size_t) MAXT) d.nact_multi.resize((size_t) MAXT);
+    // the activation width: the S2 kernels' compiled H
+    const int64_t W = (int64_t) H;
     if (d.job_of.size() != (size_t) d.n_expert) d.job_of.assign((size_t) d.n_expert, (int16_t) -1);
     if (d.jobs_multi.size() < (size_t) (n_tok * k)) d.jobs_multi.resize((size_t) (MAXT * k));
     static const bool ptrace = std::getenv("STRATA_POOL_TRACE") != nullptr;
@@ -2329,9 +2076,6 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     const bool any_cpu = std::any_of(kind, kind + n, [](int32_t v) { return v == -1; });   // -2: skipped, no work
     const auto c1 = std::chrono::steady_clock::now();
     if (!any_cpu) {
-    } else if (native) {
-        for (int64_t t = 0; t < n_tok; ++t)
-            native_quant_act(lay.fmt[(size_t) d.layers], x_f + (size_t) t * W, d.nact_multi[(size_t) t].bytes);
     } else {
         for (int64_t t = 0; t < n_tok; ++t) act_quant_q8_1(x_f + (size_t) t * W, (int) W, d.act_multi[(size_t) t]);
     }
@@ -2387,18 +2131,14 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 nj.nt = 0;
             }
             ExpertJobMulti& jb = d.jobs_multi[(size_t) jo];
-            jb.act[jb.nt] = native ? nullptr : &d.act_multi[(size_t) t];
-            jb.nact[jb.nt] = native ? d.nact_multi[(size_t) t].bytes : nullptr;
+            jb.act[jb.nt] = &d.act_multi[(size_t) t];
             jb.out[jb.nt] = row;
             ++jb.nt;
             ++d.multi_entries;
         }
     const auto c3 = std::chrono::steady_clock::now();
     pt("run", njobs);
-    if (njobs > 0) {
-        if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs);
-        else d.pool->run_split_multi(d.jobs_multi.data(), njobs);
-    }
+    if (njobs > 0) d.pool->run_split_multi(d.jobs_multi.data(), njobs);
     if (d.remote_count > 0) {
         static thread_local std::string remote_error;
         for (int r = 0; r < d.remote_count; ++r)
@@ -2598,8 +2338,7 @@ bool hash_sampled_file(const std::filesystem::path& path, uint64_t& h, std::stri
 }
 
 bool shared_arena_pack_hash(const std::string& pack_dir, const std::string& experts_path,
-                            const std::string& gguf, const strata::kernels::cpu::ExpertLayout& lay,
-                            uint64_t& out, std::string& err) {
+                            const strata::kernels::cpu::ExpertLayout& lay, uint64_t& out, std::string& err) {
     uint64_t h = 1469598103934665603ull;
     hash_text(h, "strata-shared-expert-arena-pack-v1");
     hash_u64(h, (uint64_t) lay.n_layers);
@@ -2615,20 +2354,6 @@ bool shared_arena_pack_hash(const std::string& pack_dir, const std::string& expe
 
     if (std::filesystem::exists(experts_path)) {
         if (!hash_sampled_file(experts_path, h, err)) return false;
-    } else if (!gguf.empty()) {
-        // Native packs may read experts straight from one or more GGUF shards.  Sample every distinct source
-        // file named by native_experts.txt; this keeps the fingerprint cheap while still tying it to the model
-        // bytes rather than only to an equal-size layout.
-        const std::filesystem::path first(gguf);
-        std::vector<std::filesystem::path> sources{first};
-        for (const std::string& name : lay.gguf_file) {
-            if (name.empty()) continue;
-            const std::filesystem::path p = first.parent_path() / name;
-            if (std::find(sources.begin(), sources.end(), p) == sources.end()) sources.push_back(p);
-        }
-        for (const auto& p : sources) {
-            if (!hash_sampled_file(p, h, err)) return false;
-        }
     }
 
     out = h == 0 ? 1 : h;
@@ -2637,238 +2362,11 @@ bool shared_arena_pack_hash(const std::string& pack_dir, const std::string& expe
 
 }  // namespace
 
-namespace {
-/// The GGUF file that holds role `r` (0 gate, 1 up, 2 down) of layer `l`: a name beside the --native shard
-/// (native_experts.txt v3 per layer, v4 per role), or the --native shard itself.
-std::string expert_gguf_file(const std::string& gguf, const strata::kernels::cpu::ExpertLayout& lay, int64_t l, int r) {
-    const size_t i = (size_t) (3 * l + r);
-    if (lay.gguf_file.size() <= i || lay.gguf_file[i].empty()) return gguf;
-    const size_t cut = gguf.find_last_of("/\\");
-    return (cut == std::string::npos ? std::string() : gguf.substr(0, cut + 1)) + lay.gguf_file[i];
-}
-}  // namespace
-
-void ExpertSource::record_inputs(const std::string& pack_experts, const std::string& gguf,
-                                 const strata::kernels::cpu::ExpertLayout& lay, bool from_gguf) {
-    static const char* roles[3] = {"gate", "up", "down"};
+void ExpertSource::record_inputs(const std::string& pack_experts) {
     inputs_.clear();
-    if (!from_gguf) { inputs_.push_back({"pack experts.bin", pack_experts}); return; }
-    // the same resolution open_gguf / load_experts_gguf use: every (layer, role) tensor and the file it is read from
-    for (int64_t l = 0; l < lay.n_layers; ++l)
-        for (int r = 0; r < 3; ++r)
-            inputs_.push_back({"expert blk." + std::to_string(lay.block_of(l)) + ".ffn_" + roles[r],
-                               expert_gguf_file(gguf, lay, l, r)});
+    inputs_.push_back({"pack experts.bin", pack_experts});
 }
 
-bool expert_layout_from_gguf(const std::string& gguf, const std::vector<int64_t>& moe_blocks, int64_t n_expert,
-                             int64_t n_embd, int64_t n_ff, std::string& err) {
-    using namespace strata::kernels::cpu;
-    static const char* roles[3] = {"gate", "up", "down"};
-    if (moe_blocks.empty() || n_expert <= 0 || n_embd <= 0 || n_ff <= 0) {
-        err = "experts from the GGUF: the geometry is empty";
-        return false;
-    }
-    try {
-        const strata::GgufModel model = strata::GgufModel::open(gguf);
-        const int64_t n_layers = (int64_t) moe_blocks.size();
-        ExpertLayout L;
-        L.native = true;
-        L.n_layers = n_layers;
-        L.n_expert = n_expert;
-        L.fmt.resize((size_t) n_layers);
-        L.offset.assign((size_t) n_layers, 0);
-        L.bytes.assign((size_t) n_layers, 0);
-        L.gguf_off.assign((size_t) (3 * n_layers), 0);
-        L.gguf_file.assign((size_t) (3 * n_layers), std::string());
-        L.block = moe_blocks;
-        L.max_blob = 0;
-        uint64_t at = 0;
-        for (int64_t l = 0; l < n_layers; ++l) {
-            const strata::TensorInfo* t[3] = {};
-            size_t shard[3] = {};
-            for (int r = 0; r < 3; ++r) {
-                const std::string name = "blk." + std::to_string(moe_blocks[(size_t) l]) + ".ffn_" + roles[r] +
-                                         "_exps.weight";
-                t[r] = model.find(name, &shard[r]);
-                const uint64_t cols = (uint64_t) (r < 2 ? n_embd : n_ff), rows = (uint64_t) (r < 2 ? n_ff : n_embd);
-                if (t[r] == nullptr || t[r]->shape.size() != 3 || t[r]->shape[0] != cols || t[r]->shape[1] != rows ||
-                    t[r]->shape[2] != (uint64_t) n_expert) {
-                    err = "experts from the GGUF: " + name + " is missing or not [" + std::to_string(cols) + ", " +
-                          std::to_string(rows) + ", " + std::to_string(n_expert) + "]";
-                    return false;
-                }
-                if (!model.in_bounds(*t[r], shard[r])) {
-                    err = "experts from the GGUF: " + name + " runs past the end of its file (a truncated shard?)";
-                    return false;
-                }
-            }
-            // gate and up may differ in type (native_mixed_gu), as long as they read the same activation
-            NativeFmt& f = L.fmt[(size_t) l];
-            if (!native_fmt((int) t[0]->type, (int) t[2]->type, n_embd, n_ff, f, err, (int) t[1]->type)) {
-                std::string where = "experts from the GGUF: block ";
-                where += std::to_string(moe_blocks[(size_t) l]);
-                where += ": ";
-                err.insert(0, where);
-                return false;
-            }
-            const uint64_t per[3] = {f.up_off, f.up_row * (uint64_t) n_ff, f.bytes - f.down_off};
-            for (int r = 0; r < 3; ++r) {
-                if (strata::tensor_payload_bytes(*t[r]) != per[r] * (uint64_t) n_expert) {
-                    err = "experts from the GGUF: block " + std::to_string(moe_blocks[(size_t) l]) + "'s " + roles[r] +
-                          " tensor is not " + std::to_string(per[r]) + " B per expert";
-                    return false;
-                }
-                const strata::GgufFile& file = model.shard(shard[r]);
-                L.gguf_off[(size_t) (3 * l + r)] = file.data_start() + t[r]->offset;
-                const std::string& path = file.path();
-                const size_t cut = path.find_last_of("/\\");
-                L.gguf_file[(size_t) (3 * l + r)] = cut == std::string::npos ? path : path.substr(cut + 1);
-            }
-            L.offset[(size_t) l] = at;
-            L.bytes[(size_t) l] = f.bytes;
-            L.max_blob = std::max<uint64_t>(L.max_blob, f.bytes);
-            at += (uint64_t) f.bytes * (uint64_t) n_expert;
-        }
-        L.total = at;
-        expert_layout_set(L);
-        return true;
-    } catch (const std::exception& e) {
-        err = std::string("experts from the GGUF: ") + e.what();
-        return false;
-    }
-}
-
-bool check_experts_gguf(const std::string& gguf, const strata::kernels::cpu::ExpertLayout& lay, std::string& err) {
-    static const char* roles[3] = {"gate", "up", "down"};
-    if (lay.gguf_off.size() != (size_t) (3 * lay.n_layers)) {
-        err = "native_experts.txt has no GGUF offsets (a pack older than v2): repack it with tools/iq_pack.py";
-        return false;
-    }
-    try {
-        std::map<std::string, std::unique_ptr<strata::GgufFile>> files;
-        for (int64_t l = 0; l < lay.n_layers; ++l) {
-            const auto& fm = lay.fmt[(size_t) l];
-            const uint64_t blob = lay.bytes[(size_t) l];
-            const uint64_t per[3] = {fm.up_off, fm.down_off - fm.up_off, blob - fm.down_off};
-            for (int r = 0; r < 3; ++r) {
-                const std::string path = expert_gguf_file(gguf, lay, l, r);
-                auto& f = files[path];
-                if (!f) f = std::make_unique<strata::GgufFile>(path);
-                const std::string name = "blk." + std::to_string(lay.block_of(l)) + ".ffn_" + roles[r] + "_exps.weight";
-                const strata::TensorInfo* t = f->find(name);
-                const uint64_t want_type = (uint64_t) (r < 2 ? fm.gu_type : fm.d_type);
-                // GGUF order: dim 0 is the row (the input), dim 1 the rows, dim 2 the experts
-                const uint64_t cols = (uint64_t) (r < 2 ? fm.n_embd : fm.n_ff);
-                const uint64_t rows = (uint64_t) (r < 2 ? fm.n_ff : fm.n_embd);
-                const uint64_t bytes = per[r] * (uint64_t) lay.n_expert;
-                const uint64_t payload = f->file_size() - f->data_start();
-                std::string why;
-                if (t == nullptr) why = "is not in it";
-                else if (t->type != want_type)
-                    why = std::string("is ") + t->type_name() + ", the pack says type " + std::to_string(want_type);
-                else if (t->shape.size() != 3 || t->shape[0] != cols || t->shape[1] != rows ||
-                         t->shape[2] != (uint64_t) lay.n_expert)
-                    why = "is not [" + std::to_string(cols) + ", " + std::to_string(rows) + ", " +
-                          std::to_string(lay.n_expert) + "]";
-                else if (strata::tensor_payload_bytes(*t) != bytes)
-                    why = "is not " + std::to_string(per[r]) + " B per expert";
-                else if (f->data_start() + t->offset != lay.gguf_off[(size_t) (3 * l + r)])
-                    why = "starts at byte " + std::to_string(f->data_start() + t->offset) + ", the pack says " +
-                          std::to_string(lay.gguf_off[(size_t) (3 * l + r)]);
-                else if (t->offset > payload || bytes > payload - t->offset)
-                    why = "runs past the end of the file (a truncated shard?)";
-                if (!why.empty()) {
-                    err = "the pack's native_experts.txt does not match the model: ";
-                    err += name; err += " in "; err += path; err += " "; err += why;
-                    err += " - repack with tools/iq_pack.py from this model's shards";
-                    return false;
-                }
-            }
-        }
-        return true;
-    } catch (const std::exception& e) {
-        err = std::string("native experts from the GGUF: ") + e.what();
-        return false;
-    }
-}
-
-// Plan v0.3 P6: the arena from the model's shard 1.  Each layer's gate, up and down tensors hold the 512 experts
-// one after another; they are read in chunks and each expert's slice lands at its place in the blob
-// [gate rows | up rows | down rows] - the layout tools/iq_pack.py would have written to experts.bin.
-LoadStats load_experts_gguf(const std::string& gguf, const std::vector<uint8_t*>& layer_dst,
-                            const strata::kernels::cpu::ExpertLayout& lay, int threads) {
-    LoadStats st;
-    st.layers = (uint64_t) lay.n_layers;
-    const auto t0 = std::chrono::steady_clock::now();
-    std::atomic<int64_t> next{0};
-    std::atomic<bool> bad{false};
-    // a layer's tensors may sit in other shards of the model (native_experts.txt v3/v4): names beside `gguf`
-    const size_t cut = gguf.find_last_of("/\\");
-    const std::string dir = cut == std::string::npos ? std::string() : gguf.substr(0, cut + 1);
-    auto file_of = [&](int64_t l, int r) -> std::string {
-        if (lay.gguf_file.empty() || lay.gguf_file[(size_t) (3 * l + r)].empty()) return gguf;
-        return dir + lay.gguf_file[(size_t) (3 * l + r)];
-    };
-    auto worker = [&]() {
-        std::ifstream f;
-        std::string open_name;
-        std::vector<uint8_t> buf;
-        for (;;) {
-            const int64_t l = next.fetch_add(1);
-            if (l >= lay.n_layers || bad) break;
-            const auto& fm = lay.fmt[(size_t) l];
-            const uint64_t blob = lay.bytes[(size_t) l];
-            const uint64_t per[3] = {fm.up_off, fm.down_off - fm.up_off, blob - fm.down_off};
-            const uint64_t at[3] = {0, fm.up_off, fm.down_off};
-            for (int r = 0; r < 3; ++r) {
-                const std::string name = file_of(l, r);
-                if (name != open_name) {
-                    f.close();
-                    f.clear();
-                    f.open(name, std::ios::binary);
-                    if (!f) { bad = true; return; }
-                    open_name = name;
-                }
-                const uint64_t src = lay.gguf_off[(size_t) (3 * l + r)];
-                const uint64_t total = per[r] * (uint64_t) lay.n_expert;
-                const uint64_t chunk = per[r] * 16;           // 16 experts per read
-                buf.resize((size_t) chunk);
-                for (uint64_t done = 0; done < total; done += chunk) {
-                    const uint64_t n = std::min<uint64_t>(chunk, total - done);
-                    f.seekg((std::streamoff) (src + done));
-                    f.read((char*) buf.data(), (std::streamsize) n);
-                    if ((uint64_t) f.gcount() != n) { bad = true; return; }
-                    for (uint64_t k = 0; k < n / per[r]; ++k) {
-                        const uint64_t e = done / per[r] + k;
-                        std::memcpy(layer_dst[(size_t) l] + (lay.blob_offset(l, (int64_t) e) - lay.layer_offset(l)) + at[r],
-                                    buf.data() + k * per[r], (size_t) per[r]);
-                    }
-                }
-            }
-        }
-    };
-    std::vector<std::thread> pool;
-    for (int i = 1; i < threads; ++i) pool.emplace_back(worker);
-    worker();
-    for (auto& t : pool) t.join();
-    if (bad) {
-        st.seconds = -1.0;
-        st.ok = false;
-        st.error = "short read or unreadable shard while reading the experts from the GGUF";
-        return st;
-    }
-    st.bytes = lay.total;
-    st.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    return st;
-}
-
-LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst,
-                            const strata::kernels::cpu::ExpertLayout& lay, int threads) {
-    std::vector<uint8_t*> layers;
-    layers.reserve((size_t) lay.n_layers);
-    for (int64_t l = 0; l < lay.n_layers; ++l) layers.push_back(dst + lay.layer_offset(l));
-    return load_experts_gguf(gguf, layers, lay, threads);
-}
 
 ArenaExpertSource::~ArenaExpertSource() { close(); }
 
@@ -2893,11 +2391,9 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     const int64_t blob = (int64_t) lay.max_blob;
     const uint64_t want = lay.total;
 
-    // plan v0.3 P6: no experts.bin in a native pack -> the experts come straight from the GGUF
-    const bool from_gguf = !std::ifstream(path, std::ios::binary) && lay.native && !lay.gguf_off.empty() && !gguf_.empty();
     // SIZE CHECK BEFORE THE ALLOCATION, not after.  A wrong pack should name the two numbers rather than spend
     // 34 GB and a minute of loading first.
-    if (!from_gguf) {
+    {
         std::ifstream f(path, std::ios::binary | std::ios::ate);
         if (!f) { err = "ArenaExpertSource: cannot open " + path; return false; }
         const uint64_t got = (uint64_t) f.tellg();
@@ -2919,9 +2415,7 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     // dropped is re-read from the file, so a result never depends on what is resident.  The GPUs then get no
     // mapped alias: run with --pcie-frac 0.  The first start writes experts.bin (arena layout, padded by one blob
     // so a whole-slot copy may start at any expert), later ones map it.
-#if defined(_WIN32)
-    static const bool arena_mmap = false;   // POSIX mmap/madvise: Linux only for now
-#else
+#if !defined(_WIN32)   // POSIX mmap/madvise: Linux only for now
     static const bool arena_mmap = [] { const char* v = std::getenv("STRATA_ARENA_MMAP"); return v && v[0] == '1'; }();
     if (arena_mmap) {
         const uint64_t file_bytes = want + (uint64_t) blob;
@@ -2947,7 +2441,7 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
             note_ = "mapped read-only from " + path + " (STRATA_ARENA_MMAP: not locked, not pinned)";
             gib_per_s_ = 0.0;
             load_seconds_ = load_read_s_ = load_copy_s_ = 0.0;
-            record_inputs(path, gguf_, lay, from_gguf);   // session files: the mapped experts.bin is a model input
+            record_inputs(path);   // session files: the mapped experts.bin is a model input
             return true;
         }
     }
@@ -3004,7 +2498,7 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         err = "shared arena cannot use layer-separated host USM"; return false;
     }
     uint64_t pack_hash = 0;
-    if (!shared_arena_file.empty() && !shared_arena_pack_hash(pack_dir, path, gguf_, lay, pack_hash, err)) return false;
+    if (!shared_arena_file.empty() && !shared_arena_pack_hash(pack_dir, path, lay, pack_hash, err)) return false;
     PinnedArena* a = nullptr;
     try {
         a = shared_arena_file.empty()
@@ -3035,8 +2529,7 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     LoadStats st;
     try {
         if (a->begin_shared_population()) {
-            st = from_gguf ? load_experts_gguf(gguf_, ldst, lay, threads)
-                           : load_experts_ranges(path, ldst, loff, lbytes, threads, /*chunk=*/8u << 20);
+            st = load_experts_ranges(path, ldst, loff, lbytes, threads, /*chunk=*/8u << 20);
             if (st.ok && st.bytes == want) a->publish_shared();
         } else { st.bytes = want; st.layers = (uint64_t) n_layers; }
     } catch (const std::exception& e) {
@@ -3051,30 +2544,6 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         delete a;
         err = "ArenaExpertSource: the load read " + std::to_string(st.bytes) + " B of " + std::to_string(want);
         return false;
-    }
-    // the first start: write experts.bin for the mapped starts after this one - only when the drive has room for it
-    // and 2 GiB more (a full drive fails other writes too); otherwise this start says so and runs pinned as before
-    std::error_code space_ec;
-    const uint64_t free_disk = arena_mmap && from_gguf ? (uint64_t) std::filesystem::space(
-        std::filesystem::path(path).parent_path(), space_ec).available : 0;
-    const bool room = !space_ec && free_disk >= want + (uint64_t) blob + (2ull << 30);
-    if (arena_mmap && from_gguf && !room)
-        std::fprintf(stderr, "strata generate: STRATA_ARENA_MMAP: NOT writing %s - %.1f GiB free on that drive, it needs "
-                             "%.1f GiB plus 2 GiB to spare; this start keeps the arena in RAM\n", path.c_str(),
-                     (double) free_disk / 1073741824.0, (double) (want + (uint64_t) blob) / 1073741824.0);
-    if (arena_mmap && from_gguf && room) {
-        const std::string tmp = path + ".tmp";
-        std::FILE* f = std::fopen(tmp.c_str(), "wb");
-        bool ok = f != nullptr && std::fwrite(a->data(), 1, (size_t) want, f) == (size_t) want;
-        if (ok) {
-            std::vector<uint8_t> pad((size_t) blob, 0);
-            ok = std::fwrite(pad.data(), 1, pad.size(), f) == pad.size();
-        }
-        if (f) ok = std::fclose(f) == 0 && ok;
-        if (ok) ok = std::rename(tmp.c_str(), path.c_str()) == 0;
-        if (!ok) std::remove(tmp.c_str());
-        std::fprintf(stderr, "strata generate: STRATA_ARENA_MMAP: %s %s (the next start maps it)\n",
-                     ok ? "wrote" : "could NOT write", path.c_str());
     }
     arena_ = a;
     base_ = a->data();
@@ -3108,7 +2577,7 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     load_seconds_ = st.seconds;
     load_read_s_ = st.read_seconds;
     load_copy_s_ = st.copy_seconds;
-    record_inputs(path, gguf_, lay, from_gguf);
+    record_inputs(path);
     return true;
 }
 

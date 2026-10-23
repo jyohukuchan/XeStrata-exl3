@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """serve/test_prompt_encoder.py - #567's incremental prompt encoding with #537's plain spans: every prompt's ids
 are those of a full encode, and a turn reuses the previous one's.
 

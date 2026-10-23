@@ -6,7 +6,6 @@
 #include "strata/platform/aux_cpus.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/core/exl3_prepare_profile.hpp"
-#include "strata/kernels/cpu/canon_expert.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 
 #include <algorithm>
@@ -693,32 +692,6 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
             const int e = (int) i / parts_b_, part = (int) i % parts_b_;
             const int r0 = H * part / parts_b_, r1 = H * (part + 1) / parts_b_;
             s2_expert_down_rows(jobs_[e].blob, split_[(size_t) e].a2, jobs_[e].out, r0, r1);
-        } else if (mode_ >= 5) {
-            // plan v0.3 P6: native layers, 5 = gate/up rows, 6 = down rows
-            const int per = (int) (mode_ == 5 ? nfmt_->n_ff : nfmt_->n_embd);
-            const int64_t g0 = mrows_ * (int64_t) i / mtasks_, g1 = mrows_ * (int64_t) (i + 1) / mtasks_;
-            for (int64_t r = g0; r < g1;) {
-                const int e = (int) (r / per), r0 = (int) (r % per);
-                const int r1 = (int) std::min<int64_t>(per, r0 + (g1 - r));
-                SplitBufMulti& sb = split_multi_[(size_t) e];
-                if (mode_ == 5) {
-                    float* ff[MAXT];
-                    for (int t = 0; t < mjobs_[e].nt; ++t) ff[t] = sb.ff[t];
-                    native_gu_rows(*nfmt_, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
-                } else if (nfmt_->d_type == 42 && !canon_layer(*nfmt_)) {
-                    // Q2_0 down (most IQ layers): the AVX-512 kernel, ggml-cpu has only a scalar one on x86; a layer of
-                    // the canonical rows (canon_expert.hpp) takes native_down_rows, the GPU's arithmetic
-                    const ActQ* a2[MAXT];
-                    for (int t = 0; t < mjobs_[e].nt; ++t) a2[t] = &sb.a2[t];
-                    q2_rows_any(mjobs_[e].blob + nfmt_->down_off, nfmt_->d_row, (int) (nfmt_->n_ff / 64), a2,
-                                mjobs_[e].nt, mjobs_[e].out, r0, r1);
-                } else {
-                    const void* hq[MAXT];
-                    for (int t = 0; t < mjobs_[e].nt; ++t) hq[t] = sb.hq[t];
-                    native_down_rows(*nfmt_, mjobs_[e].blob, hq, mjobs_[e].nt, mjobs_[e].out, r0, r1);
-                }
-                r += r1 - r0;
-            }
         } else {
             // plan v0.3 P6: an equal range of the phase's rows across ALL its experts (a range may span two)
             const int per = mode_ == 3 ? FF : H;
@@ -828,38 +801,6 @@ void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
     ms_multi_q += std::chrono::duration<double, std::milli>(t2 - t1).count();
     ms_multi_down += std::chrono::duration<double, std::milli>(t3 - t2).count();
     multi_bytes += (int64_t) n * (int64_t) BLOB;
-    mode_ = 0;
-    ms_drain_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-}
-
-void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n) {
-    if (n <= 0) return;
-    const auto t0 = std::chrono::steady_clock::now();
-    // more distinct experts than buffers: run them in batches
-    for (int b0 = 0; b0 < n; b0 += kMaxSplitMulti) {
-        const int nb = (std::min)(kMaxSplitMulti, n - b0);
-        mjobs_ = jobs + b0;
-        nfmt_ = &f;
-        mrows_ = (int64_t) nb * f.n_ff;
-        mtasks_ = phase_tasks(mrows_);
-        const auto a = std::chrono::steady_clock::now();
-        run_phase(5, mtasks_);
-        const auto b = std::chrono::steady_clock::now();
-        const bool q2 = f.d_type == 42 && !canon_layer(f);
-        for (int e = 0; e < nb; ++e)
-            for (int t = 0; t < mjobs_[e].nt; ++t)
-                if (q2) act_quant_any(split_multi_[(size_t) e].ff[t], (int) f.n_ff, split_multi_[(size_t) e].a2[t]);
-                else native_quant_h(f, split_multi_[(size_t) e].ff[t], split_multi_[(size_t) e].hq[t]);
-        const auto c = std::chrono::steady_clock::now();
-        mrows_ = (int64_t) nb * f.n_embd;
-        mtasks_ = phase_tasks(mrows_);
-        run_phase(6, mtasks_);
-        const auto d = std::chrono::steady_clock::now();
-        ms_multi_gu += std::chrono::duration<double, std::milli>(b - a).count();
-        ms_multi_q += std::chrono::duration<double, std::milli>(c - b).count();
-        ms_multi_down += std::chrono::duration<double, std::milli>(d - c).count();
-    }
-    multi_bytes += (int64_t) n * (int64_t) f.bytes;
     mode_ = 0;
     ms_drain_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }

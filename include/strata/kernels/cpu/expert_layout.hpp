@@ -4,13 +4,12 @@
 // include/strata/kernels/cpu/expert_layout.hpp - plan v0.3 P6: where each routed expert lives in experts.bin.
 //
 // A Q2_0 pack (tools/strata_pack.py) has one blob size for every layer, `BLOB`, in the Strata expert form.  A
-// native pack (tools/iq_pack.py, the IQ2_XS / IQ3_XXS files) keeps each expert's raw GGUF slices, so the blob
-// size and the formats change from layer to layer; `native_experts.txt` says how.  Everything that touches an
+// pack that keeps its experts in their raw GGUF slices has a per-layer blob size; `native_experts.txt` said how,
+// and is refused now that the engine no longer computes native (IQ) experts.  Everything that touches an
 // expert blob - the arena, the VRAM tier, the prompt path, the CPU pool, the GPU window - asks this table.
 #pragma once
 
 #include "strata/kernels/cpu/expert.hpp"
-#include "strata/kernels/cpu/native_expert.hpp"
 
 #include <cstdint>
 #include <string>
@@ -18,17 +17,36 @@
 
 namespace strata::kernels::cpu {
 
+/// One layer's expert geometry in its GGUF form (the record a native pack's native_experts.txt held).  The engines
+/// size their per-layer buffers from it; the kernels that computed with such rows went with the native expert path.
+struct NativeFmt {
+    int gu_type = -1, d_type = -1;      ///< ggml types of gate/up and of down
+    int gu_act = -1, d_act = -1;        ///< their vec_dot_type (the activation formats)
+    /// The up rows' type: gu_type, or another one with the same activation format (Ornith-1.5's GSQ-RCO files mix
+    /// Q2_K, Q3_K and Q4_K between gate and up in some layers).  gu_row and up_off are the gate rows'.
+    int up_type = -1;
+    int64_t n_embd = 0, n_ff = 0;
+    size_t gu_row = 0, d_row = 0;       ///< bytes per weight row
+    size_t up_row = 0;                  ///< bytes per up row (gu_row when up_type is gu_type)
+    size_t up_off = 0, down_off = 0;    ///< inside the blob
+    size_t bytes = 0;                   ///< the whole blob
+    size_t act_bytes = 0, h_bytes = 0;  ///< quantized activation sizes (n_embd of gu_act, or the ActQ; n_ff of d_act)
+};
+
+/// Whether the layer's gate and up rows are of different types (one built another way leaves up_type at -1: the
+/// gate's).
+inline bool native_mixed_gu(const NativeFmt& f) { return f.up_type >= 0 && f.up_type != f.gu_type; }
+
 struct ExpertLayout {
     bool native = false;
     int64_t n_layers = 0, n_expert = NE;
-    std::vector<NativeFmt> fmt;           ///< per layer (native packs)
+    std::vector<NativeFmt> fmt;           ///< per layer (a pack that kept its experts in GGUF form)
     std::vector<uint64_t> offset, bytes;  ///< per layer: where its 512 blobs start, bytes per blob
     /// Plan v0.3 P6: per layer, the absolute offsets of the gate / up / down tensors in their GGUF files, so the
-    /// arena can be filled from the GGUF itself when the pack has no experts.bin (3 x n_layers, 0 = unknown).
+    /// arena could be filled from the GGUF itself when the pack had no experts.bin (3 x n_layers, 0 = unknown).
     std::vector<uint64_t> gguf_off;
-    /// Per layer, the GGUF files (names beside the --native shard) that hold its gate / up / down tensors when
-    /// the model's shards split the layers (Swift's GGUFs: layers 13-47 in shard 2, and layer 13's down tensor in
-    /// shard 1) (3 x n_layers).  Empty = the --native shard itself.
+    /// Per layer, the GGUF files that held its gate / up / down tensors when the model's shards split the layers
+    /// (3 x n_layers).  Empty = the model's main shard.
     std::vector<std::string> gguf_file;
     /// Per layer of this table, the model's block that holds it (`blk.<block>.ffn_*_exps`): a model whose first blocks
     /// have no routed experts (GLM-5.3's three dense ones) numbers its MoE layers apart from its blocks.  Empty: the
@@ -52,19 +70,8 @@ struct ExpertLayout {
 /// file compiled without AVX-512, so asking is safe everywhere; STRATA_FORCE_AVX2=1 answers no (for tests).
 bool cpu_avx512_ok();
 /// Whether this CPU (and its OS) runs the AVX2 kernels (AVX, AVX2, FMA, F16C): the floor of every expert kernel
-/// (q2_avx2.cpp, iq_avx2.cpp, and ggml-cpu in the portable build).  STRATA_FORCE_AVX2 does not change it.
+/// (q2_avx2.cpp and the EXL3 CPU kernels).  STRATA_FORCE_AVX2 does not change it.
 bool cpu_avx2_ok();
-/// STRATA_IQ256_GATHER, the AVX-2 i-quant kernels' gathered grid decode (iq_avx2.cpp, upstream a7336175): -1 unset
-/// (auto, see cpu_gather_fast_here), 0 the scalar decode on every core, 1 the gathered one on every core.
-int iq256_gather_setting();
-/// Whether this CPU's performance cores gather the IQ grid entries faster than they assemble them from scalar loads,
-/// from what CPUID reports: an Intel CPU with AVX-VNNI (Alder Lake / Sapphire Rapids or newer; the older Intel cores
-/// gather slowly or under the Downfall microcode, AMD Zen 2/3 gather slowly) that is hybrid (CPUID 7.0:EDX[15]).
-/// A CPU of one core type is not told apart by CPUID from an E-core-only part, so it keeps the scalar decode.
-bool cpu_gather_fast();
-/// cpu_gather_fast() and the CALLING THREAD runs on a performance core: CPUID 1Ah core type 40h (the E-cores, 20h,
-/// gather slower than they assemble).  Probed once per thread: the pool pins each worker to one core.
-bool cpu_gather_fast_here();
 /// Whether the AVX-VNNI kernels run here: the build has them (STRATA_HAVE_AVXVNNI), the CPU has AVX2 and AVX-VNNI
 /// (CPUID 7.1 EAX bit 4).  STRATA_NO_AVXVNNI=1 answers no (to compare with the AVX2 kernels).
 bool cpu_avxvnni_ok();
@@ -75,15 +82,12 @@ void q2_rows_any(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* co
                  int r0, int r1);
 void act_quant_any(const float* x, int n, ActQ& a);
 
-/// The process-wide layout (canonical Q2_0 until `expert_layout_load` finds a native pack).
+/// The process-wide layout (the canonical Q2_0 form).
 const ExpertLayout& expert_layout();
-/// Reads `<pack_dir>/native_experts.txt` when it exists (a native pack), else sets the canonical layout.
-/// Versions up to kExpertLayoutVersion are read; a newer one is refused (a newer packer wrote it).
+/// Sets the canonical layout for `n_layers` x `n_expert` blobs; a pack that holds its experts in their raw GGUF
+/// slices (native_experts.txt) is refused: the engine no longer computes native (IQ) experts.
 bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err);
-/// Replaces the process-wide layout (expert_layout_from_gguf builds one from a model's GGUF).
+/// Replaces the process-wide layout.
 void expert_layout_set(const ExpertLayout& layout);
-/// The newest native_experts.txt this engine reads.  v4 = v3 plus the per-role shard column `gate,up,down`,
-/// written only when some layer's roles are in different shards (every other pack stays v3, byte for byte).
-inline constexpr int kExpertLayoutVersion = 4;
 
 }  // namespace strata::kernels::cpu

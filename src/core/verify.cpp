@@ -1378,16 +1378,9 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
         // grid_groups: the VRAM call a row per possible group, the PCIe call kPcieGroupRows (it rarely has any group,
         // and its rows stride over the ones it has)
         auto grouped = [&](const unsigned long long* gp, const int32_t* gs, const int32_t* gn, int64_t grid_groups) {
-            if (lay.native) {
-                // the layer's GGUF formats (i-quant gate/up, Q2_0 / IQ4_NL down)
-                const auto& f = lay.fmt[(size_t) l];
-                const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff, f.up_type);
-                native_expert_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap,
-                                      nat_xq_ + (size_t) tb * (N / 32) * 36, hit_scratch_, hit_out, cs, grid_groups);
-            } else {
-                moe_grouped_s2(gp, gs, gn, p_dst, p_tok, cap, cap, hit_xq_ + (size_t) tb * (N / 32) * 34,
-                               hit_xs_ + (size_t) tb * (N / 32), hit_scratch_, hit_out, cs);
-            }
+            (void) grid_groups;
+            moe_grouped_s2(gp, gs, gn, p_dst, p_tok, cap, cap, hit_xq_ + (size_t) tb * (N / 32) * 34,
+                           hit_xs_ + (size_t) tb * (N / 32), hit_scratch_, hit_out, cs);
         };
         // the PCIe share: its flag, and in the kernel mode the copy into staging.  On a side branch beside the VRAM
         // hits (fetch_branch_: the fetch waits on the link, the hits on the GPU; the fetch kernel leaves the hits their

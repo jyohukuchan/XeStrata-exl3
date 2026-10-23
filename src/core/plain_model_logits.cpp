@@ -33,8 +33,6 @@ struct TraceRow {
 struct Options {
     std::string exl3;
     std::string metadata_gguf;
-    std::string native;
-    std::string profile;
     std::string trace;
     std::string out_dir;
     std::vector<size_t> selected_rows;
@@ -97,8 +95,8 @@ bool parse_rows(const std::string& text, std::vector<size_t>& rows, std::string&
 }
 
 void usage() {
-    std::cerr << "usage: plain_model_logits (--exl3 DIR --metadata-gguf GGUF | --native GGUF) "
-                 "--trace TRACE.json --out-dir DIR [--rows I[,I...]] [--max-t N] [--pool-workers N] [--expert-profile FILE]\n";
+    std::cerr << "usage: plain_model_logits --exl3 DIR --metadata-gguf GGUF "
+                 "--trace TRACE.json --out-dir DIR [--rows I[,I...]] [--max-t N] [--pool-workers N]\n";
 }
 
 bool parse_options(int argc, char** argv, Options& options, std::string& error) {
@@ -119,10 +117,6 @@ bool parse_options(int argc, char** argv, Options& options, std::string& error) 
             if (!need("--exl3", options.exl3)) return false;
         } else if (arg == "--metadata-gguf") {
             if (!need("--metadata-gguf", options.metadata_gguf)) return false;
-        } else if (arg == "--native") {
-            if (!need("--native", options.native)) return false;
-        } else if (arg == "--expert-profile") {
-            if (!need("--expert-profile", options.profile)) return false;
         } else if (arg == "--trace") {
             if (!need("--trace", options.trace)) return false;
         } else if (arg == "--out-dir") {
@@ -180,20 +174,12 @@ bool parse_options(int argc, char** argv, Options& options, std::string& error) 
             return false;
         }
     }
-    if (options.exl3.empty() == options.native.empty()) {
-        error = "choose exactly one of --exl3 or --native";
+    if (options.exl3.empty()) {
+        error = "--exl3 is required";
         return false;
     }
     if (!options.exl3.empty() && options.metadata_gguf.empty()) {
         error = "--metadata-gguf is required with --exl3";
-        return false;
-    }
-    if (!options.native.empty() && !options.metadata_gguf.empty()) {
-        error = "--metadata-gguf is only valid with --exl3";
-        return false;
-    }
-    if (!options.exl3.empty() && !options.profile.empty()) {
-        error = "--expert-profile is currently supported only with --native";
         return false;
     }
     if (options.trace.empty() || options.out_dir.empty()) {
@@ -423,16 +409,11 @@ int main(int argc, char** argv) {
     model_options.max_t = options.max_t;
     model_options.max_cells = (std::max)(int64_t(16), static_cast<int64_t>(max_selected_tokens));
     model_options.pool_workers = options.pool_workers;
-    model_options.profile = options.profile;
     model_options.prompt_chunk = options.prompt_chunk;
     model_options.spec = options.spec;
     model_options.adapt_every = options.adapt_every;
-    if (!options.exl3.empty()) {
-        model_options.exl3_dir = options.exl3;
-        model_options.metadata_gguf = options.metadata_gguf;
-    } else {
-        model_options.gguf = options.native;
-    }
+    model_options.exl3_dir = options.exl3;
+    model_options.metadata_gguf = options.metadata_gguf;
 
     PlainModel model;
     if (!model.load(model_options, error)) {

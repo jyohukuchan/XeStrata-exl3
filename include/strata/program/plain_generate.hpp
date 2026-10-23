@@ -5,8 +5,7 @@
 
 namespace strata::program {
 
-/// When `--native PATH` names a model that PlainModel runs (not qwen4exp), runs it and returns the exit status;
-/// otherwise returns -1 and Qwen3.8's engine takes the command line.
+/// Runs an EXL3 model supported by PlainModel, using its metadata bootstrap; returns -1 for other model families.
 int plain_main(int argc, char** argv);
 
 }  // namespace strata::program
