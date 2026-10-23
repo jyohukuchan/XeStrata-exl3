@@ -529,6 +529,55 @@ registers; the run-time word indices fall into the private segment and took 114 
 launch, so it is reverted. The dots still fetch more words per tile than the reference does
 (the eight values' words are scattered), which is the next candidate.
 
+**Fusing the stages that flow between dots (kernel count 3160 to 2848).** The gaps around the
+kernels are a per-launch dispatch cost: an empty kernel in the same replay costs 7.6 us of
+boundary (the kernel itself 2.6 us, one in-order stream, measured in the same environment), so
+the lever is not how fast the host submits but how many launches there are. The stages that pass
+their values straight on from one dot to the next were therefore gathered into one launch in
+three places:
+
+1. **The expert flow** (7 to 5 kernels per layer): the gate/up dots' output-basis transforms with
+   their bias, the activation (`(g / (1 + exp(-g))) * u`) and the down projection's input-basis
+   transform all run on one 128-wide block per work-group, in order, in registers - the shape of
+   the reference's fused kernel A tail. A partially filled block reads back the same stale rows
+   from the activation plane that the three separate kernels read back.
+2. **The shared expert** (10 to 7 kernels per layer): the gate/up dots' two output-basis
+   transforms, the SwiGLU and the down projection's input-basis transform in one launch.
+3. **The GDN** (36 layers, 7 to 5 kernels per layer): the z dot's output-basis transform,
+   `gdn_out_norm` and the ssm_out projection's input-basis transform in one launch. The norm's sum
+   accumulates in D (double where the device has FP64) in the same warp sum and the same order.
+   One work-group owns one GDN head (state 128), so a model with another state size keeps the
+   three separate kernels.
+
+Each stage computes exactly what its separate kernel computed, in the same order (a bias the dot
+added moves into the tail, to the same value in the same position), so the values are bit
+identical. `STRATA_EXL3_FUSED_TAILS=0` goes back to the separate kernels.
+
+Measured on the two V620s with the 512-token prompt, 32 decode tokens and
+`STRATA_EXL3_FLASH_TIMING=1`:
+
+| state | decode tok/s | per token | pre | expert_prep | post | bridge | head | emb/ple |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| before | 14.63 | 67.81 ms | 0.75 | 2.50 | 0.35 | 30.44 | 32.83 | 0.92 |
+| after | 15.12 | 65.59 ms | 0.69 | 1.79 | 0.30 | 29.58 | 32.26 | 0.93 |
+
+In the kernel trace of one decode token (both devices together, the region a token occupies
+between two head launches) the launch count falls from 3160 to 2848 and the gaps around the
+kernels from 23.8 to 21.7 ms. The three fused launches take 1.4 ms of kernel time against the
+1.9 ms of the kernels they replace, but the unchanged dots' totals sit inside the run-to-run
+wobble (+-5%), so the kernel total reads 52.4 to 53.5 ms. A launch boundary costs more outside a
+graph replay (11 to 27 us, where the expert flow's eight kernels run) than inside one (7.8 us),
+so the next move is to capture the expert flow into a graph as well.
+
+The values do not change: the probe SHA256 without the device cache stays the reference value on
+one and two stages, and the generated tokens are unchanged. With the device cache on and part of
+the experts resident, the resident count itself moves by two experts between the before and after
+runs (the fused graphs hold fewer nodes, which shifts the free VRAM at startup and with it the
+admission cutoff), and with the split the mix of GPU-FP32 and CPU-FP64 experts changes, which
+changes the logits. Compared at the same resident count pinned with
+`STRATA_EXL3_DEVICE_CACHE_MIB` (14638 resident), before, after, and the fusions off and on all
+agree bit for bit.
+
 ## Qwen3.5 MoE MTP integration
 
 `--spec 2` or greater loads `mtp.fc`, three norms, and `mtp.layers.0` attention, routers and shared/routed experts

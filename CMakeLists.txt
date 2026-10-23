@@ -447,7 +447,7 @@ if(STRATA_ENABLE_XE)
 
   add_library(strata_kernels STATIC src/kernels/xe/elementwise.cpp src/kernels/xe/iq_kernels.cpp
                                     src/kernels/xe/exl3.cpp src/kernels/xe/exl3_expert.cpp src/kernels/xe/exl3_ngram.cpp
-                                    src/kernels/xe/exl3_grouped.cpp
+                                    src/kernels/xe/exl3_grouped.cpp src/kernels/xe/exl3_fused.cpp
                                     src/kernels/xe/raw_linear.cpp
                                     src/kernels/xe/native_mmvq.cpp src/kernels/xe/rope.cpp
                                     src/kernels/xe/router.cpp src/kernels/xe/bf16_gemv.cpp

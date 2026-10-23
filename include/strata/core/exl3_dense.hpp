@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 #pragma once
 
+#include "strata/kernels/exl3.hpp"
 #include "strata/kernels/exl3_format.hpp"
 #include "strata/kernels/raw_linear_format.hpp"
 
@@ -80,6 +81,17 @@ public:
     /// Runs the packed or raw matrix with FP32 input/output and caller-owned strides.
     /// The stream must have been registered with `prepare_stream` first.
     bool run(const float* x, int64_t ldx, float* y, int64_t ldy, int64_t rows, void* stream, std::string& err);
+
+    /// Runs like `run`, with the caller's basis options.  The fused transform tails
+    /// (strata/kernels/exl3_fused.hpp) own the stages a call disables, so the values are `run`'s
+    /// when the same stages are applied around it.  A raw owner carries no basis stages and runs
+    /// exactly as `run` does; the tails only take packed views (`packed`).
+    bool run(const float* x, int64_t ldx, float* y, int64_t ldy, int64_t rows, void* stream,
+             const strata::kernels::exl3::GemvOptions& options, std::string& err);
+
+    /// The packed matrix view the fused transform tails read their `suh`/`svh`/bias from;
+    /// null for a raw owner.
+    const strata::kernels::exl3::MatrixView* packed() const { return raw_ ? nullptr : &view_; }
 
     bool raw() const { return raw_; }
     strata::kernels::raw::DType raw_dtype() const { return raw_view_.dtype; }
