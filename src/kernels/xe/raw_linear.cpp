@@ -323,9 +323,17 @@ sycl::event select_raw_kernel(sycl::queue& queue, const LinearView& view, const 
     // same subgroup reduction).  Few outputs take the products form, which splits K over the waves
     // of a work-group; a medium count takes one row per wave; a wide projection takes two rows per
     // wave so its input row is fetched once for two of them.
+    //
+    // A wave of the rows form also walks k / 32 loads in one serial lane chain, and past ~128 of
+    // them that chain, not the wave count, is what the launch spends its time on: the products
+    // form's local-memory round trip is then worth it even where the rows form has waves to spare.
+    // The 4096 is the k of that crossing, measured on a card with 36 compute units (the 320-output,
+    // k = 10240 projection halves and the 512-output, k = 2560 one loses a few percent, both with
+    // the same weight bytes) and re-measurable on any other.
     const bool products_fits =
         static_cast<uint64_t>(view.k) <= device.get_info<sycl::info::device::local_mem_size>() / sizeof(float);
-    if (groups * 4 < capacity && products_fits) {
+    const bool long_walk = static_cast<uint64_t>(view.k) >= 4096;
+    if (products_fits && (groups * 4 < capacity || (groups * 2 < capacity && long_walk))) {
         // About eight products per work-item: enough loads in flight per item to cover the memory
         // latency, bounded by the work-group size and the K span (one product per position).
         const uint64_t wanted = static_cast<uint64_t>(view.k) / 8 + (static_cast<uint64_t>(view.k) % 8 != 0 ? 1 : 0);

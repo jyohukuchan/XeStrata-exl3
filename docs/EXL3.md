@@ -491,6 +491,44 @@ The GPU-side argmax is not applied either: the probe that dumps logits needs the
 the treatment of greedy ties must not change, so the logits transfer to the host stays the one
 copy at the head.
 
+**The K split of the raw projections now covers the long K.** The raw F16 projections have three
+forms (the products form, which splits K across a work-group's waves and stages the products in
+local memory, and the rows form with one or two rows per wave), and until now the products form
+was taken only when the output count was below the device's wave count. A wave of the rows form
+walks one output's K in one serial lane chain, and past 128 loads that chain, not the wave
+count, is what the projection spends its time on. A projection with a large K (4096 and up)
+therefore takes the products form even where the rows form has waves to spare. The crossing
+value is measured on a card with 36 compute units (the 320-output, K 10240 projection halves and
+the 512-output, K 2560 one loses a few percent) and re-measurable on any other. The addition
+order does not change anywhere (the same lane sums and the same subgroup reduction), so the
+values stay bit identical:
+
+Measured on the two V620s with the 512-token prompt, 32 decode tokens and
+`STRATA_EXL3_FLASH_TIMING=1`:
+
+| state | decode tok/s | per token | pre | expert_prep | post | bridge | head | emb/ple |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| before | 13.73 | 72.30 ms | 0.73 | 2.39 | 0.33 | 32.59 | 35.36 | 0.89 |
+| after | 14.70 | 67.45 ms | 0.70 | 2.39 | 0.31 | 30.14 | 33.04 | 0.86 |
+
+In the kernel trace of one decode token (both devices together, the region a token occupies
+between two head launches) the HC down projection (320 outputs, K 10240) goes from 107 to 63 us
+per launch, the raw projections together from 16.3 to 11.7 ms, and all kernels from 57.8 to
+52.8 ms. HC up (10240 outputs) and the router (512 outputs) keep their level (43 to 46 us, 36 to
+36 us). The unchanged control kernels (the experts' gate_up dot at 5.0 ms and the lm_head at
+1.23 ms) are at the same level as before, and the gaps around the kernels stay at 24.1 ms. The
+generated tokens are unchanged.
+
+**Tried and not kept.** Giving a wide projection four or eight rows per wave spilled registers
+at eight rows (VGPR 128 with 180 bytes of scratch) and took 43 us to 55 us, and at four rows the
+halved wave count took 168 us to 963 us: the wave count is what matters, not the input's
+re-reading. A rows loop rewritten around arrays with a two-step split tail grew the register use
+by 16 and took 43 to 48 us, so the original body is back. For the trellis dots a form was built
+that fetches the words a lane's eight values read once per tile and extracts every value from
+registers; the run-time word indices fall into the private segment and took 114 us to 343 us per
+launch, so it is reverted. The dots still fetch more words per tile than the reference does
+(the eight values' words are scattered), which is the next candidate.
+
 ## Qwen3.5 MoE MTP integration
 
 `--spec 2` or greater loads `mtp.fc`, three norms, and `mtp.layers.0` attention, routers and shared/routed experts
