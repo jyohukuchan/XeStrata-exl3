@@ -75,12 +75,25 @@ void gdn_step(float* state, const float* q, const float* k, const float* v, cons
 void gdn_conv_step(float* conv_state, const float* x, const float* kW, float* out, int64_t channels,
                    int64_t d_conv, void* stream);
 
+/// `gdn_conv_step` and the SiLU of its output in one launch, writing `out` directly: the layer's
+/// conv, its copy into the activation buffer and `silu_inplace` of it are one pass over the
+/// channels.  The accumulation is `gdn_conv_step`'s, in its order, and the activation is
+/// `silu_inplace`'s expression on the same value - so `out` holds what the three kernels left.
+/// `conv_state` is updated exactly as `gdn_conv_step` updates it.
+void gdn_conv_silu(float* conv_state, const float* x, const float* kW, float* out, int64_t channels,
+                   int64_t d_conv, void* stream);
+
 /// `build_gdn_l2_norm`: `x / sqrt(sum(x^2) + eps)`, over the LAST axis.
 ///
 /// The `+ eps` is an absolute floor on the SQUARED NORM, not on the mean - so the sum is formed first and
 /// there is NO division by the width.  The plausible wrong reading (`x / sqrt(mean(x^2) + eps)`) differs by
 /// sqrt(S) = 11.3x here, which is why the test asserts the two are distinguishable.
 void gdn_l2_norm(float* x, int64_t rows, int64_t cols, float eps, void* stream);
+
+/// `gdn_l2_norm`, then `x *= scale` over the same values: the layer's `scale_inplace` of the
+/// normalised q in the norm's own launch.  The two multiplications happen in the order the
+/// two kernels applied them (`p * inv`, then `* scale`), so the values are the two kernels'.
+void gdn_l2_norm_scaled(float* x, int64_t rows, int64_t cols, float eps, float scale, void* stream);
 
 /// `beta = sigmoid(beta)`, in place over `h_v` values.
 ///

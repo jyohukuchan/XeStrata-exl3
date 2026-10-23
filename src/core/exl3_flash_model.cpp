@@ -437,6 +437,13 @@ bool device_route_plan_enabled() {
     return !(text != nullptr && text[0] == '0' && text[1] == '\0');
 }
 
+/// STRATA_EXL3_RESIDENT_GRAPH: 0 submits the resident expert flow's launches one by one instead of
+/// replaying the captured graph - the same values, kept as the comparison path for the graph's effect.
+bool resident_flow_graph_enabled() {
+    const char* text = std::getenv("STRATA_EXL3_RESIDENT_GRAPH");
+    return !(text != nullptr && text[0] == '0' && text[1] == '\0');
+}
+
 double ms_since(std::chrono::steady_clock::time_point& mark) {
     const auto now = std::chrono::steady_clock::now();
     const double value = std::chrono::duration<double, std::milli>(now - mark).count();
@@ -630,6 +637,9 @@ struct Exl3FlashModel::Impl {
         float* embedding_device = nullptr;
         std::vector<strata::gpu::Graph*> pre_graphs;
         std::vector<strata::gpu::Graph*> post_graphs;
+        // The resident expert flow's own graphs (one per layer): the clear of the expert rows, the device
+        // route plan and the grouped experts' kernels, captured where the cache is fully resident.
+        std::vector<strata::gpu::Graph*> expert_graphs;
     };
 
     Exl3FlashModelOptions options;
@@ -1117,6 +1127,57 @@ bool Exl3FlashModel::open(const std::filesystem::path& directory, const Exl3Flas
             }
         }
 
+        // ---- THE RESIDENT EXPERT FLOW, CAPTURED LIKE THE LAYERS ARE ----
+        //
+        // A fully resident cache runs the same submissions for every layer of every token: the clear of the
+        // expert rows, the device route plan and the grouped experts' kernels.  They sat between the pre and
+        // post graphs at their own dispatch cost (a launch outside a graph replay measured 11 to 27 us of
+        // boundary against 7.8 us inside one) while the flow never changes shape between tokens, so it is
+        // captured per layer and replayed like the pre and post graphs.  Every pointer the body takes is a
+        // buffer allocated before this point and never moved (graph.hpp: a graph re-reads its input buffers at
+        // replay, but not its kernel arguments), and the plan kernel's layer is a property of the graph it is
+        // captured into.  The cache is open by now: the plan's device tables live in it, and whether it holds
+        // every expert is what decides whether this flow exists at all.
+        for (size_t stage_index = 0; stage_index < impl_->stages.size(); ++stage_index) {
+            auto& stage = impl_->stages[stage_index];
+            const OnDevice on(stage.device);
+            if (!stage.runtime->fully_resident()) continue;
+            stage.expert_graphs.resize(static_cast<size_t>(stage.layer_end - stage.layer_begin), nullptr);
+            for (int64_t layer = stage.layer_begin; layer < stage.layer_end; ++layer) {
+                const size_t local = static_cast<size_t>(layer - stage.layer_begin);
+                strata::gpu::Stream capture_stream = strata::gpu::stream_create();
+                if (capture_stream == nullptr) {
+                    err = "EXL3 Flash: expert graph capture stream creation failed";
+                    return false;
+                }
+                sycl::queue& queue = Runtime::at(stage.device).stream(capture_stream);
+                if (!strata::gpu::begin_capture(capture_stream)) {
+                    strata::gpu::stream_destroy(capture_stream);
+                    err = "EXL3 Flash: begin expert graph capture failed at layer " + std::to_string(layer);
+                    return false;
+                }
+                if (!strata::gpu::memset_async(stage.parts_device, 0,
+                                               stage.merge_output.size() * sizeof(float), capture_stream) ||
+                    !stage.runtime->record_device_hit_enqueue(queue, layer,
+                                                              static_cast<const float*>(stage.session.block.mixed),
+                                                              stage.doorbell.d_ids, 1,
+                                                              static_cast<float*>(stage.parts_device),
+                                                              impl_->geometry.n_embd, err)) {
+                    strata::gpu::abandon_capture(capture_stream);
+                    strata::gpu::stream_destroy(capture_stream);
+                    err = "EXL3 Flash: expert graph layer " + std::to_string(layer) + ": " + err;
+                    return false;
+                }
+                if (!strata::gpu::end_capture(capture_stream, &stage.expert_graphs[local])) {
+                    strata::gpu::stream_destroy(capture_stream);
+                    err = "EXL3 Flash: end expert graph layer " + std::to_string(layer) + ": " +
+                          strata::gpu::last_error();
+                    return false;
+                }
+                strata::gpu::stream_destroy(capture_stream);
+            }
+        }
+
         layer_set_fused_gr(impl_->previous_fused_gr);
         layer_set_shared_early(impl_->previous_shared_early);
         impl_->policy_saved = false;
@@ -1141,6 +1202,7 @@ bool Exl3FlashModel::close(std::string& err) noexcept {
             if (stage.runtime) Runtime::at(stage.device).finish();
             destroy_graphs(stage.pre_graphs);
             destroy_graphs(stage.post_graphs);
+            destroy_graphs(stage.expert_graphs);
             session_release(stage.session);
             if (stage.session.qsa_states != nullptr) {
                 for (int64_t ordinal = 0; ordinal < impl_->geometry.n_qsa_layers(); ++ordinal) {
@@ -1489,8 +1551,7 @@ bool Exl3FlashModel::forward(int32_t token, int64_t pos, int32_t& next_token, fl
                     ple_collected = true;
                 }
                 mark = std::chrono::steady_clock::now();
-                if (!strata::gpu::graph_launch(stage.pre_graphs[local], nullptr) ||
-                    !strata::gpu::event_record(impl_->doorbell_probe, nullptr)) {
+                if (!strata::gpu::graph_launch(stage.pre_graphs[local], nullptr)) {
                     err = "EXL3 Flash: pre graph launch layer " + std::to_string(layer) + ": " +
                           strata::gpu::last_error();
                     return false;
@@ -1506,20 +1567,33 @@ bool Exl3FlashModel::forward(int32_t token, int64_t pos, int32_t& next_token, fl
                     // the host still sees them and the split they imply - it sees them off the
                     // decode's critical path rather than in it.
                     timing.pre_graph_ms += ms_since(mark);
-                    if (!strata::gpu::memset_async(stage.parts_device, 0,
-                                                   stage.merge_output.size() * sizeof(float), nullptr)) {
-                        err = std::string("EXL3 Flash: clearing expert output: ") + strata::gpu::last_error();
-                        return false;
-                    }
-                    sycl::event resident_done;
                     mark = std::chrono::steady_clock::now();
-                    if (!stage.runtime->enqueue_device_hit(Runtime::at(stage.device).stream(nullptr), layer,
-                                                           static_cast<const float*>(stage.session.block.mixed),
-                                                           stage.doorbell.d_ids, 1,
-                                                           static_cast<float*>(stage.parts_device),
-                                                           impl_->geometry.n_embd, resident_done, {}, err)) {
-                        err = "EXL3 Flash: expert window layer " + std::to_string(layer) + ": " + err;
-                        return false;
+                    if (resident_flow_graph_enabled() && local < stage.expert_graphs.size() &&
+                        stage.expert_graphs[local] != nullptr) {
+                        // The flow is the same submissions every token, so its graph replays them
+                        // as one launch: the clear of the expert rows, the plan kernel and the
+                        // grouped experts' kernels run at a graph replay's boundaries.
+                        if (!strata::gpu::graph_launch(stage.expert_graphs[local], nullptr)) {
+                            err = "EXL3 Flash: expert graph launch layer " + std::to_string(layer) + ": " +
+                                  strata::gpu::last_error();
+                            return false;
+                        }
+                    } else {
+                        if (!strata::gpu::memset_async(stage.parts_device, 0,
+                                                       stage.merge_output.size() * sizeof(float), nullptr)) {
+                            err = std::string("EXL3 Flash: clearing expert output: ") + strata::gpu::last_error();
+                            return false;
+                        }
+                        sycl::event resident_done;
+                        mark = std::chrono::steady_clock::now();
+                        if (!stage.runtime->enqueue_device_hit(Runtime::at(stage.device).stream(nullptr), layer,
+                                                               static_cast<const float*>(stage.session.block.mixed),
+                                                               stage.doorbell.d_ids, 1,
+                                                               static_cast<float*>(stage.parts_device),
+                                                               impl_->geometry.n_embd, resident_done, {}, err)) {
+                            err = "EXL3 Flash: expert window layer " + std::to_string(layer) + ": " + err;
+                            return false;
+                        }
                     }
                     timing.expert_prepare_ms += ms_since(mark);
                     mark = std::chrono::steady_clock::now();
@@ -1534,7 +1608,13 @@ bool Exl3FlashModel::forward(int32_t token, int64_t pos, int32_t& next_token, fl
                 // The host waits at the doorbell - the window crossing to it - and not for the
                 // queue: the poll returns at the ring, which the pre graph rings before its end,
                 // so the expert work below starts beside the graph's tail.  The queue's order is
-                // what carries the layer's state into the rest.
+                // what carries the layer's state into the rest.  The probe marks the pre graph so
+                // the poll is a query and not a drain; the resident path above waits on neither.
+                if (!strata::gpu::event_record(impl_->doorbell_probe, nullptr)) {
+                    err = "EXL3 Flash: pre graph doorbell probe layer " + std::to_string(layer) + ": " +
+                          strata::gpu::last_error();
+                    return false;
+                }
                 if (!wait_pre_doorbell(stage.doorbell, impl_->doorbell_probe, err)) {
                     err = "EXL3 Flash: pre graph layer " + std::to_string(layer) + ": " + err;
                     return false;

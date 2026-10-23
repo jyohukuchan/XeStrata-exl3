@@ -93,6 +93,13 @@ public:
     /// null for a raw owner.
     const strata::kernels::exl3::MatrixView* packed() const { return raw_ ? nullptr : &view_; }
 
+    /// The plane `run` transforms the input into on `stream` before the dot: the input-basis image
+    /// a dot reads with `GemvOptions::input_hadamard` off.  `exl3_input_hadamard_dual_fp32` writes
+    /// two owners' planes in one launch, which is what exposes this.  `rows` rows of the input
+    /// width; false for a raw owner, one with no `suh`, an unprepared stream or a row count above
+    /// the owner's `max_rows`.
+    bool input_scratch(void* stream, int64_t rows, float*& plane, std::string& err);
+
     bool raw() const { return raw_; }
     strata::kernels::raw::DType raw_dtype() const { return raw_view_.dtype; }
 

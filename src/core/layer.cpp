@@ -252,7 +252,7 @@ bool gdn_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer,
 const WeightRef* w_qkv = v.get("attn_qkv.weight");    const WeightRef* w_gate = v.get("attn_gate.weight");    const WeightRef* w_out = v.get("ssm_out.weight");    const WeightRef* w_alpha = v.get("ssm_alpha.weight");    const WeightRef* w_beta = v.get("ssm_beta.weight");    const WeightRef* w_conv = v.get("ssm_conv1d.weight");    const WeightRef* w_norm = v.get("ssm_norm.weight");    const WeightRef* w_dt = v.get("ssm_dt.bias");    const WeightRef* w_a = v.get("ssm_a");    const char* missing = !w_qkv ? "attn_qkv.weight" : !w_gate ? "attn_gate.weight"                          : !w_out ? "ssm_out.weight" : !w_alpha ? "ssm_alpha.weight"                          : !w_beta ? "ssm_beta.weight" : !w_conv ? "ssm_conv1d.weight"                          : !w_norm ? "ssm_norm.weight" : !w_dt ? "ssm_dt.bias"                          : !w_a ? "ssm_a" : nullptr;    if (missing) { err = v.name(missing) + " is missing"; return false; }
 // The conv kernel and the two norms are F32 source types, and the loader copied them verbatim - so their
 // device bytes ARE f32 and can be handed straight to the kernels that want `const float*`.
-const float* conv_kernel = (const float*) w_conv->data;    const float* ssm_norm = (const float*) w_norm->data;    const float* dt = (const float*) w_dt->data;    const float* ssm_a = (const float*) w_a->data;    strata::kernels::SForm f_qkv, f_gate, f_out;    if (!sform_of(*w_qkv, f_qkv, v.name("attn_qkv.weight"), err)) return false;    if (!sform_of(*w_gate, f_gate, v.name("attn_gate.weight"), err)) return false;    if (!sform_of(*w_out, f_out, v.name("ssm_out.weight"), err)) return false;    Planes p_qkv, p_gate, p_out;    if (!plane_ptrs(*w_qkv, v.name("attn_qkv.weight"), p_qkv, err)) return false;    if (!plane_ptrs(*w_gate, v.name("attn_gate.weight"), p_gate, err)) return false;    if (!plane_ptrs(*w_out, v.name("ssm_out.weight"), p_out, err)) return false;    using namespace strata::kernels;    strata::gpu::Stream st = stream;
+const float* conv_kernel = (const float*) w_conv->data;    const float* ssm_norm = (const float*) w_norm->data;    const float* dt = (const float*) w_dt->data;    const float* ssm_a = (const float*) w_a->data;    strata::kernels::SForm f_qkv, f_gate, f_out;    if (!sform_of(*w_qkv, f_qkv, v.name("attn_qkv.weight"), err)) return false;    if (!sform_of(*w_gate, f_gate, v.name("attn_gate.weight"), err)) return false;    if (!sform_of(*w_out, f_out, v.name("ssm_out.weight"), err)) return false;    Planes p_qkv, p_gate, p_out;    if (!plane_ptrs(*w_qkv, v.name("attn_qkv.weight"), p_qkv, err)) return false;    if (!plane_ptrs(*w_gate, v.name("attn_gate.weight"), p_gate, err)) return false;    if (!plane_ptrs(*w_out, v.name("ssm_out.weight"), p_out, err)) return false;    using namespace strata::kernels;
 // ---- 1. the activation, in EVERY format a weight on this layer might ask for.  BOTH quantized images are
 //         produced, because which one is wanted is a property of the TENSOR and the pack mixes them by
 //         layer - producing only the "right" one is how the per-role assumption gets baked back in.
@@ -278,11 +278,11 @@ if (fused_pre) {
 } else
 try {
     if (native_gdn_enabled()) native_gdn_conv_silu(b.conv_state, b.qkv, conv_kernel, b.conv_out, b.h, C, g.ssm_d_conv, stream);
-    else {
-        gdn_conv_step(b.conv_state, b.qkv, conv_kernel, b.conv_out, C, g.ssm_d_conv, stream);
-        strata::gpu::copy_async(b.h, b.conv_out, (size_t) C * 4, st);
-        silu_inplace(b.h, C, stream);
-    }
+    else
+        // The conv, its copy into the activation buffer and the SiLU of it are one launch: the
+        // conv's accumulation and the state slide are `gdn_conv_step`'s and the activation is
+        // `silu_inplace`'s expression on the same value.
+        gdn_conv_silu(b.conv_state, b.qkv, conv_kernel, b.h, C, g.ssm_d_conv, stream);
 } catch (const std::exception& error) { err = v.name("gdn_conv_silu") + ": " + error.what(); return false; }
 st_end(layer, 10, stream);
 // ---- 4. q,k = l2_norm; v is NOT normalised.  The three views are contiguous runs of the same buffer:
@@ -293,14 +293,16 @@ if (!fused_pre) try {
         native_gdn_l2_norm(b.h, g.ssm_k_heads, g.ssm_state_size, RMS_EPS, stream);
         native_gdn_l2_norm(b.h + qk, g.ssm_k_heads, g.ssm_state_size, RMS_EPS, stream);
     } else {
-        gdn_l2_norm(b.h, g.ssm_k_heads, g.ssm_state_size, RMS_EPS, stream);
+        // The recurrence's 1/sqrt(S) rides the q norm's own launch (the scale covers the q region
+        // alone, `scale_inplace`'s span), multiplied after the norm's factor as the two kernels did.
+        const float qk_scale = 1.0f / std::sqrt((float) g.ssm_state_size);
+        gdn_l2_norm_scaled(b.h, g.ssm_k_heads, g.ssm_state_size, RMS_EPS, qk_scale, stream);
         gdn_l2_norm(b.h + qk, g.ssm_k_heads, g.ssm_state_size, RMS_EPS, stream);
     }
 } catch (const std::exception& error) { err = v.name("gdn_l2_norm") + ": " + error.what(); return false; }
 // The recurrence needs another 1/sqrt(S) beyond Q/K normalization. The legacy
 // recurrence consumes prescaled Q; pinned CUDA applies it after the readout dot.
 // Keep the scale at that backend-specific boundary to preserve rounding order.
-if (!native_gdn_enabled()) scale_inplace(b.h, qk, 1.0f / std::sqrt((float) g.ssm_state_size), stream);
 st_end(layer, 11, stream);
 // ---- 5. beta and the gate. The weights are BF16. Native single-token CUDA MMVF
 //         consumes F32 activations; the legacy path rounds them to BF16 first.
@@ -323,8 +325,7 @@ st_begin(layer, 12, stream);
             native_gdn_beta_gate(b.beta, g.ssm_v_heads, stream);
             native_gdn_gate(b.alpha, dt, ssm_a, b.gate, g.ssm_v_heads, stream);
         } else {
-            gdn_beta_gate(b.beta, g.ssm_v_heads, stream);
-            gdn_gate(b.alpha, dt, ssm_a, b.gate, 1, g.ssm_v_heads, stream);
+            gdn_gate_beta(b.alpha, dt, ssm_a, b.gate, b.beta, 1, g.ssm_v_heads, stream);
         }
     } catch (const std::exception& error) { err = v.name("gdn_gate") + ": " + error.what(); return false; }
     st_end(layer, 12, stream); st_begin(layer, 13, stream);
@@ -441,6 +442,39 @@ if (db != nullptr && g_publish_kernel) {
 // write idempotent across replays of the same graph - a captured literal would ring the same number
 // forever and the host would never see a change.
 strata::kernels::doorbell_ring(db->d_seq, stream);    }    return true;}
+// The shared expert's gate/up dots on one activation.  Their two input-basis transforms read the
+// same x, so where the shape and the device allow it the two run as one launch (exllamav3's
+// `had_r_128_dual` shape) into the two owners' own scratch planes, and the dots then read their
+// plane with the input stage off - the same values `run` computes, one launch fewer.  A raw owner,
+// a width that is not a whole 128-wide block, or a device without the SG32 form takes the two
+// ordinary `run`s.
+bool shared_gate_up_runs(Exl3Dense& gate_owner, Exl3Dense& up_owner, const float* x, float* gate, float* up,
+                         int64_t n_embd, int64_t n_ff, void* stream,
+                         const strata::kernels::exl3::GemvOptions& options, std::string& err) {
+    using namespace strata::kernels::exl3;
+    const MatrixView* gv = gate_owner.packed();
+    const MatrixView* uv = up_owner.packed();
+    float* gate_plane = nullptr;
+    float* up_plane = nullptr;
+    if (options.input_hadamard && gv != nullptr && uv != nullptr && gv->suh != nullptr && uv->suh != nullptr &&
+        gv->k == n_embd && uv->k == n_embd && n_embd % 128 == 0 && exl3_fused_tail_enabled() &&
+        exl3_fused_tail_supported(stream) && gate_owner.input_scratch(stream, 1, gate_plane, err) &&
+        up_owner.input_scratch(stream, 1, up_plane, err)) {
+        GemvOptions dot_stages = options;
+        dot_stages.input_hadamard = false;
+        try {
+            exl3_input_hadamard_dual_fp32(*gv, *uv, x, n_embd, gate_plane, up_plane, 1, stream);
+        } catch (const std::exception& e) {
+            err = std::string("shared expert dual input transform: ") + e.what();
+            return false;
+        }
+        return gate_owner.run(gate_plane, n_embd, gate, n_ff, 1, stream, dot_stages, err) &&
+               up_owner.run(up_plane, n_embd, up, n_ff, 1, stream, dot_stages, err);
+    }
+    err.clear();
+    return gate_owner.run(x, n_embd, gate, n_ff, 1, stream, options, err) &&
+           up_owner.run(x, n_embd, up, n_ff, 1, stream, options, err);
+}
 bool moe_shared(const WeightTable& tables, const ModelGeometry& g, int64_t layer, const MoEBuffers& b,                const float* x, void* stream, std::string& err) {    using namespace strata::kernels;    const LayerView v(tables, layer);    const WeightRef* w_ginp = v.get("ffn_gate_inp_shexp.weight");    const WeightRef* w_sgate = v.get("ffn_gate_shexp.weight");    const WeightRef* w_sup = v.get("ffn_up_shexp.weight");    const WeightRef* w_sdown = v.get("ffn_down_shexp.weight");    const char* missing = !w_ginp ? "ffn_gate_inp_shexp.weight" : !w_sgate ? "ffn_gate_shexp.weight"                          : !w_sup ? "ffn_up_shexp.weight" : !w_sdown ? "ffn_down_shexp.weight" : nullptr;    if (missing) { err = v.name(missing) + " is missing"; return false; }
     const bool any_owner = w_ginp->exl3 || w_sgate->exl3 || w_sup->exl3 || w_sdown->exl3;
     const bool all_owner = w_ginp->exl3 && w_sgate->exl3 && w_sup->exl3 && w_sdown->exl3;
@@ -475,8 +509,9 @@ bool moe_shared(const WeightTable& tables, const ModelGeometry& g, int64_t layer
             strata::kernels::exl3::GemvOptions tail_stages{};
             tail_stages.output_hadamard = false;
             tail_stages.add_bias = false;
-            if (!w_sgate->exl3->run(x, g.n_embd, gate, g.n_ff, 1, stream, tail_stages, err) ||
-                !w_sup->exl3->run(x, g.n_embd, up, g.n_ff, 1, stream, tail_stages, err)) return false;
+            if (!shared_gate_up_runs(*w_sgate->exl3, *w_sup->exl3, x, gate, up, g.n_embd, g.n_ff, stream,
+                                     tail_stages, err))
+                return false;
             try {
                 strata::kernels::exl3::exl3_fused_swiglu_tail_fp32(*gate_view, *up_view, *down_view, gate, up, gate,
                                                                    1, stream);
@@ -491,8 +526,9 @@ bool moe_shared(const WeightTable& tables, const ModelGeometry& g, int64_t layer
             shared_expert_sigmoid_scale_fp32(b.shared, scalar, g.n_embd, stream);
             return true;
         }
-        if (!w_sgate->exl3->run(x, g.n_embd, gate, g.n_ff, 1, stream, err) ||
-            !w_sup->exl3->run(x, g.n_embd, up, g.n_ff, 1, stream, err)) return false;
+        if (!shared_gate_up_runs(*w_sgate->exl3, *w_sup->exl3, x, gate, up, g.n_embd, g.n_ff, stream,
+                                 strata::kernels::exl3::GemvOptions{}, err))
+            return false;
         shared_expert_swiglu_fp32(gate, up, g.n_ff, stream);
         if (!w_sdown->exl3->run(gate, g.n_ff, b.shared, g.n_embd, 1, stream, err) ||
             !w_ginp->exl3->run(x, g.n_embd, scalar, 1, 1, stream, err)) return false;

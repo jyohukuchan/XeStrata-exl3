@@ -578,6 +578,57 @@ changes the logits. Compared at the same resident count pinned with
 `STRATA_EXL3_DEVICE_CACHE_MIB` (14638 resident), before, after, and the fusions off and on all
 agree bit for bit.
 
+**The resident expert flow captured into a graph, and the small launches of the shared expert and
+the GDN folded (the launch count 2848 to 2656).** A launch boundary is dispatch cost, so this
+takes the launches themselves down in three places:
+
+1. **The resident expert flow becomes a graph per layer.** With a fully resident cache the expert
+   flow (the clear of the expert rows, the device route plan's kernel and the grouped experts'
+   five kernels) is the same shape every token, and eight of its launches ran between the pre and
+   post graphs at the boundaries outside a graph (11 to 27 us). They are captured per layer as
+   they are submitted - the same pointers passed as arguments every time - and replayed like the
+   pre and post graphs (the plan's layer is a property of the graph it is captured into, so one
+   graph per layer). The host issues one graph launch instead of the flow's submissions, and the
+   launches' boundaries are a graph replay's. The doorbell probe's event record is dropped on the
+   resident path, where nothing waits on it. `STRATA_EXL3_RESIDENT_GRAPH=0` keeps the old
+   submissions (the comparison path).
+2. **The shared expert's two input transforms in one launch.** The gate/up input-basis transforms
+   read the same x, so they run as one kernel in the reference's `had_r_128_dual` shape: one work
+   group holds one 128-wide block's two transforms and computes each against its own view's `suh`
+   exactly what its single kernel computes, in the same order - the values are the two kernels'
+   own, 48 launches fewer over the 48 MoE layers.
+3. **The GDN layer's small launches folded (36 layers).** The conv, its copy into the activation
+   buffer and the SiLU are one launch (`gdn_conv_silu`; the conv's accumulation and the conv
+   state's slide keep `gdn_conv_step`'s order and the activation is `silu_inplace`'s expression).
+   `gdn_beta_gate` and `gdn_gate` are one launch (`gdn_gate_beta`; the reference folds the two
+   epilogues the same way). The q prescale by 1/sqrt(S) rides the q l2 norm's launch (the scale's
+   span is q alone, k is untouched), and `scale_inplace`'s launch is gone. `STRATA_EXL3_FUSED_TAILS=0`
+   returns item 2 and the fused transform tails to their separate kernels.
+
+Measured on the two V620s with the 512-token prompt, 32 decode tokens and
+`STRATA_EXL3_FLASH_TIMING=1`:
+
+| state | decode tok/s | per token | pre | expert_prep | post | bridge | head | emb/ple |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| before | 14.96 | 66.29 ms | 0.79 | 1.88 | 0.35 | 30.27 | 32.09 | 0.93 |
+| after | 15.63 | 63.72 ms | 0.30 | 0.28 | 0.26 | 29.75 | 32.17 | 0.95 |
+
+In the kernel trace of one decode token (both devices together, the region a token occupies
+between two head launches) the launch count falls from 2848 to 2656 and the gaps around the
+kernels from 21.77 to 18.68 ms. The 192 launches gone are the two input transforms merged
+(96 to 48), the conv folded (three launches to one, 36 layers), gate/beta (two to one) and the
+prescale (the two norms and a scale to the two norms); the kernel total stays inside the
+run-to-run wobble (+-5%) at 52.4 to 53.2 ms. The expert flow's eight launches are now a graph
+replay, and the layer's host submission is one launch (the expert_prep host time 1.88 to
+0.28 ms). The generated tokens are unchanged.
+
+The values do not change: the probe SHA256 without the device cache stays the reference
+`1fe719aca5e9...` on one and two stages. The device-cache dumps agree bit for bit before and
+after, both at a resident count pinned with `STRATA_EXL3_DEVICE_CACHE_MIB` (14638 resident on one
+stage, 7319 on each of two) and where the counts stand as they are (partially resident one stage,
+fully resident two). The fully resident two-stage run is where the resident expert flow runs from
+this graph.
+
 ## Qwen3.5 MoE MTP integration
 
 `--spec 2` or greater loads `mtp.fc`, three norms, and `mtp.layers.0` attention, routers and shared/routed experts
