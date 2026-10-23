@@ -419,6 +419,11 @@ bool Exl3Dense::prepare_stream(void* stream, std::string& err) {
 
 bool Exl3Dense::run(const float* x, int64_t ldx, float* y, int64_t ldy, int64_t rows, void* stream,
                     std::string& err) {
+    return run(x, ldx, y, ldy, rows, stream, strata::kernels::exl3::GemvOptions{}, err);
+}
+
+bool Exl3Dense::run(const float* x, int64_t ldx, float* y, int64_t ldy, int64_t rows, void* stream,
+                    const strata::kernels::exl3::GemvOptions& options, std::string& err) {
     if (runtime_ == nullptr || (raw_ ? raw_view_.data == nullptr : view_.trellis == nullptr)) {
         err = "exl3 dense: the owner is not loaded";
         return false;
@@ -466,13 +471,13 @@ bool Exl3Dense::run(const float* x, int64_t ldx, float* y, int64_t ldy, int64_t 
             strata::kernels::raw::linear_fp32(queue, raw_view_, x, ldx, y, ldy, rows);
             return true;
         }
-        const size_t needed = strata::kernels::exl3::exl3_gemm_scratch_elements(view_, rows);
+        const size_t needed = strata::kernels::exl3::exl3_gemm_scratch_elements(view_, rows, options);
         if (needed > scratch_elements_) {
             err = "exl3 dense: caller scratch is too small for this row count";
             return false;
         }
         strata::kernels::exl3::exl3_gemm_fp32(queue, view_, x, ldx, y, ldy, rows,
-                                              static_cast<float*>(prepared->data), scratch_elements_);
+                                              static_cast<float*>(prepared->data), scratch_elements_, options);
         return true;
     } catch (const std::exception& e) {
         err = std::string("exl3 dense: ") + e.what();

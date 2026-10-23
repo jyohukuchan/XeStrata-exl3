@@ -490,6 +490,48 @@ lm_head 1.23 ms）も同じままで、カーネルの外の隙間は 24.1 ms �
 segment に落ちて1 発 114 µs が 343 µs になり、戻した。trellis dot は参照実装より語を多く取りに
 行く（8 値の語は散っているため）ので、ここが次の一手の候補である。
 
+**dot の間を流れる段の融合（カーネル数を 3160 から 2848 に）。** カーネルの外の隙間は 1 起動
+あたりの dispatch の費用で、空のカーネルを同じ replay に入れると 1 境界 7.6 µs（カーネル自体は
+2.6 µs、1 本の in-order stream、同じ環境で測定）かかる。ホストの queue 提出の費用ではないので、
+減らせるのは提出の数すなわちカーネルの数である。そこで、dot と dot の間で値をそのまま受け渡す
+段を、次の3か所で1起動にまとめた:
+
+1. **expert の流れ**（7 → 5 カーネル/層）: gate/up dot の出力 basis 変換 + bias、活性化
+   （`(g / (1 + exp(-g))) * u`）、down 射影の入力 basis 変換は、128 幅の block を 1 work group が
+   持ち、レジスタの上で順に流せる。参照実装の fused kernel A の tail と同じ形。fill されない
+   block の端の行は、分けた3カーネルが activation の plane に読み返す古い値と同じものを読み返す。
+2. **shared expert**（10 → 7 カーネル/層）: gate/up dot の2つの出力 basis 変換 + SwiGLU +
+   down 射影の入力 basis 変換を1起動に。
+3. **GDN**（36 層、7 → 5 カーネル/層）: z dot の出力 basis 変換、`gdn_out_norm`、ssm_out 射影の
+   入力 basis 変換を1起動に。norm の和は D（FP64 がある device では double）で同じ warp sum と
+   同じ順に積む。1 work group が1つの GDN head（state 128）に対応するので、state が 128 でない
+   モデルは従来の3カーネルを使う。
+
+いずれも段ごとに元のカーネルと同じ式を同じ順に計算するだけ（bias を dot が足す形を tail が足す形
+に移すのも、足す相手と順序は同じ）なので、値は bit 一致。`STRATA_EXL3_FUSED_TAILS=0` で分けた
+カーネルに戻る。
+
+計測（V620 2 枚、512 トークン prompt、32 トークン decode、`STRATA_EXL3_FLASH_TIMING=1`）:
+
+| 状態 | decode tok/s | 1 トークン | pre | expert_prep | post | bridge | head | emb/ple |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 適用前 | 14.63 | 67.81 ms | 0.75 | 2.50 | 0.35 | 30.44 | 32.83 | 0.92 |
+| 適用後 | 15.12 | 65.59 ms | 0.69 | 1.79 | 0.30 | 29.58 | 32.26 | 0.93 |
+
+カーネル trace（1 decode トークン、2 device 合計、1 トークンを head の起動の間で切った区間）では
+起動数が 3160 から 2848 に減り、カーネルの外の隙間が 23.8 ms から 21.7 ms に減った。融合した
+3 起動のカーネル時間は置き換えた 1.9 ms より短い 1.4 ms だが、dot などの対照の合計は run 間の
+揺れ（±5%）の中にあり、カーネルの合計は 52.4 ms から 53.5 ms に見える。起動の費用は graph replay
+の中（1 境界 7.8 µs）より外（11〜27 µs、expert の流れの 8 カーネルはここで走る）の方が高く、
+次の一手はこの expert の流れを graph に収めることである。
+
+値は変わらない: device cache なしの probe SHA256 は単一 stage・2 stage とも参照値のままで、
+生成 token も前後で同じ。device cache ありの部分常駐では常駐数そのものが前後で 2 expert ずれ
+（fused graph の node が少ないぶん起動時の空き VRAM が変わり、常駐の締め切りが動く）、
+GPU の FP32 と CPU の FP64 で計算される expert の分担が変わるので logits が変わる。常駐数を
+`STRATA_EXL3_DEVICE_CACHE_MIB` で揃えた比較（14638 常駐）では、この一手の前・後、融合の off・on
+の4通りがすべて bit 一致した。
+
 ## Qwen3.5 MoE の MTP 接続
 
 `--spec 2` 以上は archive の `mtp.fc`、三つの norm、`mtp.layers.0` の attention・router・shared/routed

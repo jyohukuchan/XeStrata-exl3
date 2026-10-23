@@ -7,10 +7,12 @@
 #include "strata/kernels/exl3_grouped.hpp"
 
 #include "strata/kernels/bf16_bits.hpp"
+#include "strata/kernels/exl3_fused.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "cuda_intrinsics.hpp"
 #include "exl3_cb2.hpp"
 #include "exl3_funnel.hpp"
+#include "exl3_hadamard.hpp"
 #include "exl3_word_tile.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_exl3_grouped
 #include "strata/kernels/device_arch_tag.hpp"
@@ -263,46 +265,9 @@ inline int hadamard_sign(int row, int col) {
 
 bool grouped_cooperative_capability(const sycl::queue& queue);
 
-inline void fwht128_registers(const sycl::sub_group& sg, int lane, float& a0, float& a1, float& a2, float& a3) {
-    for (int step = 1; step < 32; step <<= 1) {
-        const float p0 = sycl::permute_group_by_xor(sg, a0, step);
-        const float p1 = sycl::permute_group_by_xor(sg, a1, step);
-        const float p2 = sycl::permute_group_by_xor(sg, a2, step);
-        const float p3 = sycl::permute_group_by_xor(sg, a3, step);
-        a0 = (lane & step) ? p0 - a0 : a0 + p0;
-        a1 = (lane & step) ? p1 - a1 : a1 + p1;
-        a2 = (lane & step) ? p2 - a2 : a2 + p2;
-        a3 = (lane & step) ? p3 - a3 : a3 + p3;
-    }
-    const float b0 = a0 + a1, b1 = a0 - a1, b2 = a2 + a3, b3 = a2 - a3;
-    a0 = b0 + b2; a1 = b1 + b3; a2 = b0 - b2; a3 = b1 - b3;
-}
-
-inline void fwht128_input(const sycl::sub_group& sg, int lane, const float* input, const uint16_t* suh,
-                          int64_t block, float& a0, float& a1, float& a2, float& a3) {
-    a0 = input[block + lane] * f32_from_f16(suh[block + lane]);
-    a1 = input[block + lane + 32] * f32_from_f16(suh[block + lane + 32]);
-    a2 = input[block + lane + 64] * f32_from_f16(suh[block + lane + 64]);
-    a3 = input[block + lane + 96] * f32_from_f16(suh[block + lane + 96]);
-    fwht128_registers(sg, lane, a0, a1, a2, a3);
-    a0 *= kHadamardScale; a1 *= kHadamardScale; a2 *= kHadamardScale; a3 *= kHadamardScale;
-}
-
-inline void fwht128_output(const sycl::sub_group& sg, int lane, const float* dot, const uint16_t* svh,
-                           const uint16_t* bias, int64_t block, bool add_bias, float& a0, float& a1, float& a2,
-                           float& a3) {
-    a0 = dot[block + lane]; a1 = dot[block + lane + 32];
-    a2 = dot[block + lane + 64]; a3 = dot[block + lane + 96];
-    fwht128_registers(sg, lane, a0, a1, a2, a3);
-    a0 *= kHadamardScale * f32_from_f16(svh[block + lane]);
-    a1 *= kHadamardScale * f32_from_f16(svh[block + lane + 32]);
-    a2 *= kHadamardScale * f32_from_f16(svh[block + lane + 64]);
-    a3 *= kHadamardScale * f32_from_f16(svh[block + lane + 96]);
-    if (add_bias && bias != nullptr) {
-        a0 += f32_from_f16(bias[block + lane]); a1 += f32_from_f16(bias[block + lane + 32]);
-        a2 += f32_from_f16(bias[block + lane + 64]); a3 += f32_from_f16(bias[block + lane + 96]);
-    }
-}
+using had::fwht128_input;
+using had::fwht128_input_registers;
+using had::fwht128_output;
 
 inline bool span_ok(const ExpertComponentLayout& component, uint64_t total, uint64_t expected, bool required) {
     if (component.bytes == 0) return !required;
@@ -907,6 +872,105 @@ sycl::event submit_down_input_cooperative(sycl::queue& queue, const GroupedPlan&
     });
 }
 
+// The gate/up post, the activation and the down input as one launch.  The three stages pass their
+// values straight on inside one 128-wide block, so the block's work-group runs them in order on
+// registers; every stage computes what its separate kernel computes, in the same order, and the
+// two launches between them go away.  A block the entry does not fill carries the same stale rows
+// the separate chain reads back out of the activation plane, so even a partially filled block
+// produces the values the separate kernels produced.
+sycl::event submit_gate_up_act_down_input_cooperative(sycl::queue& queue, const GroupedPlan& plan, float* scratch,
+                                                      int64_t plane, GroupedOptions options,
+                                                      const std::vector<sycl::event>& deps) {
+    const size_t blocks = (static_cast<size_t>(plan.max_ff) + 127u) / 128u;
+    return queue.submit([&](sycl::handler& h) {
+        if (!deps.empty()) h.depends_on(deps);
+        h.parallel_for(sycl::nd_range<1>(static_cast<size_t>(plan.max_entries) * blocks * 32, 32),
+                       [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+            const auto sg = item.get_sub_group();
+            const int lane = (int) sg.get_local_id()[0];
+            const size_t group = (size_t) item.get_group_linear_id();
+            const int32_t entry = static_cast<int32_t>(group / blocks);
+            const int64_t block = static_cast<int64_t>(group % blocks) * 128;
+            const ResolvedEntry resolved = resolve_entry(plan, entry);
+            if (!resolved.valid || block >= resolved.ff) return;
+            float* gd = scratch + 2 * (size_t) plan.max_entries * (size_t) plane +
+                        (size_t) entry * (size_t) plane;
+            float* ud = scratch + 3 * (size_t) plan.max_entries * (size_t) plane +
+                        (size_t) entry * (size_t) plane;
+            float* go = scratch + 4 * (size_t) plan.max_entries * (size_t) plane +
+                        (size_t) entry * (size_t) plane;
+            float* uo = scratch + 5 * (size_t) plan.max_entries * (size_t) plane +
+                        (size_t) entry * (size_t) plane;
+            float* down_in = scratch + (size_t) entry * (size_t) plane;
+            const int64_t c0 = block + lane, c1 = c0 + 32, c2 = c0 + 64, c3 = c0 + 96;
+            const bool gh = options.gate.output_hadamard && resolved.gate.svh;
+            const bool uh = options.up.output_hadamard && resolved.up.svh;
+            float g0 = 0, g1 = 0, g2 = 0, g3 = 0;
+            float u0 = 0, u1 = 0, u2 = 0, u3 = 0;
+            if (gh) {
+                fwht128_output(sg, lane, gd, resolved.gate.svh, resolved.gate.bias, block,
+                               options.gate.add_bias, g0, g1, g2, g3);
+            } else {
+                if (c0 < resolved.ff) g0 = gd[c0]; if (c1 < resolved.ff) g1 = gd[c1];
+                if (c2 < resolved.ff) g2 = gd[c2]; if (c3 < resolved.ff) g3 = gd[c3];
+            }
+            if (uh) {
+                fwht128_output(sg, lane, ud, resolved.up.svh, resolved.up.bias, block,
+                               options.up.add_bias, u0, u1, u2, u3);
+            } else {
+                if (c0 < resolved.ff) u0 = ud[c0]; if (c1 < resolved.ff) u1 = ud[c1];
+                if (c2 < resolved.ff) u2 = ud[c2]; if (c3 < resolved.ff) u3 = ud[c3];
+            }
+            if (options.gate.add_bias && !gh) {
+                if (resolved.gate.is_packed() && resolved.gate.bias) {
+                    if (c0 < resolved.ff) g0 += f32_from_f16(resolved.gate.bias[c0]);
+                    if (c1 < resolved.ff) g1 += f32_from_f16(resolved.gate.bias[c1]);
+                    if (c2 < resolved.ff) g2 += f32_from_f16(resolved.gate.bias[c2]);
+                    if (c3 < resolved.ff) g3 += f32_from_f16(resolved.gate.bias[c3]);
+                } else if (resolved.gate.is_raw() && resolved.gate.raw.bias) {
+                    if (c0 < resolved.ff) g0 += raw_bias_value(resolved.gate.raw, (size_t) c0);
+                    if (c1 < resolved.ff) g1 += raw_bias_value(resolved.gate.raw, (size_t) c1);
+                    if (c2 < resolved.ff) g2 += raw_bias_value(resolved.gate.raw, (size_t) c2);
+                    if (c3 < resolved.ff) g3 += raw_bias_value(resolved.gate.raw, (size_t) c3);
+                }
+            }
+            if (options.up.add_bias && !uh) {
+                if (resolved.up.is_packed() && resolved.up.bias) {
+                    if (c0 < resolved.ff) u0 += f32_from_f16(resolved.up.bias[c0]);
+                    if (c1 < resolved.ff) u1 += f32_from_f16(resolved.up.bias[c1]);
+                    if (c2 < resolved.ff) u2 += f32_from_f16(resolved.up.bias[c2]);
+                    if (c3 < resolved.ff) u3 += f32_from_f16(resolved.up.bias[c3]);
+                } else if (resolved.up.is_raw() && resolved.up.raw.bias) {
+                    if (c0 < resolved.ff) u0 += raw_bias_value(resolved.up.raw, (size_t) c0);
+                    if (c1 < resolved.ff) u1 += raw_bias_value(resolved.up.raw, (size_t) c1);
+                    if (c2 < resolved.ff) u2 += raw_bias_value(resolved.up.raw, (size_t) c2);
+                    if (c3 < resolved.ff) u3 += raw_bias_value(resolved.up.raw, (size_t) c3);
+                }
+            }
+            // The activation, in the expression the separate kernel stores; both planes keep the
+            // writes the two separate kernels leave behind.
+            float a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+            if (c0 < resolved.ff) { a0 = (g0 / (1.0f + sycl::exp(-g0))) * u0; go[c0] = a0; uo[c0] = u0; }
+            if (c1 < resolved.ff) { a1 = (g1 / (1.0f + sycl::exp(-g1))) * u1; go[c1] = a1; uo[c1] = u1; }
+            if (c2 < resolved.ff) { a2 = (g2 / (1.0f + sycl::exp(-g2))) * u2; go[c2] = a2; uo[c2] = u2; }
+            if (c3 < resolved.ff) { a3 = (g3 / (1.0f + sycl::exp(-g3))) * u3; go[c3] = a3; uo[c3] = u3; }
+            // The down input transform reads the activation plane for the WHOLE block, which is
+            // what mixes a partially filled block's stale rows in; read the same rows back.
+            if (c0 >= resolved.ff) a0 = go[c0];
+            if (c1 >= resolved.ff) a1 = go[c1];
+            if (c2 >= resolved.ff) a2 = go[c2];
+            if (c3 >= resolved.ff) a3 = go[c3];
+            if (options.down.input_hadamard && resolved.down.suh) {
+                fwht128_input_registers(sg, lane, resolved.down.suh, block, a0, a1, a2, a3);
+            }
+            if (c0 < resolved.ff) down_in[c0] = a0;
+            if (c1 < resolved.ff) down_in[c1] = a1;
+            if (c2 < resolved.ff) down_in[c2] = a2;
+            if (c3 < resolved.ff) down_in[c3] = a3;
+        });
+    });
+}
+
 sycl::event submit_down_post_cooperative(sycl::queue& queue, const GroupedPlan& plan, float* scratch, int64_t plane,
                                          int64_t ldy, float* y, GroupedOptions options,
                                          const std::vector<sycl::event>& deps) {
@@ -1016,6 +1080,15 @@ sycl::event exl3_grouped_fp32(sycl::queue& queue, const GroupedPlan& plan, const
         else
             gate_up_dot = submit_gate_up_dot<false>(queue, plan, scratch, plane, {gate_up_input});
     }
+    // The gate/up post, the activation and the down input pass their values straight on inside one
+    // 128-wide block: where the device has the SG32 form and the caller wants it
+    // (`STRATA_EXL3_FUSED_TAILS=0` keeps the three for a like-for-like comparison), the fused tail
+    // runs the three as one launch.
+    sycl::event down_input;
+    if (grouped_cooperative_capability(queue) && exl3_fused_tail_enabled()) {
+        down_input =
+            submit_gate_up_act_down_input_cooperative(queue, plan, scratch, plane, options, {gate_up_dot});
+    } else {
     const sycl::event gate_up_post = submit_gate_up_post(queue, plan, scratch, plane, options, {gate_up_dot});
     const sycl::event activation = queue.submit([&](sycl::handler& h) {
         h.depends_on(gate_up_post);
@@ -1033,7 +1106,6 @@ sycl::event exl3_grouped_fp32(sycl::queue& queue, const GroupedPlan& plan, const
             gate_values[col] = (g / (1.0f + sycl::exp(-g))) * up_values[col];
         });
     });
-    sycl::event down_input;
     if (grouped_cooperative_capability(queue)) {
         down_input = submit_down_input_cooperative(queue, plan, scratch, plane, options, {activation});
     } else {
@@ -1061,6 +1133,7 @@ sycl::event exl3_grouped_fp32(sycl::queue& queue, const GroupedPlan& plan, const
             }
         });
         });
+    }
     }
     sycl::event down_dot;
     if (grouped_cooperative_capability(queue)) {

@@ -11,6 +11,7 @@
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/elementwise.hpp"
+#include "strata/kernels/exl3_fused.hpp"
 #include "strata/kernels/gdn.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/kv_q4.hpp"
@@ -342,6 +343,33 @@ st_begin(layer, 12, stream);
 // it live at the end of the alpha/beta/gate line above, because the gate and the step are one sequence.
 // ---- 7. z, then y = rms_norm(o) * ssm_norm * sigmoid(z).  SIGMOID, not SiLU.
 // qkv's native quantize of `mixed` is still in the shared q8_1 scratch: nothing native ran in between.
+// The z dot's output transform, the output norm and the ssm_out input transform pass their values
+// straight on to the next stage, so the fused tail runs the three as one launch and the dots run
+// without the stages it owns - the same values, three launches fewer.  One tail block is one GDN
+// head, which wants a 128-wide state; a model with another state keeps the separate kernels.
+const strata::kernels::exl3::MatrixView* z_exl3 = w_gate->exl3 ? w_gate->exl3->packed() : nullptr;
+const strata::kernels::exl3::MatrixView* out_exl3 = w_out->exl3 ? w_out->exl3->packed() : nullptr;
+const bool fused_tail = !fused_gdn && !native_gdn_enabled() && z_exl3 != nullptr && out_exl3 != nullptr &&
+                        g.ssm_state_size == 128 && g.ssm_value_dim % 128 == 0 && g.n_embd % 128 == 0 &&
+                        strata::kernels::exl3::exl3_fused_tail_enabled() &&
+                        strata::kernels::exl3::exl3_fused_tail_supported(stream);
+if (fused_tail) {
+    strata::kernels::exl3::GemvOptions tail_stages{};
+    tail_stages.output_hadamard = false;
+    tail_stages.add_bias = false;
+    if (!w_gate->exl3->run(mixed, g.n_embd, b.z, g.ssm_value_dim, 1, stream, tail_stages, err)) return false;
+    try {
+        strata::kernels::exl3::exl3_fused_gdn_tail_fp32(*z_exl3, *out_exl3, b.o, b.z, ssm_norm, b.y,
+                                                        (int64_t) g.ssm_v_heads, gdn_silu_gate(), RMS_EPS, stream);
+    } catch (const std::exception& error) { err = v.name("gdn_out_norm") + ": " + error.what(); return false; }
+    st_end(layer, 14, stream);
+    st_begin(layer, 15, stream);
+    strata::kernels::exl3::GemvOptions out_stages{};
+    out_stages.input_hadamard = false;
+    if (!w_out->exl3->run(b.y, g.ssm_value_dim, out, g.n_embd, 1, stream, out_stages, err)) return false;
+    st_end(layer, 15, stream);
+    return true;
+}
 if (!gemv_quantized(*w_gate, p_gate, f_gate, b.x_q8_0, b.x_q8k, b.z, g.n_embd, g.ssm_value_dim, v.name("attn_gate.weight"), stream, err, mixed,
                     w_qkv->native_data != nullptr && w_gate->native_data != nullptr)) return false;
 try {
@@ -431,6 +459,38 @@ bool moe_shared(const WeightTable& tables, const ModelGeometry& g, int64_t layer
         float* gate = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(b.sh_scratch));
         float* up = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(b.sh_scratch) + a);
         float* scalar = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(b.sh_scratch) + a * 2 + q0 + qk);
+        // The gate/up dots' output transforms, the SwiGLU and the down projection's input transform
+        // pass their values straight on to the next stage, so the fused tail runs the three as one
+        // launch and the dots run without the stages it owns - the same values, three launches
+        // fewer.  One tail block is one 128-wide run of the SwiGLU; another width keeps the
+        // separate kernels.
+        const strata::kernels::exl3::MatrixView* gate_view = w_sgate->exl3->packed();
+        const strata::kernels::exl3::MatrixView* up_view = w_sup->exl3->packed();
+        const strata::kernels::exl3::MatrixView* down_view = w_sdown->exl3->packed();
+        const bool fused_tail = gate_view != nullptr && up_view != nullptr && down_view != nullptr &&
+                                g.n_ff % 128 == 0 && g.n_embd % 128 == 0 &&
+                                strata::kernels::exl3::exl3_fused_tail_enabled() &&
+                                strata::kernels::exl3::exl3_fused_tail_supported(stream);
+        if (fused_tail) {
+            strata::kernels::exl3::GemvOptions tail_stages{};
+            tail_stages.output_hadamard = false;
+            tail_stages.add_bias = false;
+            if (!w_sgate->exl3->run(x, g.n_embd, gate, g.n_ff, 1, stream, tail_stages, err) ||
+                !w_sup->exl3->run(x, g.n_embd, up, g.n_ff, 1, stream, tail_stages, err)) return false;
+            try {
+                strata::kernels::exl3::exl3_fused_swiglu_tail_fp32(*gate_view, *up_view, *down_view, gate, up, gate,
+                                                                   1, stream);
+            } catch (const std::exception& error) {
+                err = v.name("shared_expert") + ": " + error.what();
+                return false;
+            }
+            strata::kernels::exl3::GemvOptions down_stages{};
+            down_stages.input_hadamard = false;
+            if (!w_sdown->exl3->run(gate, g.n_ff, b.shared, g.n_embd, 1, stream, down_stages, err) ||
+                !w_ginp->exl3->run(x, g.n_embd, scalar, 1, 1, stream, err)) return false;
+            shared_expert_sigmoid_scale_fp32(b.shared, scalar, g.n_embd, stream);
+            return true;
+        }
         if (!w_sgate->exl3->run(x, g.n_embd, gate, g.n_ff, 1, stream, err) ||
             !w_sup->exl3->run(x, g.n_embd, up, g.n_ff, 1, stream, err)) return false;
         shared_expert_swiglu_fp32(gate, up, g.n_ff, stream);
