@@ -163,6 +163,29 @@ EXL3_INTDOT_AVX2 inline void accumulate_rows(const __m256i (&packed)[Bits], cons
     }
 }
 
+// The scale scan over the input: the largest magnitude and the finiteness of
+// every value, at eight values an iteration.  Positive IEEE bits are ordered
+// like their finite values, so the largest masked bit pattern is the
+// magnitude's own; a pattern above the largest finite float is an infinity or
+// a NaN.  This scan also sees tiny/non-finite inputs when ambient DAZ/FTZ is
+// enabled.  The K of a matrix the path accepts is a multiple of 128, so the
+// steps cover it without a tail.
+EXL3_INTDOT_AVX2 bool scan_input(const float* input, size_t k, uint32_t& amax_bits) {
+    const __m256i abs_mask = _mm256_set1_epi32(0x7fffffff);
+    const __m256i largest_finite = _mm256_set1_epi32(0x7f7fffff);
+    __m256i maxima = _mm256_setzero_si256();
+    for (size_t i = 0; i < k; i += 8) {
+        const __m256i value_bits = _mm256_and_si256(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(input + i)),
+                                                    abs_mask);
+        if (_mm256_movemask_epi8(_mm256_cmpgt_epi32(value_bits, largest_finite)) != 0) return false;
+        maxima = _mm256_max_epi32(maxima, value_bits);
+    }
+    const __m128i half = _mm_max_epi32(_mm256_castsi256_si128(maxima), _mm256_extracti128_si256(maxima, 1));
+    const __m128i quarter = _mm_max_epi32(half, _mm_shuffle_epi32(half, 0x4e));
+    amax_bits = static_cast<uint32_t>(_mm_cvtsi128_si32(_mm_max_epi32(quarter, _mm_shuffle_epi32(quarter, 0xb1))));
+    return true;
+}
+
 EXL3_INTDOT_AVX2 void quantize_input(const float* input, size_t k, int32_t* duplicated,
                                      float q, int32_t& sum) {
     const __m256 reciprocal = _mm256_set1_ps(1.0f / q);
@@ -379,6 +402,24 @@ EXL3_INTDOT_AVX512 inline void accumulate_rows512(const __m256i (&packed)[Bits],
     }
 }
 
+// The same scan at 512 bits, sixteen values an iteration: the same integer
+// maximum and the same finiteness, so the same scale as the AVX2 scan.
+EXL3_INTDOT_AVX512 bool scan_input_avx512(const float* input, size_t k, uint32_t& amax_bits) {
+    const __m512i abs_mask = _mm512_set1_epi32(0x7fffffff);
+    const __m512i largest_finite = _mm512_set1_epi32(0x7f7fffff);
+    __m512i maxima = _mm512_setzero_si512();
+    for (size_t i = 0; i < k; i += 16) {
+        const __m512i value_bits = _mm512_and_si512(_mm512_loadu_si512(input + i), abs_mask);
+        if (_mm512_cmpgt_epi32_mask(value_bits, largest_finite) != 0) return false;
+        maxima = _mm512_max_epi32(maxima, value_bits);
+    }
+    const __m256i half = _mm256_max_epi32(_mm512_castsi512_si256(maxima), _mm512_extracti64x4_epi64(maxima, 1));
+    const __m128i quarter = _mm_max_epi32(_mm256_castsi256_si128(half), _mm256_extracti128_si256(half, 1));
+    const __m128i eighth = _mm_max_epi32(quarter, _mm_shuffle_epi32(quarter, 0x4e));
+    amax_bits = static_cast<uint32_t>(_mm_cvtsi128_si32(_mm_max_epi32(eighth, _mm_shuffle_epi32(eighth, 0xb1))));
+    return true;
+}
+
 // The activation quantized the same way as in the AVX2 kernel.  The K of a
 // matrix the path accepts is a multiple of 128, so the sixteen-wide steps
 // cover it without a tail.
@@ -527,16 +568,13 @@ bool prepare_mul1_input(const MatrixView& matrix, const float* input_basis, int3
 #if EXL3_INTDOT_AVAILABLE
     const Mul1Isa kernel = resolve_isa(isa);
     if (!isa_available(kernel)) return false;
-    // Positive IEEE bits are ordered like their finite values. This scan also
-    // sees tiny/non-finite inputs when ambient DAZ/FTZ is enabled.
+    // The scale scan over the input: the largest magnitude and the
+    // finiteness of every value, in one vector pass over the input.
     uint32_t amax_bits = 0;
-    for (size_t i = 0; i < static_cast<size_t>(matrix.k); ++i) {
-        uint32_t value_bits;
-        std::memcpy(&value_bits, input_basis + i, sizeof(value_bits));
-        value_bits &= 0x7fffffffu;
-        if (value_bits >= 0x7f800000u) return false;
-        amax_bits = (std::max)(amax_bits, value_bits);
-    }
+    const bool finite = kernel == Mul1Isa::avx512
+                            ? scan_input_avx512(input_basis, static_cast<size_t>(matrix.k), amax_bits)
+                            : scan_input(input_basis, static_cast<size_t>(matrix.k), amax_bits);
+    if (!finite) return false;
     float amax;
     std::memcpy(&amax, &amax_bits, sizeof(amax));
     const float q = amax_bits != 0 ? amax / 127.0f : 1.0f;

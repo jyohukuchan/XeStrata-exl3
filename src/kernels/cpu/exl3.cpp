@@ -687,7 +687,10 @@ void linear_dot_range_dispatch(const MatrixView& matrix, const float* input_basi
     }
 }
 
-void hadamard_normalized(float* values) {
+// The scalar H128 transform: the reference the vector stages reproduce value
+// for value.  Every value is one add or one subtract of the same two operands
+// the vector form uses, so the bits are the same.
+void hadamard_normalized_scalar(float* values) {
     for (int width = 1; width < kHadamardSide; width *= 2) {
         for (int base = 0; base < kHadamardSide; base += 2 * width) {
             for (int i = 0; i < width; ++i) {
@@ -702,6 +705,74 @@ void hadamard_normalized(float* values) {
         volatile float scaled = values[i] * kHadamardScale;
         values[i] = scaled;
     }
+}
+
+#if EXL3_HAVE_TARGET_AVX2
+// The H128 transform at eight floats an instruction.  The butterflies of a
+// stage are disjoint pairs, so a register may hold any eight of them and the
+// pairs' two values are put side by side with one shuffle: a stage of width
+// one, two or four has its partners inside the register's own 128-bit lanes,
+// a wider stage has them in the other half or in the other register.  The add
+// and the subtract are the scalar stage's own two operations on the same two
+// operands, and the scale at the end is one multiply per value, so every
+// value keeps its bit pattern.
+EXL3_TARGET_AVX2_F16C void hadamard_normalized_avx2(float* values) {
+    for (int width = 1; width < kHadamardSide; width *= 2) {
+        if (width < 8) {
+            // The stage's blocks tile the transform contiguously and a
+            // register covers whole blocks (four of width one, two of width
+            // two, one of width four), so the walk is over the register
+            // positions: the partners swap positions inside the register and
+            // the sums and the differences are blended back into place.
+            for (int off = 0; off < kHadamardSide; off += 8) {
+                const __m256 v = _mm256_loadu_ps(values + off);
+                const __m256 partners = width == 1 ? _mm256_permute_ps(v, 0xb1)
+                                        : width == 2 ? _mm256_permute_ps(v, 0x4e)
+                                                     : _mm256_permute2f128_ps(v, v, 0x01);
+                const __m256 sum = _mm256_add_ps(v, partners);
+                // The differences come out with their signs in the slots the
+                // shuffle moved the partners to; subtracting the other way
+                // round puts each difference in its own value's slot, and the
+                // blend or the lane swap takes it from there.
+                const __m256 difference = _mm256_sub_ps(partners, v);
+                // width 1 pairs (0,1),(2,3) per lane; width 2 pairs (0,2),(1,3)
+                // per lane; width 4 pairs the register's two halves.
+                const __m256 out = width == 1 ? _mm256_blend_ps(sum, difference, 0xaa)
+                                   : width == 2 ? _mm256_blend_ps(sum, difference, 0xcc)
+                                                : _mm256_permute2f128_ps(sum, difference, 0x30);
+                _mm256_storeu_ps(values + off, out);
+            }
+            continue;
+        }
+        for (int base = 0; base < kHadamardSide; base += 2 * width) {
+            for (int i = 0; i < width; i += 8) {
+                const __m256 left = _mm256_loadu_ps(values + base + i);
+                const __m256 right = _mm256_loadu_ps(values + base + width + i);
+                _mm256_storeu_ps(values + base + i, _mm256_add_ps(left, right));
+                _mm256_storeu_ps(values + base + width + i, _mm256_sub_ps(left, right));
+            }
+        }
+    }
+    const __m256 scale = _mm256_set1_ps(kHadamardScale);
+    for (int i = 0; i < kHadamardSide; i += 8) {
+        const __m256 v = _mm256_loadu_ps(values + i);
+        _mm256_storeu_ps(values + i, _mm256_mul_ps(v, scale));
+    }
+}
+#endif
+
+void hadamard_normalized(float* values) {
+#if EXL3_HAVE_TARGET_AVX2
+    static const bool use_avx2 = [] {
+        const char* const force_generic = std::getenv("STRATA_NO_EXL3_AVX2");
+        return !(force_generic != nullptr && force_generic[0] == '1') && strata::kernels::cpu::cpu_avx2_ok();
+    }();
+    if (use_avx2) {
+        hadamard_normalized_avx2(values);
+        return;
+    }
+#endif
+    hadamard_normalized_scalar(values);
 }
 
 Status validate_linear(const MatrixView& matrix, const float* x, float* y) {
