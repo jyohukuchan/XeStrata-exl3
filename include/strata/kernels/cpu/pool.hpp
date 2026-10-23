@@ -286,7 +286,13 @@ private:
     // (kIdle, kWaitParked, kWaitDone, or its job), printed by the serve watchdog through `diag`
     static constexpr int32_t kParked = -1, kSleeping = -2, kBetween = -3, kIdle = -10, kWaitParked = -11,
                              kWaitDone = -12;
-    std::unique_ptr<std::atomic<int32_t>[]> wstate_;
+    /// One worker's diagnostic state.  A cache line of its own: the state is
+    /// written on every task claim, and neighbouring workers on one shared
+    /// line would take it from each other on every task.
+    struct alignas(64) WorkerState {
+        std::atomic<int32_t> value{kParked};
+    };
+    std::unique_ptr<WorkerState[]> wstate_;
     std::atomic<int32_t> hstate_{kIdle};
     std::atomic<int64_t> hstate_ms_{0};
     alignas(64) std::atomic<uint64_t> head_{0};   // epoch << 32 | njobs << 16 | next index (issue #29)

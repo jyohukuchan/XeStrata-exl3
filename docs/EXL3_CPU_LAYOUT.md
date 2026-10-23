@@ -230,3 +230,96 @@ A diagnostic prototype that rereads values while reusing open files reduced call
 Task construction and the time before and after parking are small, but publish-to-completion includes both computation and shared-counter costs. This does not rule out synchronization improvements. Also, 128 outputs form one Hadamard transform, so merely splitting tasks into 64 outputs requires another synchronization before the transform.
 
 Do not add a fixed recommended worker count. Measure it alongside layout, expert counts, and cache state. Match host-thread affinity between the standalone harness and normal serving when making that choice.
+
+## Inside the CPU expert path: the scale scan, the H128 transform and the pool's counters
+
+The hybrid path's expert cost is the pool's wall time over its four phases per layer (input, gate/up,
+silu, down). The harness of the earlier sections (40 layers x 5 experts, H 2048, FF 512, rows 1, two
+warmup rounds and twenty measured ones) was combined with the pool's own phase profile
+(`STRATA_EXL3_PREPARE_DETAIL=1`) and with comparison builds that drop part of the dot (one with the
+byte sum dropped, one with the trellis decode and the byte sum both dropped) to see where the time
+goes.
+
+Phase walls per call (24 workers, 5 experts a layer):
+
+| phase | wall time | what it holds |
+| --- | ---: | --- |
+| input (11) | 25 us | the input's H128 transform, the scale scan, the activation quantization |
+| gate/up (12) | 131 us | 6.4 MB of the two projections' compressed weights and the integer dots |
+| silu (13) | 10 us | silu, the down input's H128 transform and quantization |
+| down (14) | 68 us | 2.5 MB of compressed weights and the integer dots |
+
+The gate/up and down phases are dominated by the weight reads: about 9 MB per call together, near
+48 GB/s across the workers. A build that drops the dot's arithmetic entirely only takes gate/up from
+131 to 110 us and down from 68 to 63 us. The fall past 24 workers is this bandwidth.
+
+With one expert a layer (the starved shape, the shape the K split fills) the dot's arithmetic is 24%
+of the wall time: the byte sum and the integer adds 18%, the trellis decode (the word fetch and the
+funnel shifts) 6%. One tile's 305 instructions say the same: 139 of them are the fetch and the funnel
+shifts, 129 the byte sum and the integer adds, and the rest the activation broadcasts and the address
+arithmetic.
+
+### The trellis decode's fetch
+
+A lane of a row's half reads the tile's dword "lane number times the bit width, plus a base" (the base
+is fixed by the row, the half and which of the two words; a whole tile needs one base more than the
+bit width, six of them at five bits). Several rows call for the same base, so the generated code reads
+each base's words once per tile and the rows share them (the five-bit `dot_range`'s fetch is 31
+vpermd/vpblendd and friends). The funnel shifts are at their own floor too: a shift of 0 (the window
+sits inside one word) and a shift of 16 (a word's high half is the code) leave one word's work, and
+every other shift is the two shifts, the or and the mask the sixteen-bit window needs. Nothing further
+was found to cut on the decode side; a prototype that regrouped the rows' fetch by base produced the
+same generated code and measured the same, and is not kept. On this CPU the byte sum is four
+instructions for eight codes (vpmulld is one micro-op at latency 3, then vpmaddubsw, vpmaddwd and
+vpaddd), the smallest form found that keeps the values.
+
+### What was applied
+
+- The activation quantizer's scale scan (the largest magnitude and the finiteness of every value) was
+  a scalar pass with a memcpy per value. It is now one vector pass of eight values at a time, with a
+  512-bit copy that produces the same integer maximum. The scale formula, the rounding, the clamp to
+  [-127, 127] and the duplication are unchanged.
+- The H128 transform of the input and of every output block was scalar butterflies with a volatile
+  scale. It is now vector stages of eight floats. Every value is the scalar form's own one add or one
+  subtract of the same two operands, and the scale is still one multiply per value, so the bits are
+  the same.
+- The pool's shared counters: `done_` was one fetch-add per task and is now one release per drain,
+  added up at the drain's end (the counter's release sequences carry every worker's outputs to the
+  host's acquire). The workers' diagnostic states were written per task and neighbouring workers took
+  one shared cache line from each other on every task; each state now has a cache line of its own.
+
+### Measurement
+
+The CPU-only sweep (40 layers x 5 experts, H 2048, FF 512, the median of the twenty-round round; the
+binary before the change and the binary after it, one after the other, five pairs; the medians):
+
+| workers | before us | after us | difference |
+| ---: | ---: | ---: | ---: |
+| 8 | 14620.2 | 14155.9 | -3.2% |
+| 24 | 7790.4 | 7361.7 | -5.5% |
+| 32 | 8100.2 | 7921.4 | -2.2% |
+| 48 | 7977.2 | 7430.7 | -6.9% |
+| 64 | 8656.6 | 7942.7 | -8.2% |
+
+The five repeats of the 64-worker cell of the binary before the change spread widely (8294 to 10176
+us); minimum against minimum the difference is -4.3%. The other cells spread 1 to 3% and the direction
+is the same in every cell.
+
+The hybrid decode (the fixed-token bench, 128 positions, the 8 GiB VRAM limit, the 4 GiB allocation
+limit, the matrix engines off, the integer dot and the row split on, the V620 at 0000:03:00.0):
+
+| workers | before tok/s | after tok/s | difference |
+| ---: | ---: | ---: | ---: |
+| 24 | 49.55 | 50.22 | +1.3% |
+| 32 | 50.00 | 49.41 | -1.2% |
+
+At 24 workers the changed binary won all five pairs. At 32 workers the eight pairs spread from -6% to
++1.5% (the host's load drifted between 14 and 30 during them) and the three pairs run with the order
+swapped went the other way. The difference at 32 workers is not resolved by this measurement; the
+CPU-only sweep puts 32 workers at -2.2%. The cache's hit/miss signature is the same in every condition
+(7129/13351).
+
+The experts' outputs of the sweep (10240 values) are bit for bit the same in all 25 pairs of runs.
+That follows from the contract: the rounding, the clamp and the affine are unchanged and the integer
+sums' order is unchanged too. The conversion watcher's sentinel was stopped for the measurements, and
+no other large job was running when they were taken.

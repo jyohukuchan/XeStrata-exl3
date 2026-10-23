@@ -347,7 +347,7 @@ void ExpertPool::diag(std::FILE* f) const {
                  (uint32_t) (h >> 16) & 0xffffu, done_.load(), parked_.load(), n_, sleepers_.load(), mode_);
     std::fprintf(f, "  expert pool threads:");
     for (int i = 0; i < n_; ++i) {
-        const int32_t s = wstate_[(size_t) i].load();
+        const int32_t s = wstate_[(size_t) i].value.load();
         if (s == kParked) std::fprintf(f, " w%d=parked", i);
         else if (s == kSleeping) std::fprintf(f, " w%d=sleeping", i);
         else if (s == kBetween) std::fprintf(f, " w%d=draining", i);
@@ -370,8 +370,8 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, int first_core,
     n_ = n_workers > 0 ? n_workers : (int) cores.size();
     if (n_ < 1) n_ = 1;
     scratch_.resize((size_t) n_);
-    wstate_.reset(new std::atomic<int32_t>[(size_t) n_]);
-    for (int i = 0; i < n_; ++i) wstate_[(size_t) i].store(kParked);
+    wstate_.reset(new WorkerState[(size_t) n_]);
+    for (int i = 0; i < n_; ++i) wstate_[(size_t) i].value.store(kParked);
     hstate_ms_.store(now_ms());
     g_diag_pool.store(this);
     strata::core::diag_pool_fn().store(&diag_active_pool);
@@ -448,13 +448,13 @@ void ExpertPool::worker(int id) {
             }
             if (std::chrono::steady_clock::now() - parked_at < spin_before_sleep_) continue;
             std::unique_lock<std::mutex> lk(sleep_mu_);
-            wstate_[(size_t) id].store(kSleeping, std::memory_order_relaxed);
+            wstate_[(size_t) id].value.store(kSleeping, std::memory_order_relaxed);
             sleepers_.fetch_add(1, std::memory_order_seq_cst);
             sleep_cv_.wait(lk, [&] {
                 return epoch_.load(std::memory_order_seq_cst) != seen || stop_.load(std::memory_order_relaxed);
             });
             sleepers_.fetch_sub(1, std::memory_order_relaxed);
-            wstate_[(size_t) id].store(kParked, std::memory_order_relaxed);
+            wstate_[(size_t) id].value.store(kParked, std::memory_order_relaxed);
         }
         if (stop_.load(std::memory_order_acquire)) return;
         // acquire: the batch this epoch published (`head`, and the description before it) is visible from here
@@ -464,9 +464,9 @@ void ExpertPool::worker(int id) {
         // Drain: one claim per iteration, so a slow worker takes fewer experts and a fast one takes more.
         // Every job is the same size (all experts are 1,382,400 bytes), so there is nothing to schedule.  Only
         // this epoch's jobs: if the host has already moved on, the claims fail and the worker parks again.
-        wstate_[(size_t) id].store(kBetween, std::memory_order_relaxed);
+        wstate_[(size_t) id].value.store(kBetween, std::memory_order_relaxed);
         drain(id, scratch_[(size_t) id], seen);
-        wstate_[(size_t) id].store(kParked, std::memory_order_relaxed);
+        wstate_[(size_t) id].value.store(kParked, std::memory_order_relaxed);
         parked_.fetch_add(1, std::memory_order_acq_rel);   // back at the park
     }
 }
@@ -542,11 +542,18 @@ void ExpertPool::wait_done(int n) {
 
 void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
     (void) id;
+    // The tasks this worker claims are counted here and published to `done_`
+    // once, when the drain ends: one release per drain instead of one locked
+    // fetch-add per task keeps the shared completion counter off the
+    // per-task path.  The release sequences of the counter's fetch-adds carry
+    // every worker's outputs to the host's acquire in `wait_done`, as the
+    // per-task release did.
+    uint32_t done_here = 0;
     for (;;) {
         const int ci = claim(epoch);
         if (ci < 0) break;
         const uint32_t i = (uint32_t) ci;
-        if (id >= 0) wstate_[(size_t) id].store(ci, std::memory_order_relaxed);
+        if (id >= 0) wstate_[(size_t) id].value.store(ci, std::memory_order_relaxed);
         else { hstate_.store(ci, std::memory_order_relaxed); hstate_ms_.store(now_ms(), std::memory_order_relaxed); }
         if (mode_ >= 11 && mode_ <= 14) {
             const Exl3RowTask& task = exl3_rows_.tasks[i];
@@ -732,8 +739,9 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                 r += r1 - r0;
             }
         }
-        done_.fetch_add(1, std::memory_order_release);
+        ++done_here;
     }
+    if (done_here != 0) done_.fetch_add(done_here, std::memory_order_release);
 }
 
 void ExpertPool::run_phase(int mode, int n_tasks) {
