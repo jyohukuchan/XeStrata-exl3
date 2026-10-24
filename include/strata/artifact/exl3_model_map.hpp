@@ -12,12 +12,13 @@
 
 namespace strata::artifact::exl3 {
 
-enum class ModelFamily { qwen35, qwen38 };
+enum class ModelFamily { qwen35, qwen38, hyv3 };
 
 enum class ProjectionKind {
     gdn_qkv, gdn_z, gdn_out, gdn_alpha, gdn_beta,
     qsa_q, qsa_k, qsa_v, qsa_out, qsa_indexer_q, qsa_indexer_k,
     router, shared_scalar, shared_gate, shared_up, shared_down,
+    dense_gate, dense_up, dense_down,
     expert_gate, expert_up, expert_down,
     hc_norm, hc_down, hc_up, hc_inject,
     mtp_fc,
@@ -52,6 +53,8 @@ struct ModelGeometry {
     int64_t indexer_kv_heads = 0;
     int64_t indexer_head_dim = 0;
     int64_t full_attention_interval = 0;
+    int64_t dense_lead = 0;          ///< hyv3: leading dense-MLP layers
+    int64_t dense_intermediate = 0;  ///< hyv3: the dense MLP's width
     int64_t hc_count = 0;
     int64_t hc_rank = 0;
 };

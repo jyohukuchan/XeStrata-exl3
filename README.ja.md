@@ -93,7 +93,8 @@ EXL3 は exllamav3 の量子化形式で、**同じ大きさなら I-Quant よ�
 XeStrata はこの形式をコマンドラインから読み込めます（サーバーの経路にはまだありません）。
 
 - **読み込むもの**: EXL3 の checkpoint（safetensors の重み群）と、形の情報だけを持つ metadata GGUF
-- **使えるモデル**: Qwen3.5 系の MoE（AR と MTP）、Qwen3.8 Flash（AR と MTP の serial speculative decoding）
+- **使えるモデル**: Qwen3.5 系の MoE（AR と MTP）、Qwen3.8 Flash（AR と MTP の serial speculative decoding）、
+  Tencent Hy3 系（`HYV3ForCausalLM`、AR のみ。NextN/MTP はまだ使えない）
 - **精度**: 同じ元モデル、同じ 32×1024 の校正 token、同じ 6 つの holdout で
   `KL(P_BF16 || P_candidate)` を測ると、4.5 bpw の EXL3 は 0.0090、I-Quant の IQ4_XS 混合は 0.0218 で、
   EXL3 のほうが 59% 低い。2〜3 bpw では差がさらに大きく、5 bpw では同じ大きさで 60% 低い

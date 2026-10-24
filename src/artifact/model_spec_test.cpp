@@ -12,6 +12,7 @@
 // The fixtures carry only the metadata the reader looks at, and one F32[8] tensor so the file has a data section.
 #include "strata/artifact/model_spec.hpp"
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -151,6 +152,18 @@ std::vector<Kv> glm5next(uint32_t hc) {
             boolean(a + "attention.indexer.kpool_select_tail", true)};
 }
 
+std::vector<Kv> hyv3() {
+    const std::string a = "hy_v3.";
+    return {str("general.architecture", "hy_v3"), u32(a + "block_count", 48), u32(a + "embedding_length", 2048),
+            u32(a + "context_length", 262144), u32(a + "attention.head_count", 32),
+            u32(a + "attention.head_count_kv", 4), u32(a + "attention.key_length", 128),
+            f32(a + "attention.layer_norm_rms_epsilon", 1e-5f), f32(a + "rope.freq_base", 11158840.0f),
+            u32(a + "expert_count", 128), u32(a + "expert_used_count", 8),
+            u32s(a + "expert_feed_forward_length", std::vector<uint32_t>(48, 1536)),
+            u32(a + "leading_dense_block_count", 1), u32(a + "feed_forward_length", 6912),
+            boolean(a + "expert_weights_norm", true), f32(a + "expert_weights_scale", 2.826f)};
+}
+
 std::vector<Kv> qwen3moe() {
     const std::string a = "qwen3moe.";
     return {str("general.architecture", "qwen3moe"), u32(a + "block_count", 32), u32(a + "embedding_length", 2560),
@@ -203,6 +216,23 @@ static int run() {
         bool any = false;
         for (bool r : s.recurrent) any = any || r;
         check(s.n_layer == 32 && !any && s.n_expert_shared == 0 && s.n_head_kv[0] == 4, "full attention only, no shared expert");
+    }
+
+    std::printf("hy_v3 (Hy-Memory-30B-A3B)\n");
+    {
+        strata::ModelSpec s;
+        const bool ok = read(hyv3(), s, err);
+        check(ok, ("reads: " + err).c_str());
+        bool any = false;
+        for (bool r : s.recurrent) any = any || r;
+        check(s.arch == strata::ModelArch::HyV3 && s.n_layer == 48 && !any, "48 full-attention layers");
+        check(s.gating == strata::ExpertGating::Sigmoid && s.expert_bias && s.expert_weights_norm &&
+                  std::fabs(s.expert_weights_scale - 2.826) < 1e-6,
+              "sigmoid gating with choice bias, normalised x2.826");
+        check(s.n_ff_exp == 1536 && s.n_ff_shexp == 1536 && s.n_expert_shared == 1,
+              "per-layer expert width array, shared width fallback");
+        check(!s.layer_routes(0) && s.moe_index(1) == 0 && s.n_moe_layers() == 47 && s.n_ff == 6912,
+              "one leading dense layer, 47 MoE layers");
     }
 
     std::printf("refusals\n");

@@ -10,6 +10,8 @@
 //   qwen4exp   Qwen3.8-Flash-Next and its fine-tunes (the engine's model)
 //   qwen35moe  Qwen3.5 MoE (Ornith-1.5-35B-A3B): gated delta-net + full attention every 4th layer, MTP
 //   qwen3moe   Qwen3 MoE (llm-jp-4.1-32b-a3b): full attention only, no shared expert
+//   hy_v3      Tencent Hy3 / Hy-Memory (HYV3ForCausalLM): full attention only, QK-norm, leading dense
+//              layer(s), sigmoid router with an expert-choice bias, an always-on shared expert
 //   glm5-next  GLM-5.3-Flash: KDA + NoPE MLA with a k-pool indexer, mHC, leading dense layers, MTP.  Also spelled
 //              `glm5next` (Project Maya's quants, after unsloth's first GGUFs), with the same keys under that name.
 //
@@ -28,7 +30,7 @@
 
 namespace strata {
 
-enum class ModelArch { Qwen4Exp, Qwen35Moe, Qwen3Moe, Glm5Next };
+enum class ModelArch { Qwen4Exp, Qwen35Moe, Qwen3Moe, Glm5Next, HyV3 };
 
 /// llama.cpp's `llama_expert_gating_func_type`
 enum class ExpertGating : uint32_t { None = 0, Softmax = 1, Sigmoid = 2 };
@@ -70,6 +72,7 @@ struct ModelSpec {
     int64_t n_dense_lead = 0;             ///< leading layers with a dense FFN instead of the MoE
     int64_t n_ff = 0;                     ///< the dense FFN's width
     ExpertGating gating = ExpertGating::None;
+    bool expert_bias = false;             ///< a per-expert bias added to the gating scores for choice only (hy_v3)
     bool expert_weights_norm = false;
     double expert_weights_scale = 0;
     std::vector<double> swiglu_clamp_exp, swiglu_clamp_shexp;   ///< per layer, empty when not written
@@ -138,7 +141,8 @@ inline bool read_model_spec(const GgufFile& g, ModelSpec& s, std::string& err) {
     else if (A == "qwen35moe") s.arch = ModelArch::Qwen35Moe;
     else if (A == "qwen3moe") s.arch = ModelArch::Qwen3Moe;
     else if (A == "glm5-next" || A == "glm5next") s.arch = ModelArch::Glm5Next;
-    else { err = "architecture '" + A + "' is not supported (qwen4exp, qwen35moe, qwen3moe, glm5-next)"; return false; }
+    else if (A == "hy_v3") s.arch = ModelArch::HyV3;
+    else { err = "architecture '" + A + "' is not supported (qwen4exp, qwen35moe, qwen3moe, glm5-next, hy_v3)"; return false; }
 
     // the keys every architecture here needs
     const char* required[] = {"block_count", "embedding_length", "attention.head_count", "expert_count",
@@ -212,6 +216,7 @@ inline bool read_model_spec(const GgufFile& g, ModelSpec& s, std::string& err) {
         for (int64_t i = 0; i < s.n_layer; ++i) s.recurrent[(size_t) i] = s.n_head_kv[(size_t) i] == 0;
         break;
     case ModelArch::Qwen3Moe:
+    case ModelArch::HyV3:
         break;
     }
 
@@ -222,9 +227,25 @@ inline bool read_model_spec(const GgufFile& g, ModelSpec& s, std::string& err) {
     s.n_expert_shared = spec_int(g, A, "expert_shared_count", s.n_ff_shexp > 0 ? 1 : 0);
     s.n_dense_lead = spec_int(g, A, "leading_dense_block_count");
     s.n_ff = spec_int(g, A, "feed_forward_length");
+    if (s.arch == ModelArch::HyV3) {
+        // hy-v3.cpp: expert_feed_forward_length may be one value per layer; this engine's tiers take one width.
+        std::vector<double> per_layer;
+        if (spec_per_layer(g, A, "expert_feed_forward_length", n_all, per_layer)) {
+            s.n_ff_exp = (int64_t) per_layer[0];
+            for (double v : per_layer)
+                if ((int64_t) v != s.n_ff_exp) {
+                    err = A + ".expert_feed_forward_length differs per layer, which this engine does not run";
+                    return false;
+                }
+        }
+        if (s.n_ff_shexp <= 0) s.n_ff_shexp = s.n_ff_exp;   // hy-v3.cpp's fallback
+        if (s.n_expert_shared <= 0) s.n_expert_shared = 1;
+        s.expert_bias = true;   // the sigmoid router's choice bias (blk.*.exp_probs_b, not required in the file)
+    }
     s.gating = (ExpertGating) spec_int(g, A, "expert_gating_func");
-    if (s.gating == ExpertGating::None)   // llama.cpp's defaults: GLM-5.3-Flash sigmoid, the Qwens softmax
-        s.gating = s.arch == ModelArch::Glm5Next ? ExpertGating::Sigmoid : ExpertGating::Softmax;
+    if (s.gating == ExpertGating::None)   // llama.cpp's defaults: GLM-5.3-Flash and hy_v3 sigmoid, the Qwens softmax
+        s.gating = s.arch == ModelArch::Glm5Next || s.arch == ModelArch::HyV3 ? ExpertGating::Sigmoid
+                                                                               : ExpertGating::Softmax;
     if (s.gating != ExpertGating::Softmax && s.gating != ExpertGating::Sigmoid) {
         err = A + ".expert_gating_func " + std::to_string((uint32_t) s.gating) + " is not supported";
         return false;

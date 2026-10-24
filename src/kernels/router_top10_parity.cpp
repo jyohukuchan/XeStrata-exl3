@@ -95,6 +95,50 @@ int run_case(const char* name, const std::vector<float>& logits, int n_tokens, i
     return (int) (id_bad + w_bad);
 }
 
+int run_sigmoid_case() {
+    // hy_v3: choice by sigmoid+bias, weights sigmoid without bias, renormalised, x scale.
+    const int n_expert = 8, k = 3, n_tokens = 4;
+    const float scale = 2.826f;
+    std::vector<float> logits((size_t) n_tokens * n_expert), bias((size_t) n_expert);
+    std::mt19937 rng(7);
+    std::normal_distribution<float> gauss(0.0f, 1.0f);
+    for (auto& v : logits) v = gauss(rng);
+    for (auto& v : bias) v = gauss(rng) * 0.5f;
+    std::vector<int> r_ids((size_t) n_tokens * k);
+    std::vector<float> r_w((size_t) n_tokens * k);
+    for (int t = 0; t < n_tokens; ++t) {
+        std::vector<double> p((size_t) n_expert), score((size_t) n_expert);
+        for (int e = 0; e < n_expert; ++e) {
+            p[(size_t) e] = 1.0 / (1.0 + std::exp(-(double) logits[(size_t) t * n_expert + e]));
+            score[(size_t) e] = p[(size_t) e] + bias[(size_t) e];
+        }
+        std::vector<int> idx((size_t) n_expert);
+        std::iota(idx.begin(), idx.end(), 0);
+        std::stable_sort(idx.begin(), idx.end(), [&](int a, int b) { return score[(size_t) a] > score[(size_t) b]; });
+        double s = 0;
+        for (int i = 0; i < k; ++i) { r_ids[(size_t) t * k + i] = idx[(size_t) i]; s += p[(size_t) idx[(size_t) i]]; }
+        for (int i = 0; i < k; ++i)
+            r_w[(size_t) t * k + i] = (float) (p[(size_t) idx[(size_t) i]] / (s + 1e-20) * scale);
+    }
+    strata::parity::Device dev;
+    float* d_l = dev.upload(logits);
+    float* d_b = dev.upload(bias);
+    int* d_ids = dev.alloc<int>(r_ids.size());
+    float* d_w = dev.alloc<float>(r_w.size());
+    strata::kernels::router_sigmoid_topk(d_l, d_b, n_tokens, n_expert, k, true, scale, d_ids, d_w, nullptr);
+    std::vector<int> h_ids(r_ids.size());
+    std::vector<float> h_w(r_w.size());
+    strata::parity::copy_out(h_ids.data(), d_ids, h_ids.size());
+    strata::parity::copy_out(h_w.data(), d_w, h_w.size());
+    int bad = 0;
+    for (size_t i = 0; i < h_ids.size(); ++i) {
+        if (h_ids[i] != r_ids[i]) ++bad;
+        if (std::fabs((double) h_w[i] - r_w[i]) > 1e-5 * std::max(1.0, std::fabs((double) r_w[i]))) ++bad;
+    }
+    std::printf("  %-26s ids/weights %s (%d bad)\n", "sigmoid+bias (hy_v3)", bad ? "*** WRONG ***" : "exact", bad);
+    return bad;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -146,6 +190,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "the clamp CAN trigger, so it needs a test\n");
         ++bad;
     }
+
+    bad += run_sigmoid_case();
 
     std::printf("\nrouter_top10: %d failures over 4 distributions x %d tokens x %d experts, top-%d\n", bad, NT, NE,
                 K);

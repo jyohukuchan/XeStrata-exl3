@@ -124,6 +124,8 @@ bool add_linear(ModelMap& map, const Archive& archive, ProjectionKind kind, int6
                                    kind == ProjectionKind::expert_gate || kind == ProjectionKind::expert_up ||
                                    kind == ProjectionKind::expert_down || kind == ProjectionKind::shared_gate ||
                                    kind == ProjectionKind::shared_up || kind == ProjectionKind::shared_down ||
+                                   kind == ProjectionKind::dense_gate || kind == ProjectionKind::dense_up ||
+                                   kind == ProjectionKind::dense_down ||
                                    kind == ProjectionKind::lm_head || kind == ProjectionKind::mtp_fc;
         if (raw_descriptor != nullptr && raw_exception)
             return add_raw(map, archive, kind, layer, expert, source, canonical, target_k, target_n,
@@ -332,6 +334,9 @@ const char* projection_kind_name(ProjectionKind kind) {
         case ProjectionKind::shared_gate: return "shared_gate";
         case ProjectionKind::shared_up: return "shared_up";
         case ProjectionKind::shared_down: return "shared_down";
+        case ProjectionKind::dense_gate: return "dense_gate";
+        case ProjectionKind::dense_up: return "dense_up";
+        case ProjectionKind::dense_down: return "dense_down";
         case ProjectionKind::expert_gate: return "expert_gate";
         case ProjectionKind::expert_up: return "expert_up";
         case ProjectionKind::expert_down: return "expert_down";
@@ -348,7 +353,9 @@ const char* projection_kind_name(ProjectionKind kind) {
     return "unknown";
 }
 
-const char* model_family_name(ModelFamily family) { return family == ModelFamily::qwen35 ? "qwen35" : "qwen38"; }
+const char* model_family_name(ModelFamily family) {
+    return family == ModelFamily::qwen35 ? "qwen35" : family == ModelFamily::hyv3 ? "hyv3" : "qwen38";
+}
 
 const char* value_transform_name(ValueTransform transform) {
     switch (transform) {
@@ -376,9 +383,101 @@ bool build_model_map(const Archive& archive, ModelMap& result, std::string& err,
         if (model_type == "qwen4_exp" || model_type == "qwen4_exp_text") result.family = ModelFamily::qwen38;
         else if (model_type == "qwen3_5_moe" || model_type == "qwen3_5_moe_text" ||
                  model_type == "qwen3_5" || model_type == "qwen3_5_text") result.family = ModelFamily::qwen35;
+        else if (model_type == "hy_v3") result.family = ModelFamily::hyv3;
         else {
             err = "EXL3 model map: unsupported model_type " + model_type;
             return false;
+        }
+        if (result.family == ModelFamily::hyv3) {
+            // HYV3ForCausalLM: HF names under model.layers.*; norms are plain RMSNorm weights (no +1),
+            // Q is not gated, the shared expert is always on, and the router bias is a plain buffer.
+            auto& g = result.geometry;
+            g.hidden_size = int_value(*text, "hidden_size");
+            g.vocab_size = int_value(*text, "vocab_size", int_value(config, "vocab_size"));
+            g.layers = int_value(*text, "num_hidden_layers");
+            g.mtp_layers = int_value(*text, "num_nextn_predict_layers", int_value(config, "num_nextn_predict_layers"));
+            g.experts = int_value(*text, "num_experts");
+            g.experts_per_token = int_value(*text, "num_experts_per_tok");
+            g.moe_intermediate = int_value(*text, "expert_hidden_dim", int_value(*text, "moe_intermediate_size"));
+            const int64_t shared_count = int_value(*text, "num_shared_experts", 1);
+            g.shared_intermediate = g.moe_intermediate * (shared_count > 0 ? shared_count : 1);
+            g.q_heads = int_value(*text, "num_attention_heads");
+            g.kv_heads = int_value(*text, "num_key_value_heads", g.q_heads);
+            g.head_dim = int_value(*text, "head_dim", g.hidden_size / (g.q_heads ? g.q_heads : 1));
+            g.dense_lead = int_value(*text, "first_k_dense_replace");
+            g.dense_intermediate = int_value(*text, "intermediate_size");
+            if (g.hidden_size <= 0 || g.layers <= 0 || g.experts <= 0 || g.moe_intermediate <= 0 ||
+                g.dense_intermediate <= 0 || g.dense_lead < 0 || g.dense_lead >= g.layers)
+                return (err = "EXL3 model map: config has incomplete HyV3 geometry", false);
+            if (include_mtp && g.mtp_layers > 0)
+                reason(result, "HyV3 NextN/MTP block is not run by this engine yet");
+            result.source_prefix = "model.layers";
+            if (archive.find_tensor("model.embed_tokens.weight") == nullptr &&
+                archive.find_linear("model.embed_tokens") == nullptr) {
+                err = "EXL3 model map: cannot find the HyV3 embedding under model.embed_tokens";
+                return false;
+            }
+            if (g.vocab_size <= 0) {
+                reason(result, "config has no positive vocab_size for embedding/head mapping");
+            } else {
+                add_aux(result, archive, -1, "model.embed_tokens", "token_embd.weight",
+                        g.vocab_size * g.hidden_size, ValueTransform::identity, {}, ProjectionKind::embedding, {1, 0});
+                add_linear(result, archive, ProjectionKind::lm_head, -1, -1, "lm_head", "output.weight",
+                           g.hidden_size, g.vocab_size);
+            }
+            add_aux(result, archive, -1, "model.norm", "output_norm.weight", g.hidden_size,
+                    ValueTransform::identity, {}, ProjectionKind::final_norm);
+            for (int64_t layer = 0; layer < g.layers; ++layer) {
+                const std::string p = result.source_prefix + "." + std::to_string(layer) + ".";
+                const std::string cp = "blk." + std::to_string(layer) + ".";
+                add_aux(result, archive, layer, p + "input_layernorm", cp + "attn_norm.weight", g.hidden_size,
+                        ValueTransform::identity);
+                add_aux(result, archive, layer, p + "post_attention_layernorm", cp + "ffn_norm.weight", g.hidden_size,
+                        ValueTransform::identity);
+                add_linear(result, archive, ProjectionKind::qsa_q, layer, -1, p + "self_attn.q_proj", cp + "attn_q.weight",
+                           g.hidden_size, g.q_heads * g.head_dim);
+                add_linear(result, archive, ProjectionKind::qsa_k, layer, -1, p + "self_attn.k_proj", cp + "attn_k.weight",
+                           g.hidden_size, g.kv_heads * g.head_dim);
+                add_linear(result, archive, ProjectionKind::qsa_v, layer, -1, p + "self_attn.v_proj", cp + "attn_v.weight",
+                           g.hidden_size, g.kv_heads * g.head_dim);
+                add_linear(result, archive, ProjectionKind::qsa_out, layer, -1, p + "self_attn.o_proj", cp + "attn_output.weight",
+                           g.q_heads * g.head_dim, g.hidden_size);
+                add_aux(result, archive, layer, p + "self_attn.q_norm", cp + "attn_q_norm.weight", g.head_dim,
+                        ValueTransform::identity);
+                add_aux(result, archive, layer, p + "self_attn.k_norm", cp + "attn_k_norm.weight", g.head_dim,
+                        ValueTransform::identity);
+                if (layer < g.dense_lead) {
+                    add_linear(result, archive, ProjectionKind::dense_gate, layer, -1, p + "mlp.gate_proj", cp + "ffn_gate.weight",
+                               g.hidden_size, g.dense_intermediate);
+                    add_linear(result, archive, ProjectionKind::dense_up, layer, -1, p + "mlp.up_proj", cp + "ffn_up.weight",
+                               g.hidden_size, g.dense_intermediate);
+                    add_linear(result, archive, ProjectionKind::dense_down, layer, -1, p + "mlp.down_proj", cp + "ffn_down.weight",
+                               g.dense_intermediate, g.hidden_size);
+                    continue;
+                }
+                add_raw(result, archive, ProjectionKind::router, layer, -1, p + "mlp.router.gate", cp + "ffn_gate_inp.weight",
+                        g.hidden_size, g.experts);
+                if (archive.find_tensor(p + "mlp.expert_bias") != nullptr)
+                    add_aux(result, archive, layer, p + "mlp.expert_bias", cp + "exp_probs_b",
+                            g.experts, ValueTransform::identity);
+                add_linear(result, archive, ProjectionKind::shared_gate, layer, -1, p + "mlp.shared_mlp.gate_proj",
+                           cp + "ffn_gate_shexp.weight", g.hidden_size, g.shared_intermediate);
+                add_linear(result, archive, ProjectionKind::shared_up, layer, -1, p + "mlp.shared_mlp.up_proj",
+                           cp + "ffn_up_shexp.weight", g.hidden_size, g.shared_intermediate);
+                add_linear(result, archive, ProjectionKind::shared_down, layer, -1, p + "mlp.shared_mlp.down_proj",
+                           cp + "ffn_down_shexp.weight", g.shared_intermediate, g.hidden_size);
+                for (int64_t expert = 0; expert < g.experts; ++expert) {
+                    const std::string ep = p + "mlp.experts." + std::to_string(expert) + ".";
+                    const std::string ec = cp + "experts." + std::to_string(expert) + ".";
+                    add_linear(result, archive, ProjectionKind::expert_gate, layer, expert, ep + "gate_proj", ec + "gate_proj",
+                               g.hidden_size, g.moe_intermediate);
+                    add_linear(result, archive, ProjectionKind::expert_up, layer, expert, ep + "up_proj", ec + "up_proj",
+                               g.hidden_size, g.moe_intermediate);
+                    add_linear(result, archive, ProjectionKind::expert_down, layer, expert, ep + "down_proj", ec + "down_proj",
+                               g.moe_intermediate, g.hidden_size);
+                }
+            }
+            return true;
         }
         auto& g = result.geometry;
         g.hidden_size = int_value(*text, "hidden_size");

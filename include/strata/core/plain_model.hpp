@@ -170,8 +170,11 @@ private:
         W q, k, v, o;                                         // attention
         const float *q_norm = nullptr, *k_norm = nullptr;
         const float* router = nullptr;                        // F32 [n_embd, n_expert]
+        const float* router_bias = nullptr;                   // F32 [n_expert] (hy_v3 choice bias, may be null)
         const float* sh_gate_inp = nullptr;                   // F32 [n_embd]
         W sh_gate, sh_up, sh_down;
+        bool dense = false;                                   // hy_v3 leading layers: a dense MLP, no routing
+        W dense_gate, dense_up, dense_down;
     };
 
     bool load_exl3(std::string& err);
