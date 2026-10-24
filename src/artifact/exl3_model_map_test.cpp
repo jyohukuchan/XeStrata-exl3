@@ -199,7 +199,7 @@ bool check_lfm2moe_fixture() {
          std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     std::filesystem::create_directories(root);
     std::ofstream(root / "config.json")
-        << R"({"model_type":"lfm2_moe","text_config":{"hidden_size":4,"vocab_size":4,"num_hidden_layers":2,"num_experts":2,"num_experts_per_tok":1,"moe_intermediate_size":4,"num_attention_heads":1,"num_key_value_heads":1,"num_dense_layers":1,"use_expert_bias":true}})";
+        << R"({"model_type":"lfm2_moe","text_config":{"hidden_size":4,"vocab_size":4,"num_hidden_layers":2,"num_experts":2,"num_experts_per_tok":1,"moe_intermediate_size":4,"intermediate_size":4,"conv_L_cache":3,"layer_types":["conv","full_attention"],"num_attention_heads":1,"num_key_value_heads":1,"num_dense_layers":1,"use_expert_bias":true}})";
     const std::string header =
         R"({"model.embed_tokens.weight":{"dtype":"F16","shape":[4,4],"data_offsets":[0,32]},"lm_head.weight":{"dtype":"F16","shape":[4,4],"data_offsets":[32,64]}})";
     std::ofstream model(root / "model.safetensors", std::ios::binary);
@@ -215,13 +215,18 @@ bool check_lfm2moe_fixture() {
         ModelMap map;
         std::string err;
         const bool built = build_model_map(archive, map, err);
-        bool names_shortconv = false;
+        bool has_embed = false, has_head = false, names_conv = false;
+        for (const auto& item : map.projections) {
+            if (item.kind == ProjectionKind::embedding) has_embed = true;
+            if (item.kind == ProjectionKind::lm_head) has_head = true;
+        }
         for (const auto& item : map.unsupported)
-            if (item.find("short-conv") != std::string::npos) names_shortconv = true;
+            if (item.find("conv.in_proj") != std::string::npos) names_conv = true;
         std::string require_err;
         ok = built && map.family == ModelFamily::lfm2moe && map.geometry.hidden_size == 4 &&
-             map.geometry.layers == 2 && map.geometry.experts == 2 && !map.projections.empty() &&
-             !map.unsupported.empty() && names_shortconv && !map.require_supported(require_err) &&
+             map.geometry.layers == 2 && map.geometry.experts == 2 && map.geometry.dense_layers == 1 &&
+             map.geometry.dense_intermediate == 4 && map.geometry.shortconv_l_cache == 3 && has_embed &&
+             has_head && names_conv && !map.unsupported.empty() && !map.require_supported(require_err) &&
              require_err.find("lfm2moe") != std::string::npos;
         if (!ok) std::cerr << "lfm2moe fixture: built=" << built << " err=" << err << '\n';
     } catch (const std::exception& e) {

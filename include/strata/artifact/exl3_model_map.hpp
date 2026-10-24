@@ -15,6 +15,7 @@ namespace strata::artifact::exl3 {
 enum class ModelFamily { qwen35, qwen38, lfm2moe };
 
 enum class ProjectionKind {
+    conv_in, conv_out, dense_gate, dense_up, dense_down,
     gdn_qkv, gdn_z, gdn_out, gdn_alpha, gdn_beta,
     qsa_q, qsa_k, qsa_v, qsa_out, qsa_indexer_q, qsa_indexer_k,
     router, shared_scalar, shared_gate, shared_up, shared_down,
@@ -52,6 +53,9 @@ struct ModelGeometry {
     int64_t indexer_kv_heads = 0;
     int64_t indexer_head_dim = 0;
     int64_t full_attention_interval = 0;
+    int64_t dense_intermediate = 0;   ///< lfm2moe: the leading dense FFN width
+    int64_t dense_layers = 0;         ///< lfm2moe: leading dense FFN layers
+    int64_t shortconv_l_cache = 0;    ///< lfm2moe: the short-conv window length
     int64_t hc_count = 0;
     int64_t hc_rank = 0;
 };
