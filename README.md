@@ -112,13 +112,13 @@ strata --exl3 /path/to/exl3-model --metadata-gguf /path/to/metadata-only.gguf \
     --prompt-chunk 0 --spec 0 --max-t 1 --tokens 16,10,16,28 --max-new 2
 ```
 
-On Qwen3.8 Flash, `--spec 2` runs serial speculative decoding over MTP. Only drafts that pass
+On Qwen3.8 Flash, `--spec 2` through `--spec 6` run serial speculative decoding over MTP (`--spec N` allows up to N-1 drafts per window). Only drafts that pass
 verification are kept; a rejected window is rewritten with AR, so the answer matches AR (currently
 slower than AR).
 
 ```sh
 strata --exl3 /path/to/qwen38-exl3 --tokens 16,10,16,28 --max-new 8 \
-    --context 16 --stage-devices 0 --spec 2 --max-t 1 --prompt-chunk 0
+    --context 16 --stage-devices 0 --spec 6 --max-t 1 --prompt-chunk 0
 ```
 
 The format, how the accuracy is measured and what the speed difference is are in

@@ -123,7 +123,7 @@ void usage() {
                  "  --eos-ids LIST      replace EOS IDs and enable stopping\n"
                  "  --metadata-gguf P   optional GGUF metadata/tokenizer EOS source\n"
                  "  --dump-logits PATH  write FP32 logits rows for generated choices\n"
-                 "  --spec 0|1|2        2 runs the serial single-draft MTP loop; 0|1 stay plain AR\n"
+                 "  --spec 0..6         2..6 run the serial MTP draft loop with up to N-1 drafts per window; 0|1 stay plain AR\n"
                  "  --max-t 1           single-token AR only\n"
                  "  --prompt-chunk 0    prompt chunks are not supported\n");
 }
@@ -291,8 +291,8 @@ int exl3_flash_main(int argc, char** argv) {
             return 2;
         }
     }
-    if (spec < 0 || spec > 2) {
-        std::fprintf(stderr, "strata exl3-flash: --spec accepts 0, 1, or 2 (2 runs the serial MTP draft loop)\n");
+    if (spec < 0 || spec > 6) {
+        std::fprintf(stderr, "strata exl3-flash: --spec accepts 0..6 (2..6 run the serial MTP draft loop)\n");
         return 2;
     }
     if (spec < 0 || max_new < 1 || prompt.empty()) {
@@ -326,7 +326,7 @@ int exl3_flash_main(int argc, char** argv) {
     options.stage_layers = stage_layers;
     options.pool_workers = pool_workers;
     options.max_cells = context;
-    options.include_mtp = (spec == 2);
+    options.include_mtp = (spec >= 2);
     options.vision = false;
     std::string err;
     const Clock::time_point load_begin = Clock::now();
@@ -364,7 +364,7 @@ int exl3_flash_main(int argc, char** argv) {
     const Clock::time_point prompt_end = Clock::now();
     std::vector<int32_t> generated;
     generated.reserve(static_cast<size_t>(max_new));
-    const bool use_spec = (spec == 2);
+    const bool use_spec = (spec >= 2);
     strata::core::Exl3FlashSnapshot snap;
     size_t spec_drafted = 0;
     size_t spec_accepted = 0;
@@ -380,40 +380,64 @@ int exl3_flash_main(int argc, char** argv) {
         emit_token(emitted);
         if (stop_eos && std::find(eos.begin(), eos.end(), emitted) != eos.end()) break;
         if (static_cast<int64_t>(generated.size()) >= max_new) break;
-        if (use_spec && static_cast<int64_t>(generated.size()) + 1 < max_new) {
+        if (use_spec && spec >= 2 && static_cast<int64_t>(generated.size()) + 1 < max_new) {
             if (!model.save_snapshot(snap, err)) {
                 std::fprintf(stderr, "strata exl3-flash: snapshot: %s\n", err.c_str());
                 return 1;
             }
-            int32_t draft = -1;
-            if (!model.mtp_draft(emitted, position - 1, draft, nullptr, err)) {
-                std::fprintf(stderr, "strata exl3-flash: draft position %lld: %s\n", (long long) position, err.c_str());
-                return 1;
-            }
-            ++spec_drafted;
-            int32_t verified = -1;
-            if (!model.forward(emitted, position, verified, dump_path.empty() ? nullptr : logits.data(), err)) {
-                std::fprintf(stderr, "strata exl3-flash: verify position %lld: %s\n", (long long) position, err.c_str());
-                return 1;
-            }
-            if (draft == verified) {
-                ++spec_accepted;
-                next_token = verified;
-                position += 1;
-                emit_token(next_token);
-                if (stop_eos && std::find(eos.begin(), eos.end(), next_token) != eos.end()) break;
-                if (static_cast<int64_t>(generated.size()) >= max_new) break;
-                if (!model.forward(next_token, position, next_token, dump_path.empty() ? nullptr : logits.data(), err)) {
-                    std::fprintf(stderr, "strata exl3-flash: decode position %lld: %s\n", (long long) position, err.c_str());
+            int32_t cur = emitted;
+            int64_t cur_pos = position;
+            int attempted = 0;
+            int accepted = 0;
+            bool window_done = false;
+            for (int round = 1; round < spec && !window_done; ++round) {
+                if (static_cast<int64_t>(generated.size()) + 1 >= max_new) break;
+                int32_t draft = -1;
+                if (!model.mtp_draft(cur, cur_pos - 1, draft, nullptr, err)) {
+                    std::fprintf(stderr, "strata exl3-flash: draft position %lld: %s\n", (long long) cur_pos, err.c_str());
                     return 1;
                 }
-                ++position;
+                ++attempted;
+                ++spec_drafted;
+                int32_t verified = -1;
+                if (!model.forward(cur, cur_pos, verified, dump_path.empty() ? nullptr : logits.data(), err)) {
+                    std::fprintf(stderr, "strata exl3-flash: verify position %lld: %s\n", (long long) cur_pos, err.c_str());
+                    return 1;
+                }
+                if (draft != verified) break;
+                ++accepted;
+                ++spec_accepted;
+                cur = verified;
+                ++cur_pos;
+                emit_token(cur);
+                if (stop_eos && std::find(eos.begin(), eos.end(), cur) != eos.end()) window_done = true;
+                if (static_cast<int64_t>(generated.size()) >= max_new) window_done = true;
+            }
+            if (window_done) break;
+            if (attempted > 0 && accepted == attempted) {
+                if (!model.forward(cur, cur_pos, next_token, dump_path.empty() ? nullptr : logits.data(), err)) {
+                    std::fprintf(stderr, "strata exl3-flash: decode position %lld: %s\n", (long long) cur_pos, err.c_str());
+                    return 1;
+                }
+                position = cur_pos + 1;
                 continue;
             }
             if (!model.restore_snapshot(snap, err)) {
                 std::fprintf(stderr, "strata exl3-flash: restore: %s\n", err.c_str());
                 return 1;
             }
+            cur = emitted;
+            cur_pos = position;
+            for (int i = 0; i <= accepted; ++i) {
+                if (!model.forward(cur, cur_pos, cur, dump_path.empty() ? nullptr : logits.data(), err)) {
+                    std::fprintf(stderr, "strata exl3-flash: decode position %lld: %s\n", (long long) cur_pos, err.c_str());
+                    return 1;
+                }
+                ++cur_pos;
+            }
+            next_token = cur;
+            position = cur_pos;
+            continue;
         }
         if (!model.forward(emitted, position, next_token, dump_path.empty() ? nullptr : logits.data(), err)) {
             std::fprintf(stderr, "strata exl3-flash: decode position %lld: %s\n", (long long) position, err.c_str());
@@ -438,8 +462,8 @@ int exl3_flash_main(int argc, char** argv) {
                  load_s, prompt.size(), prompt_s, decode_tokens, decode_s,
                  static_cast<double>(decode_tokens) / std::max(decode_s, 1e-9));
     if (use_spec)
-        std::fprintf(stderr, "strata (qwen4exp-exl3): spec2 drafts %zu accepted %zu (%.1f %%)\n", spec_drafted,
-                     spec_accepted,
+        std::fprintf(stderr, "strata (qwen4exp-exl3): spec%d drafts %zu accepted %zu (%.1f %%)\n", spec,
+                     spec_drafted, spec_accepted,
                      spec_drafted == 0 ? 0.0 : 100.0 * static_cast<double>(spec_accepted) / static_cast<double>(spec_drafted));
     return 0;
 }

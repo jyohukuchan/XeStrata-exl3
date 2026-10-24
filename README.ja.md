@@ -106,12 +106,12 @@ strata --exl3 /path/to/exl3-model --metadata-gguf /path/to/metadata-only.gguf \
     --prompt-chunk 0 --spec 0 --max-t 1 --tokens 16,10,16,28 --max-new 2
 ```
 
-Qwen3.8 Flash では `--spec 2` で MTP の serial speculative decoding を使う。
+Qwen3.8 Flash では `--spec 2` から `--spec 6` で MTP の serial speculative decoding を使う（`--spec N` で窓あたり最大 N-1 draft）。
 verify に通った draft だけを採用し、通らない window は AR で書き直すので、答えは AR と同じになる（今は AR より遅い）。
 
 ```sh
 strata --exl3 /path/to/qwen38-exl3 --tokens 16,10,16,28 --max-new 8 \
-    --context 16 --stage-devices 0 --spec 2 --max-t 1 --prompt-chunk 0
+    --context 16 --stage-devices 0 --spec 6 --max-t 1 --prompt-chunk 0
 ```
 
 EXL3 の形式、精度の測り方、速さの差の分は [docs/EXL3.ja.md](docs/EXL3.ja.md) にあります。

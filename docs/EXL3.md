@@ -219,7 +219,7 @@ strata --exl3 /path/to/qwen38-exl3 --tokens 16,10,16,28 --max-new 2 \
 
 This integration runs greedy single-token AR by default and uses CPU expert fallback with partial residency.
 `--dump-logits FILE` saves generation FP32 logits; `--stop-eos` or `--eos ID` controls stopping.
-`--spec 2` runs the serial single-draft MTP loop: only drafts that pass verification are kept, and a rejected
+`--spec 2` through `--spec 6` run the serial MTP draft loop with up to N-1 drafts per window: only drafts that pass verification are kept, and a rejected
 window rewinds from a snapshot and is rewritten with AR, so tokens and logits match AR. The draft runs
 uncaptured with CPU-pool experts, so it is currently slower than AR. Vision, serve, batch and multi-token
 prompt chunks are still rejected on request. Qwen3.5 CLI/MTP uses the following path.
