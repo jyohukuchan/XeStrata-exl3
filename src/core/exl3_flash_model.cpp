@@ -2295,9 +2295,10 @@ void Exl3FlashModel::release_snapshot(Exl3FlashSnapshot& snap) noexcept {
 }
 
 bool Exl3FlashModel::mtp_draft(int32_t next_token, int64_t trunk_pos, int32_t& draft, float* host_logits,
-                               std::string& err) {
+                               std::string& err, float* draft_prob) {
     err.clear();
     draft = -1;
+    if (draft_prob != nullptr) *draft_prob = 0.0f;
     if (!loaded()) { err = "EXL3 Flash: model is not open"; return false; }
     if (!impl_->has_mtp || !impl_->mtp_runtime || !impl_->mtp_weights || impl_->mtp_table == nullptr ||
         impl_->mtp_fc_scratch == nullptr || impl_->mtp_parts_device == nullptr) {
@@ -2410,6 +2411,8 @@ bool Exl3FlashModel::mtp_draft(int32_t next_token, int64_t trunk_pos, int32_t& d
             }
         }
         if (draft < 0) { err = "EXL3 Flash: MTP draft logits are all non-finite"; return false; }
+        if (draft_prob != nullptr)
+            *draft_prob = exl3_flash_draft_probability(impl_->logits_host.data(), impl_->logits_host.size(), draft);
         if (host_logits != nullptr)
             std::copy(impl_->logits_host.begin(), impl_->logits_host.end(), host_logits);
         return true;

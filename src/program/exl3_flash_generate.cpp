@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <charconv>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -28,6 +29,17 @@ namespace {
 
 using Json = nlohmann::json;
 using Clock = std::chrono::steady_clock;
+
+bool parse_probability(std::string_view text, double& value) {
+    if (text.empty()) return false;
+    const std::string copy(text);
+    char* end = nullptr;
+    const double parsed = std::strtod(copy.c_str(), &end);
+    if (end != copy.c_str() + copy.size() || !std::isfinite(parsed) || parsed < 0.0 || parsed > 1.0)
+        return false;
+    value = parsed;
+    return true;
+}
 
 bool parse_i64(std::string_view text, int64_t& value) {
     if (text.empty()) return false;
@@ -124,6 +136,8 @@ void usage() {
                  "  --metadata-gguf P   optional GGUF metadata/tokenizer EOS source\n"
                  "  --dump-logits PATH  write FP32 logits rows for generated choices\n"
                  "  --spec 0..6         2..6 run the serial MTP draft loop with up to N-1 drafts per window; 0|1 stay plain AR\n"
+                 "  --spec-min-p P      stop a window's draft chain after a draft whose softmax probability is below P\n"
+                 "                      (0..1, default 0: never stop early; the first draft is always proposed)\n"
                  "  --max-t 1           single-token AR only\n"
                  "  --prompt-chunk 0    prompt chunks are not supported\n");
 }
@@ -173,6 +187,7 @@ int exl3_flash_main(int argc, char** argv) {
     int64_t max_new = 16, context = 0;
     bool stop_eos = false;
     int spec = 0, pool_workers = 0;
+    double spec_min_p = 0.0;
     bool prompt_seen = false, eos_explicit = false;
     for (int i = 1; i < argc; ++i) {
         const std::string argument = argv[i];
@@ -267,6 +282,16 @@ int exl3_flash_main(int argc, char** argv) {
                 return 2;
             }
             spec = static_cast<int>(value);
+        } else if (argument == "--spec-min-p") {
+            if (!parse_probability(next("--spec-min-p"), spec_min_p)) {
+                std::fprintf(stderr, "strata exl3-flash: --spec-min-p must be a probability in [0, 1]\n");
+                return 2;
+            }
+        } else if (argument.rfind("--spec-min-p=", 0) == 0) {
+            if (!parse_probability(std::string_view(argument).substr(13), spec_min_p)) {
+                std::fprintf(stderr, "strata exl3-flash: --spec-min-p must be a probability in [0, 1]\n");
+                return 2;
+            }
         } else if (argument == "--max-t") {
             int64_t value = 0;
             if (!parse_i64(next("--max-t"), value) || value != 1) {
@@ -368,6 +393,7 @@ int exl3_flash_main(int argc, char** argv) {
     strata::core::Exl3FlashSnapshot snap;
     size_t spec_drafted = 0;
     size_t spec_accepted = 0;
+    size_t spec_cut = 0;
     const auto emit_token = [&](int32_t token) {
         generated.push_back(token);
         if (!dump_path.empty())
@@ -393,7 +419,9 @@ int exl3_flash_main(int argc, char** argv) {
             for (int round = 1; round < spec && !window_done; ++round) {
                 if (static_cast<int64_t>(generated.size()) + 1 >= max_new) break;
                 int32_t draft = -1;
-                if (!model.mtp_draft(cur, cur_pos - 1, draft, nullptr, err)) {
+                float draft_prob = 0.0f;
+                if (!model.mtp_draft(cur, cur_pos - 1, draft, nullptr, err,
+                                     spec_min_p > 0.0 ? &draft_prob : nullptr)) {
                     std::fprintf(stderr, "strata exl3-flash: draft position %lld: %s\n", (long long) cur_pos, err.c_str());
                     return 1;
                 }
@@ -412,6 +440,15 @@ int exl3_flash_main(int argc, char** argv) {
                 emit_token(cur);
                 if (stop_eos && std::find(eos.begin(), eos.end(), cur) != eos.end()) window_done = true;
                 if (static_cast<int64_t>(generated.size()) >= max_new) window_done = true;
+                // --spec-min-p: a draft the MTP head itself is unsure of ends
+                // the chain here; the drafts already accepted stand, and the
+                // window closes as if every draft had been proposed.  The
+                // token stream is unchanged: unproposed drafts would only
+                // have been verified, never emitted unverified.
+                if (!window_done && !strata::core::exl3_flash_spec_extends(draft_prob, spec_min_p)) {
+                    ++spec_cut;
+                    break;
+                }
             }
             if (window_done) break;
             if (attempted > 0 && accepted == attempted) {
@@ -465,6 +502,8 @@ int exl3_flash_main(int argc, char** argv) {
         std::fprintf(stderr, "strata (qwen4exp-exl3): spec%d drafts %zu accepted %zu (%.1f %%)\n", spec,
                      spec_drafted, spec_accepted,
                      spec_drafted == 0 ? 0.0 : 100.0 * static_cast<double>(spec_accepted) / static_cast<double>(spec_drafted));
+    if (use_spec && spec_min_p > 0.0)
+        std::fprintf(stderr, "strata (qwen4exp-exl3): spec-min-p %.3f cut %zu windows\n", spec_min_p, spec_cut);
     return 0;
 }
 
