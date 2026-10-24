@@ -6,8 +6,10 @@
 // A bounded, graph-capturable grouped routed expert correctness path.
 #include "strata/kernels/exl3_grouped.hpp"
 
+#include "strata/core/per_device.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/exl3_fused.hpp"
+#include "strata/kernels/exl3_grouped_launch.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "cuda_intrinsics.hpp"
 #include "exl3_cb2.hpp"
@@ -617,25 +619,163 @@ bool grouped_cooperative_capability(const sycl::queue& queue) {
     }
 }
 
+// The gate/up dot as a named kernel: the launch chooses its K split from the registers the
+// compiled kernel takes, which the host can only ask of a kernel it can name (the CodePlay
+// kernel query, as iq_mmq.cpp asks a named kernel its work-group size).
+template <bool HalfFma>
+struct GateUpDotKernel {
+    GroupedPlan plan;
+    float* scratch;
+    int64_t plane;
+    int split_k;
+    size_t tiles;
+    size_t columns;
+    bool word_tile;
+    int64_t k_iters;
+    sycl::local_accessor<float, 1> reduce;
+
+    [[sycl::reqd_sub_group_size(32)]] void operator()(sycl::nd_item<1> item) const {
+        const sycl::sub_group subgroup = item.get_sub_group();
+        const int lane = static_cast<int>(subgroup.get_local_id()[0]);
+        const int wave = static_cast<int>(item.get_local_id(0)) / 32;
+        const int column_lane = word_tile ? lane & 15 : lane >> 2;
+        const int k_lane = word_tile ? lane >> 4 : lane & 3;
+        const size_t group = static_cast<size_t>(item.get_group_linear_id());
+        const int32_t entry = static_cast<int32_t>(group / tiles);
+        const int64_t tile = static_cast<int64_t>(group % tiles);
+        const int64_t col = tile * static_cast<int64_t>(columns) + column_lane;
+        const ResolvedEntry resolved = resolve_entry(plan, entry);
+        const bool active = resolved.valid && col < resolved.ff;
+        const float* gate_input = active ? scratch + static_cast<size_t>(entry) * static_cast<size_t>(plane) : nullptr;
+        const float* up_input = active ? scratch + static_cast<size_t>(plan.max_entries) * static_cast<size_t>(plane) +
+                                               static_cast<size_t>(entry) * static_cast<size_t>(plane)
+                                       : nullptr;
+        const int64_t iter_begin = (k_iters * wave) / split_k;
+        const int64_t iter_end = (k_iters * (wave + 1)) / split_k;
+        GroupedPartial gate_partial;
+        GroupedPartial up_partial;
+        if (active) {
+            if (resolved.gate.is_packed()) {
+                const MatrixView gate = resolved.gate.packed_matrix();
+                if (gate.codebook == 2 && word_tile && iter_begin % 4 == 0 && iter_end % 4 == 0) {
+                    gate_partial = grouped_word_dot_dispatch<HalfFma>(gate, gate_input, col, iter_begin * 4,
+                                                                      iter_end * 4, subgroup, lane);
+                } else {
+                    gate_partial = grouped_scalar_partial<HalfFma>(gate, gate_input, col, iter_begin, iter_end, k_lane,
+                                                                   word_tile);
+                }
+            } else if (wave == 0 && k_lane == 0) {
+                // Preserve the existing raw/mixed projection summation order; only packed EXL3 dots are K-split.
+                gate_partial.even = dot_value<HalfFma>(resolved.gate, gate_input, col);
+            }
+            if (resolved.up.is_packed()) {
+                const MatrixView up = resolved.up.packed_matrix();
+                if (up.codebook == 2 && word_tile && iter_begin % 4 == 0 && iter_end % 4 == 0) {
+                    up_partial = grouped_word_dot_dispatch<HalfFma>(up, up_input, col, iter_begin * 4, iter_end * 4,
+                                                                     subgroup, lane);
+                } else {
+                    up_partial = grouped_scalar_partial<HalfFma>(up, up_input, col, iter_begin, iter_end, k_lane,
+                                                                  word_tile);
+                }
+            } else if (wave == 0 && k_lane == 0) {
+                up_partial.even = dot_value<HalfFma>(resolved.up, up_input, col);
+            }
+        }
+        const float gate_reduced = reduce_grouped_partial(gate_partial, subgroup, word_tile);
+        const float up_reduced = reduce_grouped_partial(up_partial, subgroup, word_tile);
+        if (active && k_lane == 0) {
+            reduce[static_cast<size_t>(wave) * 16u + static_cast<size_t>(column_lane)] = gate_reduced;
+            reduce[static_cast<size_t>(split_k) * 16u + static_cast<size_t>(wave) * 16u +
+                   static_cast<size_t>(column_lane)] = up_reduced;
+        }
+        item.barrier();
+        if (active && wave == 0 && k_lane == 0) {
+            float gate_sum = 0.0f;
+            float up_sum = 0.0f;
+            for (int w = 0; w < split_k; ++w) {
+                gate_sum += reduce[static_cast<size_t>(w) * 16u + static_cast<size_t>(column_lane)];
+                up_sum += reduce[static_cast<size_t>(split_k) * 16u + static_cast<size_t>(w) * 16u +
+                                 static_cast<size_t>(column_lane)];
+            }
+            float* gate_dot = scratch + 2 * static_cast<size_t>(plan.max_entries) * static_cast<size_t>(plane) +
+                              static_cast<size_t>(entry) * static_cast<size_t>(plane);
+            float* up_dot = scratch + 3 * static_cast<size_t>(plan.max_entries) * static_cast<size_t>(plane) +
+                            static_cast<size_t>(entry) * static_cast<size_t>(plane);
+            gate_dot[col] = gate_sum;
+            up_dot[col] = up_sum;
+        }
+    }
+};
+
+// What the compiled gate/up dot reports of itself, asked once a device: the registers a
+// work-item takes and the largest work-group the driver admits for it (which already folds
+// in the register allocation's granularity).  Building the kernel bundle compiles the
+// kernel, which the launch that follows does anyway.  0 where the backend does not report a
+// value (the Intel paths today), which leaves that term of gate_up_split_k unbound rather
+// than guessing a count for a device not measured.
+struct GateUpKernelLimits {
+    uint32_t registers_per_work_item = 0;
+    size_t max_work_group_size = 0;
+};
+
+template <bool HalfFma>
+GateUpKernelLimits gate_up_kernel_limits(const sycl::queue& queue) {
+    static core::PerDevice<GateUpKernelLimits> per_device;
+    return per_device.get(queue.get_device(), [&queue]() -> GateUpKernelLimits {
+        GateUpKernelLimits limits;
+        try {
+            const sycl::device device = queue.get_device();
+            const sycl::kernel_id id = sycl::get_kernel_id<GateUpDotKernel<HalfFma>>();
+            const auto bundle = sycl::get_kernel_bundle<sycl::bundle_state::executable>(queue.get_context(),
+                                                                                         {device}, {id});
+            const sycl::kernel kernel = bundle.get_kernel(id);
+            limits.registers_per_work_item =
+                kernel.template get_info<sycl::info::kernel_device_specific::ext_codeplay_num_regs>(device);
+            limits.max_work_group_size =
+                kernel.template get_info<sycl::info::kernel_device_specific::work_group_size>(device);
+        } catch (...) {
+        }
+        return limits;
+    });
+}
+
+// The registers a work-group may take, from the device (the CodePlay device query: CUDA's
+// regsPerBlock, HIP's counterpart).  0 where the device does not report it.
+uint32_t max_registers_per_work_group(const sycl::device& device) {
+#if defined(SYCL_EXT_CODEPLAY_MAX_REGISTERS_PER_WORK_GROUP_QUERY)
+    try {
+        return device.get_info<sycl::ext::codeplay::experimental::info::device::max_registers_per_work_group>();
+    } catch (...) {
+        return 0;
+    }
+#else
+    (void) device;
+    return 0;
+#endif
+}
+
+template <bool HalfFma>
 int gate_up_split_k(const sycl::queue& queue, const GroupedPlan& plan) {
     if (plan.hidden <= 0 || (plan.hidden & 3) != 0) return 1;
     try {
-        const auto device = queue.get_device();
-        const size_t max_waves = device.get_info<sycl::info::device::max_work_group_size>() / 32;
-        const size_t subgroup_limit = device.get_info<sycl::info::device::max_num_sub_groups>();
-        // Each wave reserves two padded 16-column planes for the eight gate/up partials.
-        const size_t local_waves = device.get_info<sycl::info::device::local_mem_size>() / (2 * 16 * sizeof(float));
-        const size_t cap = std::max<size_t>(1, std::min({max_waves, subgroup_limit, local_waves}));
-        int split = static_cast<int>(std::min<size_t>(static_cast<size_t>(plan.hidden / 4), cap));
+        GateUpSplitLimits limits;
+        const sycl::device device = queue.get_device();
+        limits.max_work_group_size = device.get_info<sycl::info::device::max_work_group_size>();
+        limits.max_num_sub_groups = device.get_info<sycl::info::device::max_num_sub_groups>();
+        limits.local_mem_size = device.get_info<sycl::info::device::local_mem_size>();
+        limits.max_registers_per_work_group = max_registers_per_work_group(device);
+        const GateUpKernelLimits kernel_limits = gate_up_kernel_limits<HalfFma>(queue);
+        limits.registers_per_work_item = kernel_limits.registers_per_work_item;
+        limits.kernel_max_work_group_size = kernel_limits.max_work_group_size;
+        limits.hidden = plan.hidden;
         // An explicit upper bound supports per-device tuning without embedding a one-device threshold.
         const char* text = std::getenv("STRATA_EXL3_GU_SPLIT_K");
         if (text != nullptr) {
             char* end = nullptr;
             const long requested = std::strtol(text, &end, 10);
-            if (end != text && *end == '\0' && requested > 0)
-                split = static_cast<int>(std::min<long>(split, requested));
+            if (end != text && *end == '\0' && requested > 0) limits.env_override = requested;
         }
-        return std::max(1, split);
+        return gate_up_split_k(limits);
     } catch (...) {
         return 1;
     }
@@ -644,7 +784,7 @@ int gate_up_split_k(const sycl::queue& queue, const GroupedPlan& plan) {
 template <bool HalfFma>
 sycl::event submit_gate_up_dot_cooperative(sycl::queue& queue, const GroupedPlan& plan, float* scratch,
                                            int64_t plane, const std::vector<sycl::event>& deps) {
-    const int split_k = gate_up_split_k(queue, plan);
+    const int split_k = gate_up_split_k<HalfFma>(queue, plan);
     const bool word_tile = grouped_word_tile_enabled();
     const size_t columns = word_tile ? 16u : 8u;
     const size_t tiles = (static_cast<size_t>(plan.max_ff) + columns - 1) / columns;
@@ -654,78 +794,8 @@ sycl::event submit_gate_up_dot_cooperative(sycl::queue& queue, const GroupedPlan
     return queue.submit([&](sycl::handler& h) {
         if (!deps.empty()) h.depends_on(deps);
         sycl::local_accessor<float, 1> reduce(sycl::range<1>(static_cast<size_t>(split_k) * 32u), h);
-        h.parallel_for(sycl::nd_range<1>(sycl::range<1>(groups * local_size), sycl::range<1>(local_size)),
-                       [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
-            const sycl::sub_group subgroup = item.get_sub_group();
-            const int lane = static_cast<int>(subgroup.get_local_id()[0]);
-            const int wave = static_cast<int>(item.get_local_id(0)) / 32;
-            const int column_lane = word_tile ? lane & 15 : lane >> 2;
-            const int k_lane = word_tile ? lane >> 4 : lane & 3;
-            const size_t group = static_cast<size_t>(item.get_group_linear_id());
-            const int32_t entry = static_cast<int32_t>(group / tiles);
-            const int64_t tile = static_cast<int64_t>(group % tiles);
-            const int64_t col = tile * static_cast<int64_t>(columns) + column_lane;
-            const ResolvedEntry resolved = resolve_entry(plan, entry);
-            const bool active = resolved.valid && col < resolved.ff;
-            const float* gate_input = active ? scratch + static_cast<size_t>(entry) * static_cast<size_t>(plane) : nullptr;
-            const float* up_input = active ? scratch + static_cast<size_t>(plan.max_entries) * static_cast<size_t>(plane) +
-                                                   static_cast<size_t>(entry) * static_cast<size_t>(plane) : nullptr;
-            const int64_t iter_begin = (k_iters * wave) / split_k;
-            const int64_t iter_end = (k_iters * (wave + 1)) / split_k;
-            GroupedPartial gate_partial;
-            GroupedPartial up_partial;
-            if (active) {
-                if (resolved.gate.is_packed()) {
-                    const MatrixView gate = resolved.gate.packed_matrix();
-                    if (gate.codebook == 2 && word_tile && iter_begin % 4 == 0 && iter_end % 4 == 0) {
-                        gate_partial = grouped_word_dot_dispatch<HalfFma>(gate, gate_input, col, iter_begin * 4,
-                                                                         iter_end * 4, subgroup, lane);
-                    } else {
-                        gate_partial = grouped_scalar_partial<HalfFma>(gate, gate_input, col, iter_begin,
-                                                                     iter_end, k_lane, word_tile);
-                    }
-                } else if (wave == 0 && k_lane == 0) {
-                    // Preserve the existing raw/mixed projection summation order; only packed EXL3 dots are K-split.
-                    gate_partial.even = dot_value<HalfFma>(resolved.gate, gate_input, col);
-                }
-                if (resolved.up.is_packed()) {
-                    const MatrixView up = resolved.up.packed_matrix();
-                    if (up.codebook == 2 && word_tile && iter_begin % 4 == 0 && iter_end % 4 == 0) {
-                        up_partial = grouped_word_dot_dispatch<HalfFma>(up, up_input, col, iter_begin * 4,
-                                                                       iter_end * 4, subgroup, lane);
-                    } else {
-                        up_partial = grouped_scalar_partial<HalfFma>(up, up_input, col, iter_begin,
-                                                                   iter_end, k_lane, word_tile);
-                    }
-                } else if (wave == 0 && k_lane == 0) {
-                    // Preserve the existing raw/mixed projection summation order; only packed EXL3 dots are K-split.
-                    up_partial.even = dot_value<HalfFma>(resolved.up, up_input, col);
-                }
-            }
-            const float gate_reduced = reduce_grouped_partial(gate_partial, subgroup, word_tile);
-            const float up_reduced = reduce_grouped_partial(up_partial, subgroup, word_tile);
-            if (active && k_lane == 0) {
-                reduce[static_cast<size_t>(wave) * 16u + static_cast<size_t>(column_lane)] = gate_reduced;
-                reduce[static_cast<size_t>(split_k) * 16u + static_cast<size_t>(wave) * 16u +
-                       static_cast<size_t>(column_lane)] = up_reduced;
-            }
-            item.barrier();
-            if (active && wave == 0 && k_lane == 0) {
-                float gate_sum = 0.0f;
-                float up_sum = 0.0f;
-                for (int w = 0; w < split_k; ++w) {
-                    gate_sum += reduce[static_cast<size_t>(w) * 16u + static_cast<size_t>(column_lane)];
-                    up_sum += reduce[static_cast<size_t>(split_k) * 16u + static_cast<size_t>(w) * 16u +
-                                      static_cast<size_t>(column_lane)];
-                }
-                float* gate_dot = scratch + 2 * static_cast<size_t>(plan.max_entries) * static_cast<size_t>(plane) +
-                                  static_cast<size_t>(entry) * static_cast<size_t>(plane);
-                float* up_dot = scratch + 3 * static_cast<size_t>(plan.max_entries) * static_cast<size_t>(plane) +
-                                static_cast<size_t>(entry) * static_cast<size_t>(plane);
-                gate_dot[col] = gate_sum;
-                up_dot[col] = up_sum;
-            }
-        });
+        GateUpDotKernel<HalfFma> kernel{plan, scratch, plane, split_k, tiles, columns, word_tile, k_iters, reduce};
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>(groups * local_size), sycl::range<1>(local_size)), kernel);
     });
 }
 

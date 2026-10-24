@@ -190,7 +190,10 @@ are GPU resident, the graph builds its route plan from device IDs without CPU ri
 plan/scratch is reused sequentially on an in-order queue. `STRATA_EXL3_RESIDENT_GRAPH=0` or
 `STRATA_VERIFY_SEGMENTED=1` selects the earlier path for comparison. On devices supporting SG32, grouped
 expert H128 transforms use a register FWHT; other devices retain the existing transform.
-Gate/up K partitioning derives from work-group, sub-group and local-memory limits. A positive
+Gate/up K partitioning derives from work-group, sub-group, local-memory and register limits.
+The register limits come from the device's reported registers a work-group and from the compiled
+kernel's reported registers a work-item and largest work-group; a limit the device does not
+report does not bind. A positive
 `STRATA_EXL3_GU_SPLIT_K` sets an upper bound for per-device tuning; `1` selects a single-sub-group
 comparison path.
 

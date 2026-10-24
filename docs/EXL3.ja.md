@@ -180,7 +180,10 @@ expert の residency は実際の blob byte 数と device の容量から決め�
 CPU の ring 応答を省く。同じ owner の plan/scratch は in-order queue 上で順番に再利用する。
 `STRATA_EXL3_RESIDENT_GRAPH=0` または `STRATA_VERIFY_SEGMENTED=1` で比較用に従来経路を選べる。
 SG32 を使える device では grouped expert の H128 変換を register FWHT で実行し、他では既存の変換を使う。
-gate/up の K 分割数は work-group、sub-group と local memory の上限から決める。
+gate/up の K 分割数は work-group、sub-group、local memory と register の上限から決める。
+register の上限は device が報告する work-group あたりの register 数と、コンパイル済み kernel が
+報告する work-item あたりの register 数および最大 work-group size から取る。device が報告しない
+上限は拘束しない。
 `STRATA_EXL3_GU_SPLIT_K` に正の整数を指定すると、その値を上限として device ごとに調整できる。
 `1` は一つの sub-group で積和を実行する比較経路になる。
 
