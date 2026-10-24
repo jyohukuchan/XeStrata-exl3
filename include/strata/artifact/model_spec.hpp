@@ -12,6 +12,9 @@
 //   qwen3moe   Qwen3 MoE (llm-jp-4.1-32b-a3b): full attention only, no shared expert
 //   glm5-next  GLM-5.3-Flash: KDA + NoPE MLA with a k-pool indexer, mHC, leading dense layers, MTP.  Also spelled
 //              `glm5next` (Project Maya's quants, after unsloth's first GGUFs), with the same keys under that name.
+//   lfm2moe    LFM2 MoE (LiquidAI LFM2.5-24B-A2B, HF `Lfm2MoeForCausalLM`): short-conv layers (no K/V heads)
+//              mixed with full-attention layers, leading dense FFN layers, routed experts with an expert bias
+//              and no shared expert.  The shape is read here; no engine block runs it yet (see plain_model.hpp).
 //
 // `block_count` counts the MTP (NextN) layers too; `n_layer` here is the trunk, block_count minus
 // `nextn_predict_layers`, as llama.cpp's `n_layer()`.  A key a model does not carry reads as 0 (or false), and
@@ -28,7 +31,7 @@
 
 namespace strata {
 
-enum class ModelArch { Qwen4Exp, Qwen35Moe, Qwen3Moe, Glm5Next };
+enum class ModelArch { Qwen4Exp, Qwen35Moe, Qwen3Moe, Glm5Next, Lfm2Moe };
 
 /// llama.cpp's `llama_expert_gating_func_type`
 enum class ExpertGating : uint32_t { None = 0, Softmax = 1, Sigmoid = 2 };
@@ -61,6 +64,7 @@ struct ModelSpec {
     int64_t ssm_n_group = 0;              ///< its key heads
     int64_t kda_head_dim = 0;
     double kda_gate_lower_bound = 0;
+    int64_t shortconv_l_cache = 0;        ///< lfm2moe: the short-conv window (kernel) length, state holds one less
 
     // MoE
     int64_t n_expert = 0, n_expert_used = 0;
@@ -70,6 +74,8 @@ struct ModelSpec {
     int64_t n_dense_lead = 0;             ///< leading layers with a dense FFN instead of the MoE
     int64_t n_ff = 0;                     ///< the dense FFN's width
     ExpertGating gating = ExpertGating::None;
+    bool expert_bias = false;             ///< a per-expert bias added to the gating scores for choice (lfm2moe)
+    std::vector<int64_t> n_ff_exp_layer;  ///< per-layer expert width when written as an array, else empty
     bool expert_weights_norm = false;
     double expert_weights_scale = 0;
     std::vector<double> swiglu_clamp_exp, swiglu_clamp_shexp;   ///< per layer, empty when not written
@@ -122,6 +128,22 @@ inline bool spec_per_layer(const GgufFile& g, const std::string& arch, const cha
     }
     return true;
 }
+/// The integer form of spec_per_layer (llama.cpp writes some widths as one integer per layer).
+inline bool spec_per_layer_int(const GgufFile& g, const std::string& arch, const char* key, int64_t n,
+                               std::vector<int64_t>& out) {
+    out.clear();
+    const MetaValue* v = spec_get(g, arch, key);
+    if (!v) return false;
+    if (v->type == MetaType::ARRAY) {
+        if ((int64_t) v->items.size() != n) return false;
+        for (const MetaValue& e : v->items) out.push_back((int64_t) e.u);
+    } else if (v->is_num()) {
+        out.assign((size_t) n, (int64_t) v->u);
+    } else {
+        return false;
+    }
+    return true;
+}
 
 }  // namespace detail
 
@@ -138,7 +160,8 @@ inline bool read_model_spec(const GgufFile& g, ModelSpec& s, std::string& err) {
     else if (A == "qwen35moe") s.arch = ModelArch::Qwen35Moe;
     else if (A == "qwen3moe") s.arch = ModelArch::Qwen3Moe;
     else if (A == "glm5-next" || A == "glm5next") s.arch = ModelArch::Glm5Next;
-    else { err = "architecture '" + A + "' is not supported (qwen4exp, qwen35moe, qwen3moe, glm5-next)"; return false; }
+    else if (A == "lfm2moe") s.arch = ModelArch::Lfm2Moe;
+    else { err = "architecture '" + A + "' is not supported (qwen4exp, qwen35moe, qwen3moe, glm5-next, lfm2moe)"; return false; }
 
     // the keys every architecture here needs
     const char* required[] = {"block_count", "embedding_length", "attention.head_count", "expert_count",
@@ -187,6 +210,7 @@ inline bool read_model_spec(const GgufFile& g, ModelSpec& s, std::string& err) {
     s.ssm_n_group = spec_int(g, A, "ssm.group_count");
     s.kda_head_dim = spec_int(g, A, "kda.head_dim");
     s.kda_gate_lower_bound = spec_num(g, A, "kda.gate_lower_bound");
+    s.shortconv_l_cache = spec_int(g, A, "shortconv.l_cache");
 
     // which layers are recurrent: llama.cpp's rule per architecture
     s.recurrent.assign((size_t) n_all, false);
@@ -211,6 +235,21 @@ inline bool read_model_spec(const GgufFile& g, ModelSpec& s, std::string& err) {
         // glm5-next.cpp: a layer without K/V heads is a KDA layer
         for (int64_t i = 0; i < s.n_layer; ++i) s.recurrent[(size_t) i] = s.n_head_kv[(size_t) i] == 0;
         break;
+    case ModelArch::Lfm2Moe:
+        // lfm2moe.cpp: a layer without K/V heads is a short-conv layer; the pattern comes from the per-layer
+        // head_count_kv the converter writes, so that key has to be there to tell the two layer kinds apart
+        if (!spec_get(g, A, "attention.head_count_kv")) {
+            err = "missing " + A + ".attention.head_count_kv (the short-conv layers are the ones without K/V heads)";
+            return false;
+        }
+        for (int64_t i = 0; i < s.n_layer; ++i) s.recurrent[(size_t) i] = s.n_head_kv[(size_t) i] == 0;
+        if (s.shortconv_l_cache <= 1) {
+            err = A + ".shortconv.l_cache " + std::to_string(s.shortconv_l_cache) + ", the short-conv layers need one above 1";
+            return false;
+        }
+        // llama.cpp's lfm2moe loader requires the per-expert bias tensor (HF use_expert_bias) on MoE layers
+        s.expert_bias = true;
+        break;
     case ModelArch::Qwen3Moe:
         break;
     }
@@ -222,9 +261,21 @@ inline bool read_model_spec(const GgufFile& g, ModelSpec& s, std::string& err) {
     s.n_expert_shared = spec_int(g, A, "expert_shared_count", s.n_ff_shexp > 0 ? 1 : 0);
     s.n_dense_lead = spec_int(g, A, "leading_dense_block_count");
     s.n_ff = spec_int(g, A, "feed_forward_length");
+    // lfm2moe writes the expert width as one number or one per layer (llama.cpp's get_key_or_arr); the array
+    // form is kept whole, and n_ff_exp above already holds its first routed layer's width from the scalar read
+    if (const MetaValue* v = spec_get(g, A, "expert_feed_forward_length");
+        v != nullptr && v->type == MetaType::ARRAY) {
+        if (!spec_per_layer_int(g, A, "expert_feed_forward_length", n_all, s.n_ff_exp_layer)) {
+            err = A + ".expert_feed_forward_length is neither a number nor one per layer";
+            return false;
+        }
+        for (int64_t i = 0; i < s.n_layer; ++i)
+            if (s.layer_routes(i) && s.n_ff_exp_layer[(size_t) i] > 0) { s.n_ff_exp = s.n_ff_exp_layer[(size_t) i]; break; }
+    }
     s.gating = (ExpertGating) spec_int(g, A, "expert_gating_func");
-    if (s.gating == ExpertGating::None)   // llama.cpp's defaults: GLM-5.3-Flash sigmoid, the Qwens softmax
-        s.gating = s.arch == ModelArch::Glm5Next ? ExpertGating::Sigmoid : ExpertGating::Softmax;
+    if (s.gating == ExpertGating::None)   // llama.cpp's defaults: GLM-5.3-Flash and LFM2 MoE sigmoid, the Qwens softmax
+        s.gating = s.arch == ModelArch::Glm5Next || s.arch == ModelArch::Lfm2Moe ? ExpertGating::Sigmoid
+                                                                                  : ExpertGating::Softmax;
     if (s.gating != ExpertGating::Softmax && s.gating != ExpertGating::Sigmoid) {
         err = A + ".expert_gating_func " + std::to_string((uint32_t) s.gating) + " is not supported";
         return false;

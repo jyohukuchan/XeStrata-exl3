@@ -12,7 +12,7 @@
 
 namespace strata::artifact::exl3 {
 
-enum class ModelFamily { qwen35, qwen38 };
+enum class ModelFamily { qwen35, qwen38, lfm2moe };
 
 enum class ProjectionKind {
     gdn_qkv, gdn_z, gdn_out, gdn_alpha, gdn_beta,
@@ -133,7 +133,8 @@ struct ModelMap {
     bool require_supported(std::string& err) const;
 };
 
-/// Discover and validate the explicit Qwen3.5/Qwen3.8 mapping from the
+/// Discover and validate the explicit Qwen3.5/Qwen3.8 mapping (an LFM2 MoE archive is recognized, its
+/// geometry recorded, and the engine pieces it still lacks listed in `unsupported`) from the
 /// archive's config, EXL3 descriptors, and raw tensor headers. This reads no
 /// weight payloads and returns a useful partial map with `unsupported` reasons
 /// for recognized but not yet engine-compatible variants.

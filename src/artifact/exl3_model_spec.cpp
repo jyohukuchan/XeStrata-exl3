@@ -180,9 +180,97 @@ bool read_exl3_model_spec(const Archive& archive, strata::ModelSpec& spec, std::
         const std::string model_type = model_type_value->get<std::string>();
         const bool qwen35 = model_type == "qwen3_5_moe_text" || model_type == "qwen3_5_moe";
         const bool qwen38 = model_type == "qwen4_exp_text" || model_type == "qwen4_exp";
-        if (!qwen35 && !qwen38) {
+        const bool lfm2 = model_type == "lfm2_moe";
+        if (!qwen35 && !qwen38 && !lfm2) {
             err = "EXL3 model spec: unsupported model_type " + model_type;
             return false;
+        }
+        if (lfm2) {
+            // LFM2 MoE (HF Lfm2MoeForCausalLM): short-conv and full-attention layers, leading dense FFN
+            // layers, routed experts with an expert bias and no shared expert.  The geometry lands in the
+            // same ModelSpec the GGUF reader fills; which engine block could run it is the model map's call.
+            if (include_mtp) {
+                err = "EXL3 model spec: LFM2 MoE has no MTP layer this engine reads";
+                return false;
+            }
+            spec.arch = strata::ModelArch::Lfm2Moe;
+            spec.arch_name = "lfm2moe";
+            spec.n_nextn = 0;
+            int64_t vocab_lfm = 0, kv_heads_lfm = 0;
+            if (!required_int(*text, "num_hidden_layers", spec.n_layer, err) ||
+                !required_int(*text, "hidden_size", spec.n_embd, err) ||
+                !required_int(*text, "vocab_size", vocab_lfm, err) ||
+                !required_int(*text, "num_attention_heads", spec.n_head, err) ||
+                !required_int(*text, "num_key_value_heads", kv_heads_lfm, err) ||
+                !required_int(*text, "max_position_embeddings", spec.context_length, err))
+                return false;
+            const Json* eps_field = object_field(*text, "norm_eps");
+            if (eps_field == nullptr) eps_field = object_field(*text, "rms_norm_eps");
+            if (eps_field == nullptr || !eps_field->is_number() || eps_field->get<double>() <= 0.0) {
+                err = "EXL3 model spec: missing or non-positive config field norm_eps";
+                return false;
+            }
+            spec.rms_eps = eps_field->get<double>();
+            spec.key_length = spec.n_head > 0 ? spec.n_embd / spec.n_head : 0;
+            if (!optional_int(*text, "head_dim", spec.key_length, err)) return false;
+            spec.value_length = spec.key_length;
+            if (!positive(spec.n_layer, "num_hidden_layers", err) || !positive(spec.n_embd, "hidden_size", err) ||
+                !positive(vocab_lfm, "vocab_size", err) || !positive(spec.n_head, "num_attention_heads", err) ||
+                !positive(kv_heads_lfm, "num_key_value_heads", err) || !positive(spec.key_length, "head_dim", err) ||
+                !positive(spec.context_length, "max_position_embeddings", err))
+                return false;
+            const Json* layer_types_lfm = nullptr;
+            if (!required_array(*text, "layer_types", layer_types_lfm, err) ||
+                static_cast<int64_t>(layer_types_lfm->size()) != spec.n_layer) {
+                err = "EXL3 model spec: layer_types must contain exactly num_hidden_layers entries";
+                return false;
+            }
+            spec.n_head_kv.assign(static_cast<size_t>(spec.n_layer), 0);
+            spec.recurrent.assign(static_cast<size_t>(spec.n_layer), false);
+            for (int64_t layer = 0; layer < spec.n_layer; ++layer) {
+                const auto& item = (*layer_types_lfm)[static_cast<size_t>(layer)];
+                if (!item.is_string() || (item.get<std::string>() != "conv" && item.get<std::string>() != "full_attention")) {
+                    err = "EXL3 model spec: layer_types contains an unsupported layer type";
+                    return false;
+                }
+                const bool conv = item.get<std::string>() == "conv";
+                spec.recurrent[static_cast<size_t>(layer)] = conv;
+                spec.n_head_kv[static_cast<size_t>(layer)] = conv ? 0 : kv_heads_lfm;
+            }
+            if (!required_int(*text, "conv_L_cache", spec.shortconv_l_cache, err) ||
+                spec.shortconv_l_cache <= 1) {
+                if (err.empty()) err = "EXL3 model spec: conv_L_cache must be above 1";
+                return false;
+            }
+            if (!optional_int(*text, "num_dense_layers", spec.n_dense_lead, err) ||
+                !optional_int(*text, "intermediate_size", spec.n_ff, err))
+                return false;
+            if (spec.n_dense_lead < 0 || spec.n_dense_lead >= spec.n_layer ||
+                (spec.n_dense_lead > 0 && !positive(spec.n_ff, "intermediate_size", err)))
+                return false;
+            if (!required_int(*text, "num_experts", spec.n_expert, err) ||
+                !required_int(*text, "num_experts_per_tok", spec.n_expert_used, err) ||
+                !required_int(*text, "moe_intermediate_size", spec.n_ff_exp, err))
+                return false;
+            if (!positive(spec.n_expert, "num_experts", err) ||
+                !positive(spec.n_expert_used, "num_experts_per_tok", err) ||
+                spec.n_expert_used > spec.n_expert || !positive(spec.n_ff_exp, "moe_intermediate_size", err))
+                return false;
+            spec.n_ff_shexp = 0;
+            spec.n_expert_shared = 0;
+            spec.gating = strata::ExpertGating::Sigmoid;
+            if (!optional_bool(*text, "use_expert_bias", spec.expert_bias, err) ||
+                !optional_bool(*text, "norm_topk_prob", spec.expert_weights_norm, err) ||
+                !optional_num(*text, "routed_scaling_factor", spec.expert_weights_scale, err))
+                return false;
+            const Json* rope_lfm = object_field(*text, "rope_parameters");
+            if (rope_lfm == nullptr || !rope_lfm->is_object() ||
+                !required_num(*rope_lfm, "rope_theta", spec.rope_base, err) || spec.rope_base <= 0.0) {
+                if (err.empty()) err = "EXL3 model spec: rope_parameters.rope_theta is missing";
+                return false;
+            }
+            spec.rope_dims = spec.key_length;   // LFM2 rotates the whole head
+            return true;
         }
         spec.arch = qwen35 ? strata::ModelArch::Qwen35Moe : strata::ModelArch::Qwen4Exp;
         spec.arch_name = qwen35 ? "qwen35moe" : "qwen4exp";

@@ -348,7 +348,14 @@ const char* projection_kind_name(ProjectionKind kind) {
     return "unknown";
 }
 
-const char* model_family_name(ModelFamily family) { return family == ModelFamily::qwen35 ? "qwen35" : "qwen38"; }
+const char* model_family_name(ModelFamily family) {
+    switch (family) {
+        case ModelFamily::qwen35: return "qwen35";
+        case ModelFamily::qwen38: return "qwen38";
+        case ModelFamily::lfm2moe: return "lfm2moe";
+    }
+    return "qwen38";
+}
 
 const char* value_transform_name(ValueTransform transform) {
     switch (transform) {
@@ -376,9 +383,43 @@ bool build_model_map(const Archive& archive, ModelMap& result, std::string& err,
         if (model_type == "qwen4_exp" || model_type == "qwen4_exp_text") result.family = ModelFamily::qwen38;
         else if (model_type == "qwen3_5_moe" || model_type == "qwen3_5_moe_text" ||
                  model_type == "qwen3_5" || model_type == "qwen3_5_text") result.family = ModelFamily::qwen35;
+        else if (model_type == "lfm2_moe") result.family = ModelFamily::lfm2moe;
         else {
             err = "EXL3 model map: unsupported model_type " + model_type;
             return false;
+        }
+        if (result.family == ModelFamily::lfm2moe) {
+            // LFM2 MoE: the geometry is recorded and the embedding/head are mapped, but no engine block
+            // runs this family yet; the reasons below name exactly what is missing, in the map's own terms.
+            auto& g = result.geometry;
+            g.hidden_size = int_value(*text, "hidden_size");
+            g.vocab_size = int_value(*text, "vocab_size", int_value(config, "vocab_size"));
+            g.layers = int_value(*text, "num_hidden_layers");
+            g.experts = int_value(*text, "num_experts");
+            g.experts_per_token = int_value(*text, "num_experts_per_tok");
+            g.moe_intermediate = int_value(*text, "moe_intermediate_size");
+            g.q_heads = int_value(*text, "num_attention_heads");
+            g.kv_heads = int_value(*text, "num_key_value_heads", g.q_heads);
+            g.head_dim = int_value(*text, "head_dim", g.q_heads > 0 ? g.hidden_size / g.q_heads : 0);
+            if (g.hidden_size <= 0 || g.layers <= 0 || g.experts <= 0 || g.moe_intermediate <= 0)
+                return (err = "EXL3 model map: config has incomplete LFM2 MoE geometry", false);
+            result.source_prefix = "model.layers";
+            if (g.vocab_size <= 0)
+                reason(result, "config has no positive vocab_size for embedding/head mapping");
+            else {
+                add_aux(result, archive, -1, "model.embed_tokens", "token_embd.weight",
+                        g.vocab_size * g.hidden_size, ValueTransform::identity, {}, ProjectionKind::embedding, {1, 0});
+                add_linear(result, archive, ProjectionKind::lm_head, -1, -1, "lm_head", "output.weight",
+                           g.hidden_size, g.vocab_size);
+            }
+            reason(result, "lfm2moe: short-conv (conv) layers have no engine block yet "
+                           "(conv.in_proj/conv/conv.out_proj with a carried conv state)");
+            if (int_value(*text, "num_dense_layers") > 0)
+                reason(result, "lfm2moe: leading dense FFN layers have no engine block yet");
+            if (bool_value(*text, "use_expert_bias", true))
+                reason(result, "lfm2moe: the expert bias (feed_forward.expert_bias) is not applied by the engine router yet");
+            reason(result, "lfm2moe: no engine block runs this family yet; the map records its shape only");
+            return true;
         }
         auto& g = result.geometry;
         g.hidden_size = int_value(*text, "hidden_size");
