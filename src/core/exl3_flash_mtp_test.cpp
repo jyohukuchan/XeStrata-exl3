@@ -8,9 +8,11 @@
 
 #include "strata/artifact/exl3_model_map.hpp"
 
+#include <cmath>
 #include <cstdint>
 #include <iostream>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -116,6 +118,35 @@ int main() {
         }
         std::string err;
         check(!strata::core::exl3_flash_mtp_roles_complete(map, err) && !err.empty(), "missing expert rejected");
+    }
+    {
+        // --spec-min-p's confidence: the draft token's softmax probability.
+        const std::vector<float> flat = {0.0f, 0.0f, 0.0f, 0.0f};
+        check(std::fabs(strata::core::exl3_flash_draft_probability(flat.data(), flat.size(), 0) - 0.25f) < 1e-6f,
+              "draft probability of a flat row is uniform");
+        const std::vector<float> peaked = {2.0f, 0.0f, 0.0f};
+        const double e2 = std::exp(2.0);
+        check(std::fabs(strata::core::exl3_flash_draft_probability(peaked.data(), peaked.size(), 0) -
+                        static_cast<float>(e2 / (e2 + 2.0))) < 1e-6f,
+              "draft probability follows the softmax of the argmax");
+        check(std::fabs(strata::core::exl3_flash_draft_probability(peaked.data(), peaked.size(), 1) -
+                        static_cast<float>(1.0 / (e2 + 2.0))) < 1e-6f,
+              "draft probability follows the softmax off the argmax");
+        check(strata::core::exl3_flash_draft_probability(peaked.data(), peaked.size(), 7) == 0.0f &&
+                  strata::core::exl3_flash_draft_probability(nullptr, peaked.size(), 0) == 0.0f,
+              "draft probability fails closed outside the row");
+        const std::vector<float> shifted = {1002.0f, 1000.0f, 1000.0f};
+        check(std::fabs(strata::core::exl3_flash_draft_probability(shifted.data(), shifted.size(), 0) -
+                        static_cast<float>(e2 / (e2 + 2.0))) < 1e-6f,
+              "draft probability is shift invariant");
+    }
+    {
+        // The chain extends at or above the threshold and stops below it;
+        // a threshold of 0 keeps the plain --spec loop's behaviour.
+        check(strata::core::exl3_flash_spec_extends(0.5f, 0.5), "spec chain extends at the threshold");
+        check(!strata::core::exl3_flash_spec_extends(0.49f, 0.5), "spec chain stops below the threshold");
+        check(strata::core::exl3_flash_spec_extends(0.0f, 0.0), "spec chain never stops at a zero threshold");
+        check(!strata::core::exl3_flash_spec_extends(0.0f, 0.5), "spec chain stops on a zero probability");
     }
     if (failures != 0) {
         std::cerr << failures << " MTP role check(s) failed\n";

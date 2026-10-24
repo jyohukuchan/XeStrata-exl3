@@ -218,6 +218,13 @@ window は snapshot から戻して AR で書き直すので、token 列と logi
 非キャプチャで expert は CPU pool のため、今は AR より遅い。vision、serve、batch と複数 token の
 prompt chunk は引き続き要求時に拒否する。Qwen3.5 の CLI/MTP 接続は次の経路を使う。
 
+`--spec-min-p P`（0〜1 の確率、既定 0）は draft loop を選択的にする。MTP head の下での
+softmax 確率が P 未満の draft の後は、その窓ではそれ以上 draft を提案しない（窓の最初の
+draft は常に出す）。既に accept された draft はそのまま残り、窓は全 draft を提案した
+場合と全く同じに閉じるため、生成 token 列と logits は AR および通常の `--spec` と引き続き
+一致し、変わるのは窓が verify する draft の数だけである。閾値 0 では連鎖は止まらず、
+通常の `--spec` の動作になる。実行は閾値で打ち切った窓の数を報告する。
+
 ### device cache（Qwen3.8 Flash）
 
 Qwen3.8 Flash の接続は、GPU が保持する expert の device cache を使う。cache の大きさは

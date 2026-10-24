@@ -227,6 +227,13 @@ window rewinds from a snapshot and is rewritten with AR, so tokens and logits ma
 uncaptured with CPU-pool experts, so it is currently slower than AR. Vision, serve, batch and multi-token
 prompt chunks are still rejected on request. Qwen3.5 CLI/MTP uses the following path.
 
+`--spec-min-p P` (a probability in [0, 1], default 0) makes the draft loop selective: after a draft
+whose own softmax probability under the MTP head is below P, the window proposes no further drafts
+(the first draft of a window is always proposed). Drafts already accepted stand, and the window
+closes exactly as if every draft had been proposed, so the generated tokens and logits still match
+AR and plain `--spec`; only how many drafts a window verifies changes. A threshold of 0 never stops
+a chain, which is the plain `--spec` behaviour. The run reports how many windows the threshold cut.
+
 ### The device cache (Qwen3.8 Flash)
 
 The Qwen3.8 Flash integration keeps its experts in a device cache on the GPU. The cache's size comes from
