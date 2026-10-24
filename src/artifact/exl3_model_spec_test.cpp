@@ -78,6 +78,21 @@ int main() {
         failures += !check(!strata::artifact::exl3::read_exl3_model_spec(q38_archive, q38, err, true) &&
                                err.find("external official raw MTP") != std::string::npos,
                            "Qwen3.8 unbound MTP rejection");
+        write_archive(root / "q35", base_config("qwen3_5_moe_text"));
+        strata::artifact::exl3::Archive q35_archive(root / "q35");
+        strata::ModelSpec q35;
+        failures += !check(strata::artifact::exl3::read_exl3_model_spec(q35_archive, q35, err), "Qwen3.5 MoE trunk config");
+        failures += !check(q35.arch == strata::ModelArch::Qwen35Moe && q35.arch_name == "qwen35moe" &&
+                               q35.n_layer == 4 && q35.n_nextn == 0 && q35.n_head_kv.size() == 4 &&
+                               q35.recurrent.size() == 4 && q35.recurrent[0] && q35.recurrent[1] && q35.recurrent[2] &&
+                               !q35.recurrent[3] && q35.ssm_d_inner == 4096 && q35.ssm_d_state == 128 &&
+                               q35.ssm_dt_rank == 32 && q35.ssm_n_group == 16 && q35.ssm_d_conv == 4 &&
+                               q35.n_expert == 256 && q35.n_expert_used == 8 && q35.n_ff_shexp == 512 &&
+                               q35.n_expert_shared == 1 && q35.rope_dims == 32,
+                           "Qwen3.5 MoE typed geometry");
+        failures += !check(!strata::artifact::exl3::read_exl3_model_spec(q35_archive, q35, err, true) &&
+                               err.find("Qwen3.5 MTP was requested") != std::string::npos,
+                           "Qwen3.5 unbound MTP rejection");
         Json malformed = base_config("qwen3_5_moe_text");
         malformed["text_config"].erase("linear_key_head_dim");
         write_archive(root / "bad", malformed);
