@@ -28,6 +28,19 @@ constexpr float kHadamardScale = 0.08838834764831845f;  // 1 / sqrt(128), as in 
 // The number of 16x16 K tiles one physical wave of the packed path reads.  A wave that covers more
 // of the K span reads its tiles one after the other and cannot overlap the loads.
 constexpr uint64_t kWaveTileSpan = 16;
+// STRATA_EXL3_WAVE_TILE_SPAN overrides it for measurement; the default is the value measured on a
+// card with 36 compute units.
+inline uint64_t wave_tile_span() {
+    static const uint64_t span = [] {
+        const char* text = std::getenv("STRATA_EXL3_WAVE_TILE_SPAN");
+        if (text == nullptr) return kWaveTileSpan;
+        char* end = nullptr;
+        const unsigned long long value = std::strtoull(text, &end, 10);
+        if (end == text || value == 0) return kWaveTileSpan;
+        return (uint64_t) value;
+    }();
+    return span;
+}
 // gitleaks:allow -- public EXL3 codebook multipliers and bit masks, never credentials.
 
 inline void check_view(const MatrixView& view, const char* who) {
@@ -580,7 +593,8 @@ bool submit_packed_dot_dispatch(sycl::queue& queue, const MatrixView& view, cons
         // several loads in flight; the bound is the number of 16x16 K tiles a wave reads (256 K
         // elements), measured on a card with 36 compute units and re-measurable on any other.
         const uint64_t k_tiles = static_cast<uint64_t>(view.k / 16);
-        const uint64_t pipelined = (k_tiles + kWaveTileSpan - 1) / kWaveTileSpan;
+        const uint64_t span = wave_tile_span();
+        const uint64_t pipelined = (k_tiles + span - 1) / span;
         physical_waves = static_cast<int>(std::max<uint64_t>(static_cast<uint64_t>(physical_waves),
                                                             std::min<uint64_t>(waves_per_group, pipelined)));
     }
