@@ -93,7 +93,7 @@ EXL3 は exllamav3 の量子化形式で、**同じ大きさなら I-Quant よ�
 XeStrata はこの形式をコマンドラインから読み込めます（サーバーの経路にはまだありません）。
 
 - **読み込むもの**: EXL3 の checkpoint（safetensors の重み群）と、形の情報だけを持つ metadata GGUF
-- **使えるモデル**: Qwen3.5 系の MoE（AR と MTP）、Qwen3.8 Flash（AR 1 トークン）
+- **使えるモデル**: Qwen3.5 系の MoE（AR と MTP）、Qwen3.8 Flash（AR と MTP の serial speculative decoding）
 - **精度**: 同じ元モデル、同じ 32×1024 の校正 token、同じ 6 つの holdout で
   `KL(P_BF16 || P_candidate)` を測ると、4.5 bpw の EXL3 は 0.0090、I-Quant の IQ4_XS 混合は 0.0218 で、
   EXL3 のほうが 59% 低い。2〜3 bpw では差がさらに大きく、5 bpw では同じ大きさで 60% 低い
@@ -104,6 +104,14 @@ XeStrata はこの形式をコマンドラインから読み込めます（サ�
 ```sh
 strata --exl3 /path/to/exl3-model --metadata-gguf /path/to/metadata-only.gguf \
     --prompt-chunk 0 --spec 0 --max-t 1 --tokens 16,10,16,28 --max-new 2
+```
+
+Qwen3.8 Flash では `--spec 2` で MTP の serial speculative decoding を使う。
+verify に通った draft だけを採用し、通らない window は AR で書き直すので、答えは AR と同じになる（今は AR より遅い）。
+
+```sh
+strata --exl3 /path/to/qwen38-exl3 --tokens 16,10,16,28 --max-new 8 \
+    --context 16 --stage-devices 0 --spec 2 --max-t 1 --prompt-chunk 0
 ```
 
 EXL3 の形式、精度の測り方、速さの差の分は [docs/EXL3.ja.md](docs/EXL3.ja.md) にあります。

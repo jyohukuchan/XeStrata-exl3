@@ -97,7 +97,8 @@ XeStrata reads it from the command line (the server path does not have it yet).
 
 - **What it reads**: an EXL3 checkpoint (a set of safetensors weights) and a metadata GGUF that carries
   the shape only
-- **The models it covers**: the Qwen3.5 family of MoE models (AR and MTP), and Qwen3.8 Flash (AR, one token)
+- **The models it covers**: the Qwen3.5 family of MoE models (AR and MTP), and Qwen3.8 Flash
+  (AR and serial-speculation MTP)
 - **Accuracy**: with the same source model, the same 32x1024 calibration tokens and the same six holdouts,
   `KL(P_BF16 || P_candidate)` is 0.0090 for EXL3 at 4.5 bpw and 0.0218 for I-Quant's mixed IQ4_XS,
   so EXL3 is 59 percent lower. The gap is larger at 2 and 3 bpw, and at 5 bpw it is 60 percent lower at
@@ -109,6 +110,15 @@ XeStrata reads it from the command line (the server path does not have it yet).
 ```sh
 strata --exl3 /path/to/exl3-model --metadata-gguf /path/to/metadata-only.gguf \
     --prompt-chunk 0 --spec 0 --max-t 1 --tokens 16,10,16,28 --max-new 2
+```
+
+On Qwen3.8 Flash, `--spec 2` runs serial speculative decoding over MTP. Only drafts that pass
+verification are kept; a rejected window is rewritten with AR, so the answer matches AR (currently
+slower than AR).
+
+```sh
+strata --exl3 /path/to/qwen38-exl3 --tokens 16,10,16,28 --max-new 8 \
+    --context 16 --stage-devices 0 --spec 2 --max-t 1 --prompt-chunk 0
 ```
 
 The format, how the accuracy is measured and what the speed difference is are in

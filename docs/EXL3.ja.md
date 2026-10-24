@@ -194,7 +194,7 @@ FP32 logits と manifest を保存する。`--exl3 DIR --metadata-gguf GGUF` と
 `--trace TRACE.json --out-dir DIR` を指定する。`--rows 0,4` で対象行を限定できる。精度判定は元の BF16 教師に対する
 `KL(P_BF16 || P_candidate)` だけを使う。速度の判定にはこの診断用 dump の実行時間を使わない。
 
-## Qwen3.8 Flash の AR 接続
+## Qwen3.8 Flash の AR 接続と spec2
 
 Qwen3.8 の `--exl3 DIR` は archive の HF config から直接起動し、metadata GGUF を必要としない。
 `--metadata-gguf` を指定した場合は EOS metadata の取得に使う。`--tokens` または `--tokens-file` で
@@ -208,10 +208,12 @@ strata --exl3 /path/to/qwen38-exl3 --tokens 16,10,16,28 --max-new 2 \
     --context 8 --stage-devices 0 --spec 0 --max-t 1 --prompt-chunk 0
 ```
 
-この接続は greedy の単 token AR を実行する。部分常駐時は CPU expert fallback を使う。
+この接続は既定で greedy の単 token AR を実行する。部分常駐時は CPU expert fallback を使う。
 `--dump-logits FILE` は生成時の FP32 logits を保存し、`--stop-eos` または `--eos ID` で終了条件を指定する。
-MTP、vision、serve、batch と複数 token の prompt chunk はこの初期 CLI では要求時に拒否する。
-Qwen3.5 の CLI/MTP 接続は次の経路を使う。
+`--spec 2` は MTP の serial single-draft loop を実行する。verify に通った draft だけを採用し、通らない
+window は snapshot から戻して AR で書き直すので、token 列と logits は AR と一致する。draft 実行は
+非キャプチャで expert は CPU pool のため、今は AR より遅い。vision、serve、batch と複数 token の
+prompt chunk は引き続き要求時に拒否する。Qwen3.5 の CLI/MTP 接続は次の経路を使う。
 
 ### device cache（Qwen3.8 Flash）
 

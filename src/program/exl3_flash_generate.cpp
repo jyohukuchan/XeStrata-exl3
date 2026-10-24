@@ -123,7 +123,7 @@ void usage() {
                  "  --eos-ids LIST      replace EOS IDs and enable stopping\n"
                  "  --metadata-gguf P   optional GGUF metadata/tokenizer EOS source\n"
                  "  --dump-logits PATH  write FP32 logits rows for generated choices\n"
-                 "  --spec 0|1          accepted compatibility flags; MTP remains disabled\n"
+                 "  --spec 0|1|2        2 runs the serial single-draft MTP loop; 0|1 stay plain AR\n"
                  "  --max-t 1           single-token AR only\n"
                  "  --prompt-chunk 0    prompt chunks are not supported\n");
 }
@@ -281,7 +281,7 @@ int exl3_flash_main(int argc, char** argv) {
                 return 2;
             }
         } else if (argument == "--serve" || argument == "--batch" || argument == "--vision" || argument == "--mtp") {
-            std::fprintf(stderr, "strata exl3-flash: %s is not supported by the initial Qwen3.8 AR path\n", argument.c_str());
+            std::fprintf(stderr, "strata exl3-flash: %s is not supported by the Qwen3.8 EXL3 path\n", argument.c_str());
             return 2;
         } else if (argument == "--help" || argument == "-h") {
             usage();
@@ -291,8 +291,8 @@ int exl3_flash_main(int argc, char** argv) {
             return 2;
         }
     }
-    if (spec >= 2) {
-        std::fprintf(stderr, "strata exl3-flash: MTP/speculation is not supported; use --spec0 or --spec1\n");
+    if (spec < 0 || spec > 2) {
+        std::fprintf(stderr, "strata exl3-flash: --spec accepts 0, 1, or 2 (2 runs the serial MTP draft loop)\n");
         return 2;
     }
     if (spec < 0 || max_new < 1 || prompt.empty()) {
@@ -326,7 +326,7 @@ int exl3_flash_main(int argc, char** argv) {
     options.stage_layers = stage_layers;
     options.pool_workers = pool_workers;
     options.max_cells = context;
-    options.include_mtp = false;
+    options.include_mtp = (spec == 2);
     options.vision = false;
     std::string err;
     const Clock::time_point load_begin = Clock::now();
@@ -364,20 +364,64 @@ int exl3_flash_main(int argc, char** argv) {
     const Clock::time_point prompt_end = Clock::now();
     std::vector<int32_t> generated;
     generated.reserve(static_cast<size_t>(max_new));
+    const bool use_spec = (spec == 2);
+    strata::core::Exl3FlashSnapshot snap;
+    size_t spec_drafted = 0;
+    size_t spec_accepted = 0;
+    const auto emit_token = [&](int32_t token) {
+        generated.push_back(token);
+        if (!dump_path.empty())
+            dump.write(reinterpret_cast<const char*>(logits.data()), static_cast<std::streamsize>(logits.size() * sizeof(float)));
+    };
     const Clock::time_point decode_begin = Clock::now();
     int64_t position = static_cast<int64_t>(prompt.size());
     while (static_cast<int64_t>(generated.size()) < max_new) {
         const int32_t emitted = next_token;
-        generated.push_back(emitted);
-        if (!dump_path.empty()) dump.write(reinterpret_cast<const char*>(logits.data()), static_cast<std::streamsize>(logits.size() * sizeof(float)));
+        emit_token(emitted);
         if (stop_eos && std::find(eos.begin(), eos.end(), emitted) != eos.end()) break;
         if (static_cast<int64_t>(generated.size()) >= max_new) break;
+        if (use_spec && static_cast<int64_t>(generated.size()) + 1 < max_new) {
+            if (!model.save_snapshot(snap, err)) {
+                std::fprintf(stderr, "strata exl3-flash: snapshot: %s\n", err.c_str());
+                return 1;
+            }
+            int32_t draft = -1;
+            if (!model.mtp_draft(emitted, position - 1, draft, nullptr, err)) {
+                std::fprintf(stderr, "strata exl3-flash: draft position %lld: %s\n", (long long) position, err.c_str());
+                return 1;
+            }
+            ++spec_drafted;
+            int32_t verified = -1;
+            if (!model.forward(emitted, position, verified, dump_path.empty() ? nullptr : logits.data(), err)) {
+                std::fprintf(stderr, "strata exl3-flash: verify position %lld: %s\n", (long long) position, err.c_str());
+                return 1;
+            }
+            if (draft == verified) {
+                ++spec_accepted;
+                next_token = verified;
+                position += 1;
+                emit_token(next_token);
+                if (stop_eos && std::find(eos.begin(), eos.end(), next_token) != eos.end()) break;
+                if (static_cast<int64_t>(generated.size()) >= max_new) break;
+                if (!model.forward(next_token, position, next_token, dump_path.empty() ? nullptr : logits.data(), err)) {
+                    std::fprintf(stderr, "strata exl3-flash: decode position %lld: %s\n", (long long) position, err.c_str());
+                    return 1;
+                }
+                ++position;
+                continue;
+            }
+            if (!model.restore_snapshot(snap, err)) {
+                std::fprintf(stderr, "strata exl3-flash: restore: %s\n", err.c_str());
+                return 1;
+            }
+        }
         if (!model.forward(emitted, position, next_token, dump_path.empty() ? nullptr : logits.data(), err)) {
             std::fprintf(stderr, "strata exl3-flash: decode position %lld: %s\n", (long long) position, err.c_str());
             return 1;
         }
         ++position;
     }
+    strata::core::Exl3FlashModel::release_snapshot(snap);
     const Clock::time_point decode_end = Clock::now();
     if (!dump_path.empty() && !dump.good()) {
         std::fprintf(stderr, "strata exl3-flash: writing --dump-logits failed\n");
@@ -393,6 +437,10 @@ int exl3_flash_main(int argc, char** argv) {
     std::fprintf(stderr, "strata (qwen4exp-exl3): load %.1f s, prompt %zu tokens %.2f s, %zu decode tokens %.2f s (%.2f tok/s)\n",
                  load_s, prompt.size(), prompt_s, decode_tokens, decode_s,
                  static_cast<double>(decode_tokens) / std::max(decode_s, 1e-9));
+    if (use_spec)
+        std::fprintf(stderr, "strata (qwen4exp-exl3): spec2 drafts %zu accepted %zu (%.1f %%)\n", spec_drafted,
+                     spec_accepted,
+                     spec_drafted == 0 ? 0.0 : 100.0 * static_cast<double>(spec_accepted) / static_cast<double>(spec_drafted));
     return 0;
 }
 

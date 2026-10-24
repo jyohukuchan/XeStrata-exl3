@@ -24,6 +24,7 @@ struct Exl3WeightSetOptions {
     int64_t layer_end = -1;      ///< exclusive; -1: all trunk layers
     bool include_head = false;   ///< output.weight and a qwen35 final norm
     bool include_final_hc = false;  ///< qwen3.8 combine-less output mixer
+    bool include_mtp_block = false;  ///< mtp_fc plus layer<0 globals: the Qwen3.8 one-layer MTP map only
     int64_t max_rows = 1;        ///< persistent EXL3 scratch/capture row capacity
 };
 

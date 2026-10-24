@@ -11,6 +11,9 @@
 #include "strata/core/gpu.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/native_head.hpp"
+#include "strata/kernels/native_qsa.hpp"
+#include "strata/kernels/qsa.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/core/session.hpp"
@@ -617,6 +620,46 @@ int64_t exl3_flash_ple_stage(int64_t layer_count, int64_t stage_count) {
     return exl3_flash_ple_stage(ranges);
 }
 
+bool exl3_flash_mtp_roles_complete(const strata::artifact::exl3::ModelMap& mtp, std::string& err) {
+    err.clear();
+    if (mtp.geometry.layers != 1) {
+        err = "the MTP map must hold exactly one layer";
+        return false;
+    }
+    if (mtp.geometry.experts <= 0) {
+        err = "the MTP map names no routed experts";
+        return false;
+    }
+    size_t fc = 0, qsa = 0, hc = 0, experts = 0;
+    for (const auto& item : mtp.projections) {
+        fc += item.kind == ProjectionKind::mtp_fc;
+        qsa += item.kind == ProjectionKind::qsa_q || item.kind == ProjectionKind::qsa_k ||
+               item.kind == ProjectionKind::qsa_v || item.kind == ProjectionKind::qsa_out ||
+               item.kind == ProjectionKind::qsa_indexer_q || item.kind == ProjectionKind::qsa_indexer_k;
+        hc += item.kind == ProjectionKind::hc_norm || item.kind == ProjectionKind::hc_down ||
+              item.kind == ProjectionKind::hc_up || item.kind == ProjectionKind::hc_inject;
+        experts += item.kind == ProjectionKind::expert_gate || item.kind == ProjectionKind::expert_up ||
+                   item.kind == ProjectionKind::expert_down;
+    }
+    if (fc != 2) {
+        err = "the MTP map must carry both mtp_fc projections";
+        return false;
+    }
+    if (qsa != 6) {
+        err = "the MTP map must carry the full QSA set";
+        return false;
+    }
+    if (hc != 8) {
+        err = "the MTP map must carry the eight hyper-connection entries";
+        return false;
+    }
+    if (experts != static_cast<size_t>(3 * mtp.geometry.experts)) {
+        err = "the MTP map must carry the complete expert gate/up/down set";
+        return false;
+    }
+    return true;
+}
+
 struct Exl3FlashModel::Impl {
     struct Stage {
         int device = -1;
@@ -629,6 +672,7 @@ struct Exl3FlashModel::Impl {
         std::unique_ptr<Exl3ExpertRuntime> runtime;
         SessionState session;
         void* session_arena = nullptr;
+        size_t session_arena_bytes = 0;
         Doorbell doorbell;
         void* parts_device = nullptr;
         std::vector<float> miss_output;
@@ -647,6 +691,31 @@ struct Exl3FlashModel::Impl {
     strata::ModelSpec spec;
     ModelGeometry geometry;
     ModelMap map;
+    ModelMap mtp_map;
+    bool has_mtp = false;
+    // THE MTP DRAFT BLOCK'S OWNERS.  Bound on the last stage's device when
+    // include_mtp is set: dense weights over the one-layer MTP map, the MTP
+    // expert names/source/pool, and one layer of session state (QSA every
+    // layer).  The expert runtime stays unopened until the draft/verify loop
+    // lands, so the draft block holds no device cache yet.
+    std::unique_ptr<WeightTable> mtp_table;
+    std::unique_ptr<Exl3WeightSet> mtp_weights;
+    std::vector<ExpertTensorNames> mtp_expert_names;
+    std::unique_ptr<Exl3ExpertSource> mtp_source;
+    std::unique_ptr<strata::kernels::cpu::ExpertPool> mtp_pool;
+    ModelGeometry mtp_geometry;
+    std::unique_ptr<Exl3ExpertRuntime> mtp_runtime;
+    strata::gpu::Stream mtp_stream = nullptr;
+    void* mtp_parts_device = nullptr;
+    void* mtp_fc_scratch = nullptr;
+    std::vector<int32_t> mtp_host_ids;
+    std::vector<float> mtp_host_weights;
+    std::vector<float> mtp_host_x;
+    std::vector<float> mtp_cpu_out;
+    void* mtp_session_arena = nullptr;
+    size_t mtp_session_arena_bytes = 0;
+    SessionState mtp_session;
+    int mtp_device = -1;
     std::vector<ExpertTensorNames> expert_names;
     std::vector<Stage> stages;
     std::unique_ptr<NativeEmbed> embedding;
@@ -699,10 +768,6 @@ bool Exl3FlashModel::open(const std::filesystem::path& directory, const Exl3Flas
     } cleanup{this};
     try {
         if (directory.empty()) { err = "EXL3 Flash: archive directory is required"; return false; }
-        if (options.include_mtp) {
-            err = "EXL3 Flash: Qwen3.8 MTP is not bound by the initial AR coordinator";
-            return false;
-        }
         if (options.vision) {
             err = "EXL3 Flash: vision input is not supported by the initial AR coordinator";
             return false;
@@ -792,6 +857,26 @@ bool Exl3FlashModel::open(const std::filesystem::path& directory, const Exl3Flas
                 err = "EXL3 Flash: model map is not runnable: " + unsupported;
                 return false;
             }
+        }
+        if (impl_->options.include_mtp) {
+            // The legacy include_mtp switch stays Qwen3.5-only: the Qwen3.8
+            // draft block is a separate one-layer map built from the trunk.
+            // Forward stays single-token AR until the draft/verify loop lands;
+            // this only binds the map that loop will draft from.
+            if (!strata::artifact::exl3::build_qwen38_mtp_map(*impl_->archive, impl_->map, impl_->mtp_map,
+                                                             err)) {
+                err = "EXL3 Flash MTP: " + err;
+                return false;
+            }
+            for (const auto& unsupported : impl_->mtp_map.unsupported) {
+                err = "EXL3 Flash MTP map is not runnable: " + unsupported;
+                return false;
+            }
+            if (!exl3_flash_mtp_roles_complete(impl_->mtp_map, err)) {
+                err = "EXL3 Flash MTP: " + err;
+                return false;
+            }
+            impl_->has_mtp = true;
         }
         if (!make_expert_names(impl_->map, impl_->geometry.n_layers, impl_->geometry.n_expert,
                                impl_->expert_names, err)) return false;
@@ -931,6 +1016,7 @@ bool Exl3FlashModel::open(const std::filesystem::path& directory, const Exl3Flas
             const OnDevice on(stage.device);
             const uint64_t session_size = session_bytes(impl_->geometry, impl_->options.max_cells, routed_k,
                                                         stage.layer_begin, stage.layer_end);
+            stage.session_arena_bytes = static_cast<size_t>(session_size);
             stage.session_arena = strata::gpu::alloc_device(static_cast<size_t>(session_size));
             if (stage.session_arena == nullptr || session_init(impl_->geometry, impl_->options.max_cells, routed_k,
                                                                stage.session_arena, stage.session, stage.layer_begin,
@@ -1114,6 +1200,87 @@ bool Exl3FlashModel::open(const std::filesystem::path& directory, const Exl3Flas
 
         // ---- THE DEVICE CACHE, PLANNED FROM WHAT THE DEVICE REPORTS ----
         //
+        // The MTP draft block's weights, expert source and session state are bound here, after the
+        // trunk's graphs and before the device-cache opening: they are device allocations the cache
+        // must see as taken.  The draft block gets no expert runtime (no device cache) until the
+        // draft/verify loop lands; its experts serve through the source and the CPU pool.
+        if (impl_->options.include_mtp) {
+            if (!make_expert_names(impl_->mtp_map, 1, impl_->mtp_map.geometry.experts,
+                                   impl_->mtp_expert_names, err)) {
+                err = "EXL3 Flash MTP experts: " + err;
+                return false;
+            }
+            impl_->mtp_device = impl_->stages.back().device;
+            impl_->mtp_geometry = impl_->geometry;
+            impl_->mtp_geometry.n_layers = 1;
+            impl_->mtp_geometry.qsa_interval = 1;
+            impl_->mtp_table = std::make_unique<WeightTable>();
+            impl_->mtp_weights = std::make_unique<Exl3WeightSet>();
+            impl_->mtp_source = std::make_unique<Exl3ExpertSource>();
+            impl_->mtp_pool = std::make_unique<strata::kernels::cpu::ExpertPool>(options.pool_workers);
+            const OnDevice on_mtp(impl_->mtp_device);
+            Exl3WeightSetOptions mtp_weight_options;
+            mtp_weight_options.device = impl_->mtp_device;
+            mtp_weight_options.layer_begin = 0;
+            mtp_weight_options.layer_end = 1;
+            mtp_weight_options.include_mtp_block = true;
+            mtp_weight_options.max_rows = options.max_rows;
+            if (!impl_->mtp_weights->load(*impl_->archive, impl_->mtp_map, *impl_->mtp_table,
+                                          mtp_weight_options, err)) {
+                err = "EXL3 Flash MTP dense weights: " + err;
+                return false;
+            }
+            if (!impl_->mtp_source->open(impl_->archive, 1, impl_->mtp_map.geometry.experts,
+                                         impl_->mtp_expert_names, err)) {
+                err = "EXL3 Flash MTP expert source: " + err;
+                return false;
+            }
+            const uint64_t mtp_session_size =
+                session_bytes(impl_->mtp_geometry, impl_->options.max_cells, routed_k, 0, 1);
+            impl_->mtp_session_arena_bytes = static_cast<size_t>(mtp_session_size);
+            impl_->mtp_session_arena = strata::gpu::alloc_device(static_cast<size_t>(mtp_session_size));
+            if (impl_->mtp_session_arena == nullptr ||
+                session_init(impl_->mtp_geometry, impl_->options.max_cells, routed_k,
+                             impl_->mtp_session_arena, impl_->mtp_session, 0, 1) == 0) {
+                err = "EXL3 Flash MTP SessionState allocation failed";
+                return false;
+            }
+            session_zero(impl_->mtp_session, impl_->mtp_geometry, nullptr, nullptr);
+            impl_->mtp_stream = strata::gpu::stream_create();
+            if (impl_->mtp_stream == nullptr) {
+                err = "EXL3 Flash MTP draft stream creation failed";
+                return false;
+            }
+            if (!impl_->mtp_weights->prepare_stream(impl_->mtp_stream, err)) {
+                err = "EXL3 Flash MTP draft stream weights: " + err;
+                return false;
+            }
+            if (!impl_->stages.back().weights->prepare_stream(impl_->mtp_stream, err)) {
+                err = "EXL3 Flash MTP draft head weights: " + err;
+                return false;
+            }
+            impl_->mtp_runtime = std::make_unique<Exl3ExpertRuntime>();
+            if (!impl_->mtp_runtime->open(*impl_->mtp_source, *impl_->mtp_pool, 1, routed_k, {}, err, 0, 1)) {
+                err = "EXL3 Flash MTP expert runtime: " + err;
+                return false;
+            }
+            const size_t mtp_fc_floats = static_cast<size_t>(3 * impl_->geometry.n_embd +
+                                                            2 * impl_->geometry.hc * impl_->geometry.n_embd);
+            impl_->mtp_fc_scratch = strata::gpu::alloc_device(mtp_fc_floats * sizeof(float));
+            impl_->mtp_parts_device = strata::gpu::alloc_device(static_cast<size_t>(routed_k) *
+                                                                static_cast<size_t>(impl_->geometry.n_embd) *
+                                                                sizeof(float));
+            if (impl_->mtp_fc_scratch == nullptr || impl_->mtp_parts_device == nullptr) {
+                err = "EXL3 Flash MTP draft scratch allocation failed";
+                return false;
+            }
+            impl_->mtp_host_ids.assign(static_cast<size_t>(routed_k), 0);
+            impl_->mtp_host_weights.assign(static_cast<size_t>(routed_k), 0.0f);
+            impl_->mtp_host_x.assign(static_cast<size_t>(impl_->geometry.n_embd), 0.0f);
+            impl_->mtp_cpu_out.assign(static_cast<size_t>(routed_k) * static_cast<size_t>(impl_->geometry.n_embd),
+                                      0.0f);
+        }
+
         // It is opened LAST, after every other device allocation and after the graph capture, because it takes
         // what the device has left: the room it gets is the free VRAM at this point, less a reserve.
         for (size_t stage_index = 0; stage_index < impl_->stages.size(); ++stage_index) {
@@ -1235,6 +1402,49 @@ bool Exl3FlashModel::close(std::string& err) noexcept {
             stage.weights.reset();
         }
         impl_->stages.clear();
+        if (impl_->mtp_device >= 0) {
+            const OnDevice on_mtp(impl_->mtp_device);
+            session_release(impl_->mtp_session);
+            if (impl_->mtp_session.qsa_states != nullptr) {
+                for (int64_t ordinal = 0; ordinal < impl_->mtp_geometry.n_qsa_layers(); ++ordinal) {
+                    if (impl_->mtp_session.qsa_states[ordinal].host_step != nullptr)
+                        strata::gpu::free(impl_->mtp_session.qsa_states[ordinal].host_step);
+                    if (impl_->mtp_session.qsa_states[ordinal].host_pos != nullptr)
+                        strata::gpu::free(impl_->mtp_session.qsa_states[ordinal].host_pos);
+                }
+                delete[] impl_->mtp_session.qsa_states;
+                impl_->mtp_session.qsa_states = nullptr;
+            }
+            if (impl_->mtp_session.ple.emb_dev != nullptr) strata::gpu::free(impl_->mtp_session.ple.emb_dev);
+            if (impl_->mtp_session.ple.emb_host != nullptr) strata::gpu::free(impl_->mtp_session.ple.emb_host);
+            if (impl_->mtp_session.ple.scratch != nullptr) strata::gpu::free(impl_->mtp_session.ple.scratch);
+            impl_->mtp_session.ple.emb_dev = nullptr;
+            impl_->mtp_session.ple.emb_host = nullptr;
+            impl_->mtp_session.ple.scratch = nullptr;
+            if (impl_->mtp_session_arena != nullptr) strata::gpu::free(impl_->mtp_session_arena);
+            impl_->mtp_session_arena = nullptr;
+            if (impl_->mtp_weights) impl_->mtp_weights->close();
+            if (impl_->mtp_runtime) {
+                Runtime::at(impl_->mtp_device).finish();
+                impl_->mtp_runtime->close();
+            }
+            if (impl_->mtp_stream != nullptr) strata::gpu::stream_destroy(impl_->mtp_stream);
+            impl_->mtp_stream = nullptr;
+            impl_->mtp_runtime.reset();
+            impl_->mtp_weights.reset();
+            impl_->mtp_source.reset();
+            impl_->mtp_pool.reset();
+            if (impl_->mtp_fc_scratch != nullptr) strata::gpu::free(impl_->mtp_fc_scratch);
+            if (impl_->mtp_parts_device != nullptr) strata::gpu::free(impl_->mtp_parts_device);
+            impl_->mtp_fc_scratch = nullptr;
+            impl_->mtp_parts_device = nullptr;
+            impl_->mtp_host_ids.clear();
+            impl_->mtp_host_weights.clear();
+            impl_->mtp_host_x.clear();
+            impl_->mtp_cpu_out.clear();
+            impl_->mtp_table.reset();
+            impl_->mtp_device = -1;
+        }
         if (impl_->logits_device != nullptr) {
             const OnDevice on(impl_->options.stage_devices.empty() ? -1 : impl_->options.stage_devices.back());
             strata::gpu::free(impl_->logits_device);
@@ -1262,6 +1472,10 @@ bool Exl3FlashModel::close(std::string& err) noexcept {
         impl_->archive.reset();
         impl_->expert_names.clear();
         impl_->map = {};
+        impl_->mtp_map = {};
+        impl_->has_mtp = false;
+        impl_->mtp_expert_names.clear();
+        impl_->mtp_geometry = {};
         impl_->spec = {};
         impl_->geometry = {};
         impl_->embedding_device = impl_->ple_device = -1;
@@ -1413,6 +1627,14 @@ bool Exl3FlashModel::reset(std::string& err) {
             std::fill(stage.miss_output.begin(), stage.miss_output.end(), 0.0f);
             std::fill(stage.merge_output.begin(), stage.merge_output.end(), 0.0f);
             std::fill(stage.merge_upload.begin(), stage.merge_upload.end(), 0.0f);
+        }
+        if (impl_->has_mtp) {
+            const OnDevice on_mtp(impl_->mtp_device);
+            session_zero(impl_->mtp_session, impl_->mtp_geometry, nullptr, nullptr);
+            if (!strata::gpu::stream_sync(nullptr)) {
+                err = std::string("EXL3 Flash: resetting MTP state: ") + strata::gpu::last_error();
+                return false;
+            }
         }
         // The PLE's token window is the model's: a new sequence starts with no predecessor, which
         // is what the n-gram lookup reads as the end of the context.
@@ -1781,6 +2003,420 @@ const ModelGeometry& Exl3FlashModel::geometry() const {
 const ModelMap& Exl3FlashModel::model_map() const {
     static const ModelMap empty;
     return impl_ == nullptr ? empty : impl_->map;
+}
+
+bool Exl3FlashModel::has_mtp() const { return impl_ != nullptr && impl_->has_mtp; }
+
+const ModelMap& Exl3FlashModel::mtp_map() const {
+    static const ModelMap empty;
+    return impl_ == nullptr ? empty : impl_->mtp_map;
+}
+
+const Exl3WeightSet* Exl3FlashModel::mtp_weights() const {
+    return impl_ == nullptr ? nullptr : impl_->mtp_weights.get();
+}
+
+namespace {
+
+bool snapshot_mirrors_from(const SessionState& session, int64_t n_head,
+                           std::vector<std::vector<int32_t>>& steps,
+                           std::vector<std::vector<int32_t>>& poss, std::string& err) {
+    if (session.qsa_states == nullptr) {
+        err = "snapshot needs allocated QSA states";
+        return false;
+    }
+    steps.assign(static_cast<size_t>(session.qsa_alloc), {});
+    poss.assign(static_cast<size_t>(session.qsa_alloc), {});
+    for (int64_t j = 0; j < session.qsa_alloc; ++j) {
+        const QsaState& q = session.qsa_states[session.qsa_ord0 + j];
+        if (q.kv_mode != 0) {
+            err = "snapshot does not cover streamed KV caches";
+            return false;
+        }
+        if (q.host_step == nullptr || q.host_pos == nullptr) {
+            err = "snapshot needs allocated QSA host mirrors";
+            return false;
+        }
+        steps[static_cast<size_t>(j)].assign(q.host_step, q.host_step + (strata::kernels::kStepCount + 1));
+        poss[static_cast<size_t>(j)].assign(q.host_pos, q.host_pos + n_head);
+    }
+    return true;
+}
+
+bool snapshot_mirrors_to(const SessionState& session, int64_t n_head,
+                         const std::vector<std::vector<int32_t>>& steps,
+                         const std::vector<std::vector<int32_t>>& poss, std::string& err) {
+    if (session.qsa_states == nullptr) {
+        err = "snapshot needs allocated QSA states";
+        return false;
+    }
+    if (steps.size() != static_cast<size_t>(session.qsa_alloc) ||
+        poss.size() != static_cast<size_t>(session.qsa_alloc)) {
+        err = "snapshot QSA count does not match the model";
+        return false;
+    }
+    for (int64_t j = 0; j < session.qsa_alloc; ++j) {
+        const QsaState& q = session.qsa_states[session.qsa_ord0 + j];
+        if (steps[static_cast<size_t>(j)].size() !=
+                static_cast<size_t>(strata::kernels::kStepCount + 1) ||
+            poss[static_cast<size_t>(j)].size() != static_cast<size_t>(n_head)) {
+            err = "snapshot QSA mirror size does not match the model";
+            return false;
+        }
+        if (q.host_step == nullptr || q.host_pos == nullptr) {
+            err = "snapshot needs allocated QSA host mirrors";
+            return false;
+        }
+        std::copy(steps[static_cast<size_t>(j)].begin(), steps[static_cast<size_t>(j)].end(), q.host_step);
+        std::copy(poss[static_cast<size_t>(j)].begin(), poss[static_cast<size_t>(j)].end(), q.host_pos);
+    }
+    return true;
+}
+
+bool snapshot_ensure_device(void*& slot, size_t bytes, std::string& err, const char* what) {
+    if (slot != nullptr) {
+        strata::gpu::free(slot);
+        slot = nullptr;
+    }
+    slot = strata::gpu::alloc_device(bytes);
+    if (slot == nullptr) {
+        err = std::string("snapshot cannot allocate ") + what;
+        return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+bool Exl3FlashModel::save_snapshot(Exl3FlashSnapshot& snap, std::string& err) {
+    err.clear();
+    if (!loaded()) { err = "EXL3 Flash: model is not open"; return false; }
+    try {
+        snap.stages.resize(impl_->stages.size());
+        for (size_t index = 0; index < impl_->stages.size(); ++index) {
+            auto& stage = impl_->stages[index];
+            auto& out = snap.stages[index];
+            const OnDevice on(stage.device);
+            if (stage.session_arena == nullptr || stage.session_arena_bytes == 0) {
+                err = "EXL3 Flash: snapshot needs an allocated stage session";
+                return false;
+            }
+            if (out.arena == nullptr || out.arena_bytes != stage.session_arena_bytes) {
+                if (!snapshot_ensure_device(out.arena, stage.session_arena_bytes, err, "stage arena")) return false;
+                out.arena_bytes = stage.session_arena_bytes;
+            }
+            if (!strata::gpu::copy(out.arena, stage.session_arena, stage.session_arena_bytes)) {
+                err = std::string("EXL3 Flash: snapshot stage copy failed: ") + strata::gpu::last_error();
+                return false;
+            }
+            if (stage.session.ple.emb_dev != nullptr) {
+                if (out.ple_emb_dev == nullptr &&
+                    !snapshot_ensure_device(out.ple_emb_dev,
+                                            static_cast<size_t>(strata::kernels::NG_N_EMBD) * sizeof(float), err,
+                                            "PLE embedding row"))
+                    return false;
+                if (!strata::gpu::copy(out.ple_emb_dev, stage.session.ple.emb_dev,
+                                       static_cast<size_t>(strata::kernels::NG_N_EMBD) * sizeof(float))) {
+                    err = std::string("EXL3 Flash: snapshot PLE copy failed: ") + strata::gpu::last_error();
+                    return false;
+                }
+            } else if (out.ple_emb_dev != nullptr) {
+                strata::gpu::free(out.ple_emb_dev);
+                out.ple_emb_dev = nullptr;
+            }
+            if (stage.session.ple.scratch != nullptr) {
+                if (out.ple_scratch == nullptr &&
+                    !snapshot_ensure_device(out.ple_scratch, strata::core::ple_run_scratch_bytes(), err,
+                                            "PLE scratch"))
+                    return false;
+                if (!strata::gpu::copy(out.ple_scratch, stage.session.ple.scratch,
+                                       strata::core::ple_run_scratch_bytes())) {
+                    err = std::string("EXL3 Flash: snapshot PLE scratch copy failed: ") + strata::gpu::last_error();
+                    return false;
+                }
+            } else if (out.ple_scratch != nullptr) {
+                strata::gpu::free(out.ple_scratch);
+                out.ple_scratch = nullptr;
+            }
+            if (!snapshot_mirrors_from(stage.session, impl_->geometry.n_head, out.qsa_step, out.qsa_pos, err)) {
+                err = "EXL3 Flash snapshot: " + err;
+                return false;
+            }
+            if (!strata::gpu::stream_sync(nullptr)) {
+                err = std::string("EXL3 Flash: snapshot stage sync failed: ") + strata::gpu::last_error();
+                return false;
+            }
+        }
+        if (impl_->has_mtp) {
+            const OnDevice on_mtp(impl_->mtp_device);
+            if (impl_->mtp_session_arena == nullptr || impl_->mtp_session_arena_bytes == 0) {
+                err = "EXL3 Flash: snapshot needs an allocated MTP session";
+                return false;
+            }
+            if (snap.mtp_arena == nullptr || snap.mtp_arena_bytes != impl_->mtp_session_arena_bytes) {
+                if (!snapshot_ensure_device(snap.mtp_arena, impl_->mtp_session_arena_bytes, err, "MTP arena"))
+                    return false;
+                snap.mtp_arena_bytes = impl_->mtp_session_arena_bytes;
+            }
+            if (!strata::gpu::copy(snap.mtp_arena, impl_->mtp_session_arena, impl_->mtp_session_arena_bytes)) {
+                err = std::string("EXL3 Flash: snapshot MTP copy failed: ") + strata::gpu::last_error();
+                return false;
+            }
+            if (!snapshot_mirrors_from(impl_->mtp_session, impl_->mtp_geometry.n_head, snap.mtp_qsa_step,
+                                       snap.mtp_qsa_pos, err)) {
+                err = "EXL3 Flash snapshot: " + err;
+                return false;
+            }
+            if (!strata::gpu::stream_sync(nullptr)) {
+                err = std::string("EXL3 Flash: snapshot MTP sync failed: ") + strata::gpu::last_error();
+                return false;
+            }
+        } else {
+            if (snap.mtp_arena != nullptr) strata::gpu::free(snap.mtp_arena);
+            snap.mtp_arena = nullptr;
+            snap.mtp_arena_bytes = 0;
+            snap.mtp_qsa_step.clear();
+            snap.mtp_qsa_pos.clear();
+        }
+        snap.next_position = impl_->next_position;
+        snap.ple_prev[0] = impl_->ple_prev[0];
+        snap.ple_prev[1] = impl_->ple_prev[1];
+        snap.ple_token = impl_->ple_token;
+        snap.seeded = impl_->seeded;
+        snap.initialized = impl_->initialized;
+        return true;
+    } catch (const std::exception& e) {
+        err = std::string("EXL3 Flash snapshot save: ") + e.what();
+        return false;
+    }
+}
+
+bool Exl3FlashModel::restore_snapshot(const Exl3FlashSnapshot& snap, std::string& err) {
+    err.clear();
+    if (!loaded()) { err = "EXL3 Flash: model is not open"; return false; }
+    try {
+        if (snap.stages.size() != impl_->stages.size()) {
+            err = "EXL3 Flash: snapshot stage count does not match the model";
+            return false;
+        }
+        for (size_t index = 0; index < impl_->stages.size(); ++index) {
+            auto& stage = impl_->stages[index];
+            const auto& in = snap.stages[index];
+            const OnDevice on(stage.device);
+            if (in.arena == nullptr || in.arena_bytes != stage.session_arena_bytes ||
+                stage.session_arena == nullptr) {
+                err = "EXL3 Flash: snapshot arena does not match the model";
+                return false;
+            }
+            if (!strata::gpu::copy(stage.session_arena, in.arena, stage.session_arena_bytes)) {
+                err = std::string("EXL3 Flash: snapshot stage restore failed: ") + strata::gpu::last_error();
+                return false;
+            }
+            if (stage.session.ple.emb_dev != nullptr) {
+                if (in.ple_emb_dev == nullptr ||
+                    !strata::gpu::copy(stage.session.ple.emb_dev, in.ple_emb_dev,
+                                       static_cast<size_t>(strata::kernels::NG_N_EMBD) * sizeof(float))) {
+                    err = "EXL3 Flash: snapshot PLE restore is incomplete";
+                    return false;
+                }
+            }
+            if (stage.session.ple.scratch != nullptr) {
+                if (in.ple_scratch == nullptr ||
+                    !strata::gpu::copy(stage.session.ple.scratch, in.ple_scratch,
+                                       strata::core::ple_run_scratch_bytes())) {
+                    err = "EXL3 Flash: snapshot PLE scratch restore is incomplete";
+                    return false;
+                }
+            }
+            if (!snapshot_mirrors_to(stage.session, impl_->geometry.n_head, in.qsa_step, in.qsa_pos, err)) {
+                err = "EXL3 Flash snapshot: " + err;
+                return false;
+            }
+            if (!strata::gpu::stream_sync(nullptr)) {
+                err = std::string("EXL3 Flash: snapshot stage sync failed: ") + strata::gpu::last_error();
+                return false;
+            }
+        }
+        if (impl_->has_mtp) {
+            const OnDevice on_mtp(impl_->mtp_device);
+            if (snap.mtp_arena == nullptr || snap.mtp_arena_bytes != impl_->mtp_session_arena_bytes ||
+                impl_->mtp_session_arena == nullptr) {
+                err = "EXL3 Flash: snapshot MTP arena does not match the model";
+                return false;
+            }
+            if (!strata::gpu::copy(impl_->mtp_session_arena, snap.mtp_arena, impl_->mtp_session_arena_bytes)) {
+                err = std::string("EXL3 Flash: snapshot MTP restore failed: ") + strata::gpu::last_error();
+                return false;
+            }
+            if (!snapshot_mirrors_to(impl_->mtp_session, impl_->mtp_geometry.n_head, snap.mtp_qsa_step,
+                                     snap.mtp_qsa_pos, err)) {
+                err = "EXL3 Flash snapshot: " + err;
+                return false;
+            }
+            if (!strata::gpu::stream_sync(nullptr)) {
+                err = std::string("EXL3 Flash: snapshot MTP sync failed: ") + strata::gpu::last_error();
+                return false;
+            }
+        }
+        impl_->next_position = snap.next_position;
+        impl_->ple_prev[0] = snap.ple_prev[0];
+        impl_->ple_prev[1] = snap.ple_prev[1];
+        impl_->ple_token = snap.ple_token;
+        impl_->seeded = snap.seeded;
+        impl_->initialized = snap.initialized;
+        return true;
+    } catch (const std::exception& e) {
+        err = std::string("EXL3 Flash snapshot restore: ") + e.what();
+        return false;
+    }
+}
+
+void Exl3FlashModel::release_snapshot(Exl3FlashSnapshot& snap) noexcept {
+    try {
+        for (auto& stage : snap.stages) {
+            if (stage.arena != nullptr) strata::gpu::free(stage.arena);
+            if (stage.ple_emb_dev != nullptr) strata::gpu::free(stage.ple_emb_dev);
+            if (stage.ple_scratch != nullptr) strata::gpu::free(stage.ple_scratch);
+            stage.arena = nullptr;
+            stage.arena_bytes = 0;
+            stage.ple_emb_dev = nullptr;
+            stage.ple_scratch = nullptr;
+            stage.qsa_step.clear();
+            stage.qsa_pos.clear();
+        }
+        snap.stages.clear();
+        if (snap.mtp_arena != nullptr) strata::gpu::free(snap.mtp_arena);
+        snap.mtp_arena = nullptr;
+        snap.mtp_arena_bytes = 0;
+        snap.mtp_qsa_step.clear();
+        snap.mtp_qsa_pos.clear();
+    } catch (...) {
+    }
+}
+
+bool Exl3FlashModel::mtp_draft(int32_t next_token, int64_t trunk_pos, int32_t& draft, float* host_logits,
+                               std::string& err) {
+    err.clear();
+    draft = -1;
+    if (!loaded()) { err = "EXL3 Flash: model is not open"; return false; }
+    if (!impl_->has_mtp || !impl_->mtp_runtime || !impl_->mtp_weights || impl_->mtp_table == nullptr ||
+        impl_->mtp_fc_scratch == nullptr || impl_->mtp_parts_device == nullptr) {
+        err = "EXL3 Flash: MTP draft block is not bound";
+        return false;
+    }
+    if (!validate_token_request(1, 1, err)) return false;
+    if (next_token < 0 || static_cast<int64_t>(next_token) >= impl_->map.geometry.vocab_size) {
+        err = "EXL3 Flash: draft token is outside the embedding vocabulary";
+        return false;
+    }
+    if (trunk_pos < 0 || trunk_pos >= impl_->options.max_cells || impl_->next_position != trunk_pos + 1) {
+        err = "EXL3 Flash: MTP draft needs the trunk just past trunk_pos";
+        return false;
+    }
+    try {
+        const int64_t N = impl_->geometry.n_embd;
+        const int64_t HC = impl_->geometry.hc;
+        const int64_t k = impl_->options.routed_k;
+        auto& last = impl_->stages.back();
+        const OnDevice on(impl_->mtp_device);
+        float* scratch = static_cast<float*>(impl_->mtp_fc_scratch);
+        float* emb = scratch;
+        float* en = emb + N;
+        float* hn = en + N;
+        float* e2 = hn + HC * N;
+        float* h2 = e2 + N;
+        const WeightRef* enorm = impl_->mtp_table->find("mtp.pre_fc_norm_embedding.weight");
+        const WeightRef* hnorm = impl_->mtp_table->find("mtp.pre_fc_norm_hidden.weight");
+        const WeightRef* fc_e = impl_->mtp_table->find("mtp.fc_embedding.weight");
+        const WeightRef* fc_h = impl_->mtp_table->find("mtp.fc_hidden.weight");
+        if (enorm == nullptr || hnorm == nullptr || fc_e == nullptr || fc_h == nullptr ||
+            fc_e->exl3 == nullptr || fc_h->exl3 == nullptr) {
+            err = "EXL3 Flash: MTP draft projections are missing";
+            return false;
+        }
+        void* ds = impl_->mtp_stream;
+        impl_->embedding->gather_one(next_token, emb, ds);
+        const float eps = static_cast<float>(impl_->spec.rms_eps);
+        strata::kernels::native_qsa_rms_norm_weighted(emb, static_cast<const float*>(enorm->data), en,
+                                                      static_cast<int>(N), 1, eps, ds);
+        strata::kernels::native_qsa_rms_norm_weighted(last.session.block.R,
+                                                      static_cast<const float*>(hnorm->data), hn,
+                                                      static_cast<int>(HC * N), 1, eps, ds);
+        if (!fc_e->exl3->run(en, N, e2, N, 1, ds, err)) {
+            err = "EXL3 Flash MTP draft embedding projection: " + err;
+            return false;
+        }
+        for (int64_t s = 0; s < HC; ++s) {
+            if (!fc_h->exl3->run(hn + s * N, N, h2 + s * N, N, 1, ds, err)) {
+                err = "EXL3 Flash MTP draft hidden projection: " + err;
+                return false;
+            }
+        }
+        strata::kernels::add_streams_broadcast(h2, e2, impl_->mtp_session.block.R, N, static_cast<int>(HC), 1,
+                                               ds);
+        QsaState& mq = impl_->mtp_session.qsa_states[impl_->mtp_session.qsa_ord0];
+        if (!block_layer_pre(*impl_->mtp_table, impl_->mtp_geometry, 0, trunk_pos, 0, impl_->mtp_session.gdn, mq,
+                             impl_->mtp_session.qsa_bufs, impl_->mtp_session.moe, k, impl_->mtp_session.block,
+                             ds, err)) {
+            err = "EXL3 Flash MTP draft block: " + err;
+            return false;
+        }
+        if (!strata::gpu::stream_sync(ds)) {
+            err = std::string("EXL3 Flash MTP draft pre sync failed: ") + strata::gpu::last_error();
+            return false;
+        }
+        if (!strata::gpu::copy(impl_->mtp_host_ids.data(), impl_->mtp_session.moe.ids,
+                               static_cast<size_t>(k) * sizeof(int32_t)) ||
+            !strata::gpu::copy(impl_->mtp_host_weights.data(), impl_->mtp_session.moe.weights,
+                               static_cast<size_t>(k) * sizeof(float)) ||
+            !strata::gpu::copy(impl_->mtp_host_x.data(), impl_->mtp_session.block.mixed,
+                               static_cast<size_t>(N) * sizeof(float))) {
+            err = std::string("EXL3 Flash MTP draft router readback failed: ") + strata::gpu::last_error();
+            return false;
+        }
+        if (!impl_->mtp_runtime->prepare_window(0, impl_->mtp_host_x.data(), N, impl_->mtp_host_ids.data(), 1,
+                                                impl_->mtp_cpu_out.data(), N, err) ||
+            !impl_->mtp_runtime->run_cpu(err)) {
+            err = "EXL3 Flash MTP draft experts: " + err;
+            return false;
+        }
+        impl_->mtp_runtime->mark_gpu_consumed();
+        if (!strata::gpu::copy_async(static_cast<float*>(impl_->mtp_parts_device), impl_->mtp_cpu_out.data(),
+                                     static_cast<size_t>(k) * static_cast<size_t>(N) * sizeof(float), ds)) {
+            err = std::string("EXL3 Flash MTP draft expert upload failed: ") + strata::gpu::last_error();
+            return false;
+        }
+        if (!block_layer_post(*impl_->mtp_table, impl_->mtp_geometry, 0, k, impl_->mtp_session.moe,
+                              impl_->mtp_session.block, static_cast<const float*>(impl_->mtp_parts_device),
+                              ds, err)) {
+            err = "EXL3 Flash MTP draft combine: " + err;
+            return false;
+        }
+        const BlockBuffers head_bb = impl_->mtp_session.block;
+        if (!lm_head(last.table, impl_->geometry, head_bb, static_cast<float*>(impl_->logits_device), ds,
+                     err) ||
+            !strata::gpu::stream_sync(ds) ||
+            !strata::gpu::copy(impl_->logits_host.data(), impl_->logits_device,
+                               impl_->logits_host.size() * sizeof(float))) {
+            err = "EXL3 Flash MTP draft head: " + (err.empty() ? strata::gpu::last_error() : err);
+            return false;
+        }
+        double best = -std::numeric_limits<double>::infinity();
+        for (size_t i = 0; i < impl_->logits_host.size(); ++i) {
+            const double value = impl_->logits_host[i];
+            if (std::isfinite(value) && value > best) {
+                best = value;
+                draft = static_cast<int32_t>(i);
+            }
+        }
+        if (draft < 0) { err = "EXL3 Flash: MTP draft logits are all non-finite"; return false; }
+        if (host_logits != nullptr)
+            std::copy(impl_->logits_host.begin(), impl_->logits_host.end(), host_logits);
+        return true;
+    } catch (const std::exception& e) {
+        err = std::string("EXL3 Flash MTP draft: ") + e.what();
+        return false;
+    }
 }
 
 NativeEmbed* Exl3FlashModel::embedding() const { return impl_ == nullptr ? nullptr : impl_->embedding.get(); }

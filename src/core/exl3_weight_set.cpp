@@ -519,14 +519,17 @@ bool Exl3WeightSet::load(const Archive& archive, const ModelMap& map, WeightTabl
         bool selected = false;
         bool selected_head = false;
         for (const auto& mapping : map.projections) {
-            if (mapping.kind == ProjectionKind::embedding || mapping.kind == ProjectionKind::mtp_fc ||
+            if (mapping.kind == ProjectionKind::embedding ||
+                (mapping.kind == ProjectionKind::mtp_fc && !options.include_mtp_block) ||
                 expert_kind(mapping.kind)) continue;
             if (mapping.canonical_name.find(".nextn.") != std::string::npos) continue;
             if (mapping.kind == ProjectionKind::lm_head || mapping.kind == ProjectionKind::final_norm) {
                 if (!options.include_head) continue;
                 if (mapping.kind == ProjectionKind::lm_head) selected_head = true;
             } else if (mapping.layer < options.layer_begin || mapping.layer >= end) {
-                continue;
+                // Layer<0 entries are archive globals (the MTP block's fc/norms); the trunk range
+                // never takes them, and the MTP block takes them only when asked for explicitly.
+                if (!options.include_mtp_block || mapping.layer >= 0) continue;
             }
             if (mapping.kind == ProjectionKind::hc_norm && mapping.layer < 0) continue;
             if (!attach_mapping(archive, mapping, options.max_rows, err)) {

@@ -48,7 +48,7 @@ struct Exl3FlashModelOptions {
     int64_t max_rows = 1;                 ///< persistent projection/expert row capacity
     int64_t max_cells = 0;                ///< 0: config.max_position_embeddings
     int64_t routed_k = 0;                 ///< 0: text_config.num_experts_per_tok
-    bool include_mtp = false;             ///< currently rejected for Qwen3.8
+    bool include_mtp = false;             ///< bind the archive MTP map (draft/verify loop still AR-only)
     bool vision = false;                  ///< currently rejected
     bool allow_cpu_expert_miss = true;    ///< misses use Exl3ExpertSource + ExpertPool
     std::string embedding_name;            ///< empty: ModelMap's HF embedding prefix
@@ -77,6 +77,33 @@ struct Exl3FlashStageRange {
     int64_t layer_end = 0;
 };
 
+/// A caller-owned full-sequence snapshot for the draft/verify loop.  It holds
+/// every device buffer a forward mutates (the session arenas, the PLE owner's
+/// device rows) plus the host QSA mirrors and the host sequence scalars, so a
+/// rejected draft rewinds by restoring.  Save allocates (or grows) the
+/// snapshot's own device buffers; release frees them.  KV streaming is not
+/// covered: saving a streamed state fails closed.
+struct Exl3FlashSnapshot {
+    struct StageSnap {
+        void* arena = nullptr;
+        size_t arena_bytes = 0;
+        std::vector<std::vector<int32_t>> qsa_step;  ///< per allocated state, kStepCount+1
+        std::vector<std::vector<int32_t>> qsa_pos;   ///< per allocated state, n_head
+        void* ple_emb_dev = nullptr;
+        void* ple_scratch = nullptr;
+    };
+    std::vector<StageSnap> stages;
+    void* mtp_arena = nullptr;
+    size_t mtp_arena_bytes = 0;
+    std::vector<std::vector<int32_t>> mtp_qsa_step;
+    std::vector<std::vector<int32_t>> mtp_qsa_pos;
+    int64_t next_position = 0;
+    int32_t ple_prev[2] = {-1, -1};
+    int32_t ple_token = -1;
+    bool seeded = false;
+    bool initialized = false;
+};
+
 /// The range of stage `stage_index` of `stage_count` over `layer_count` layers.  The split is the
 /// same for every layer count and stage count, and it is the only place the split is written down.
 Exl3FlashStageRange exl3_flash_stage_range(int64_t layer_count, int64_t stage_count, int64_t stage_index);
@@ -89,6 +116,13 @@ Exl3FlashStageRange exl3_flash_stage_range(int64_t layer_count, int64_t stage_co
 /// that holds a layer decides where that layer's state lives and the last stage holds the head.
 bool exl3_flash_stage_ranges(int64_t layer_count, int64_t stage_count, const std::vector<int64_t>& counts,
                              std::vector<Exl3FlashStageRange>& ranges, std::string& err);
+
+/// Whether a Qwen3.8 MTP map carries every role the draft binding needs: one
+/// layer, both mtp_fc projections, the full QSA set (q/k/v/out plus both
+/// indexer halves), the eight hyper-connection entries, and the complete
+/// gate/up/down set for a positive expert count.  Anything less is not a
+/// usable draft block, so it fails closed with the reason in `err`.
+bool exl3_flash_mtp_roles_complete(const strata::artifact::exl3::ModelMap& mtp, std::string& err);
 
 /// The stage that runs the PLE layer: the PLE's HOME STAGE.
 ///
@@ -150,6 +184,27 @@ public:
     const strata::ModelSpec& spec() const;
     const ModelGeometry& geometry() const;
     const strata::artifact::exl3::ModelMap& model_map() const;
+    /// Whether open() bound the Qwen3.8 MTP map.  Forward stays single-token
+    /// AR until the draft/verify loop lands; the map is the binding it will use.
+    bool has_mtp() const;
+    const strata::artifact::exl3::ModelMap& mtp_map() const;
+    /// The MTP draft block's dense weights, or null when include_mtp was not
+    /// set.  The draft expert runtime holds no device cache; misses run on
+    /// the CPU pool, which is the functional path until the fast path lands.
+    const Exl3WeightSet* mtp_weights() const;
+    /// Run one MTP draft step from the current trunk state: the trunk must
+    /// have just produced `next_token` at `trunk_pos`, so `next_position()`
+    /// is `trunk_pos + 1`.  Only the MTP session advances; the trunk state is
+    /// untouched.  The draft predicts the token after `next_token`; callers
+    /// verify it with a trunk forward and rewind with a snapshot on reject.
+    bool mtp_draft(int32_t next_token, int64_t trunk_pos, int32_t& draft, float* host_logits,
+                   std::string& err);
+    /// Save the full sequence state into the caller-owned snapshot, or restore
+    /// it back.  Restoring a snapshot from another model, another stage split,
+    /// or another arena size fails closed.  Forward stays valid after either.
+    bool save_snapshot(Exl3FlashSnapshot& snap, std::string& err);
+    bool restore_snapshot(const Exl3FlashSnapshot& snap, std::string& err);
+    static void release_snapshot(Exl3FlashSnapshot& snap) noexcept;
     NativeEmbed* embedding() const;
     Exl3Ple* ple() const;
     strata::kernels::PleTable* ple_table() const;

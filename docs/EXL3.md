@@ -204,7 +204,7 @@ and `--trace TRACE.json --out-dir DIR`. `--rows 0,4` limits rows.
 Quality acceptance uses only `KL(P_BF16 || P_candidate)` against the original
 BF16 teacher. The diagnostic dump's runtime is not a decode speed acceptance measurement.
 
-## Qwen3.8 Flash AR integration
+## Qwen3.8 Flash AR integration and spec2
 
 Qwen3.8 `--exl3 DIR` starts directly from the archive's HF config without requiring a metadata GGUF.
 An optional `--metadata-gguf` supplies EOS metadata. Pass input IDs with `--tokens` or `--tokens-file`,
@@ -217,10 +217,12 @@ strata --exl3 /path/to/qwen38-exl3 --tokens 16,10,16,28 --max-new 2 \
     --context 8 --stage-devices 0 --spec 0 --max-t 1 --prompt-chunk 0
 ```
 
-This integration runs greedy single-token AR and uses CPU expert fallback with partial residency.
+This integration runs greedy single-token AR by default and uses CPU expert fallback with partial residency.
 `--dump-logits FILE` saves generation FP32 logits; `--stop-eos` or `--eos ID` controls stopping.
-This initial CLI rejects requests for MTP, vision, serve, batch and multi-token prompt chunks.
-Qwen3.5 CLI/MTP uses the following path.
+`--spec 2` runs the serial single-draft MTP loop: only drafts that pass verification are kept, and a rejected
+window rewinds from a snapshot and is rewritten with AR, so tokens and logits match AR. The draft runs
+uncaptured with CPU-pool experts, so it is currently slower than AR. Vision, serve, batch and multi-token
+prompt chunks are still rejected on request. Qwen3.5 CLI/MTP uses the following path.
 
 ### The device cache (Qwen3.8 Flash)
 
