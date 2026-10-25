@@ -97,8 +97,9 @@ XeStrata reads it from the command line (the server path does not have it yet).
 
 - **What it reads**: an EXL3 checkpoint (a set of safetensors weights) and a metadata GGUF that carries
   the shape only
-- **The models it covers**: the Qwen3.5 family of MoE models (AR and MTP), and Qwen3.8 Flash
-  (AR and serial-speculation MTP)
+- **The models it covers**: the Qwen3.5 family of MoE models (AR and MTP), Qwen3.8 Flash
+  (AR and serial-speculation MTP), and the Tencent Hy3 family (`HYV3ForCausalLM`, AR only;
+  its NextN/MTP block is not run yet)
 - **Accuracy**: with the same source model, the same 32x1024 calibration tokens and the same six holdouts,
   `KL(P_BF16 || P_candidate)` is 0.0090 for EXL3 at 4.5 bpw and 0.0218 for I-Quant's mixed IQ4_XS,
   so EXL3 is 59 percent lower. The gap is larger at 2 and 3 bpw, and at 5 bpw it is 60 percent lower at

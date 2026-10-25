@@ -180,12 +180,18 @@ bool read_exl3_model_spec(const Archive& archive, strata::ModelSpec& spec, std::
         const std::string model_type = model_type_value->get<std::string>();
         const bool qwen35 = model_type == "qwen3_5_moe_text" || model_type == "qwen3_5_moe";
         const bool qwen38 = model_type == "qwen4_exp_text" || model_type == "qwen4_exp";
-        if (!qwen35 && !qwen38) {
+        const bool hyv3 = model_type == "hy_v3";
+        if (!qwen35 && !qwen38 && !hyv3) {
             err = "EXL3 model spec: unsupported model_type " + model_type;
             return false;
         }
-        spec.arch = qwen35 ? strata::ModelArch::Qwen35Moe : strata::ModelArch::Qwen4Exp;
-        spec.arch_name = qwen35 ? "qwen35moe" : "qwen4exp";
+        spec.arch = qwen35 ? strata::ModelArch::Qwen35Moe : qwen38 ? strata::ModelArch::Qwen4Exp : strata::ModelArch::HyV3;
+        spec.arch_name = qwen35 ? "qwen35moe" : qwen38 ? "qwen4exp" : "hy_v3";
+        if (hyv3 && include_mtp) {
+            err = "EXL3 model spec: HyV3 MTP (num_nextn_predict_layers) is not run by this engine yet; "
+                  "read the trunk with include_mtp=false";
+            return false;
+        }
 
         int64_t configured_mtp = 0;
         if (!optional_int(*text, "mtp_num_hidden_layers", configured_mtp, err)) return false;
@@ -222,6 +228,85 @@ bool read_exl3_model_spec(const Archive& archive, strata::ModelSpec& spec, std::
             !positive(spec.context_length, "max_position_embeddings", err) || spec.rms_eps <= 0.0) {
             if (err.empty()) err = "EXL3 model spec: rms_norm_eps must be positive";
             return false;
+        }
+
+        if (hyv3) {
+            // HYV3ForCausalLM (transformers' hy_v3): every layer is full attention, rotated over the whole
+            // head; the leading `first_k_dense_replace` layers carry a dense MLP, the rest a sigmoid-routed
+            // MoE with an expert-choice bias and an always-on shared expert of moe width x shared count.
+            spec.n_head_kv.assign(static_cast<size_t>(spec.n_layer), num_kv_heads);
+            spec.recurrent.assign(static_cast<size_t>(spec.n_layer), false);
+            spec.full_attention_interval = spec.n_layer;
+            const Json* rope = object_field(*text, "rope_parameters");
+            if (rope == nullptr) rope = object_field(*text, "rope_scaling");
+            if (rope == nullptr || !rope->is_object()) { err = "EXL3 model spec: rope_parameters is missing"; return false; }
+            double rope_theta = 0.0;
+            if (!required_num(*rope, "rope_theta", rope_theta, err) || rope_theta <= 0.0) {
+                if (err.empty()) err = "EXL3 model spec: invalid rope_parameters";
+                return false;
+            }
+            spec.rope_base = rope_theta;
+            spec.rope_dims = spec.key_length;
+            spec.rope_scaling_type = "none";
+            if (const Json* type = object_field(*rope, "rope_type"); type != nullptr) {
+                if (!type->is_string()) { err = "EXL3 model spec: rope_type is not a string"; return false; }
+                if (type->get<std::string>() != "default") {
+                    err = "EXL3 model spec: HyV3 rope_type " + type->get<std::string>() + " is not supported";
+                    return false;
+                }
+            }
+            int64_t dense_lead = 0, shared_count = 1;
+            if (!optional_int(*text, "first_k_dense_replace", dense_lead, err) ||
+                !optional_int(*text, "num_shared_experts", shared_count, err) ||
+                !required_int(*text, "intermediate_size", spec.n_ff, err) ||
+                !required_int(*text, "num_experts", spec.n_expert, err) ||
+                !required_int(*text, "num_experts_per_tok", spec.n_expert_used, err) ||
+                !required_int(*text, "moe_intermediate_size", spec.n_ff_exp, err)) return false;
+            int64_t expert_hidden = 0;
+            if (!optional_int(*text, "expert_hidden_dim", expert_hidden, err)) return false;
+            if (expert_hidden > 0) spec.n_ff_exp = expert_hidden;   // Hy-Memory: 768, where moe_intermediate_size is 1536
+            const Json* mlp_types = object_field(*text, "mlp_layer_types");
+            if (mlp_types != nullptr) {
+                if (!mlp_types->is_array() || static_cast<int64_t>(mlp_types->size()) != spec.n_layer) {
+                    err = "EXL3 model spec: mlp_layer_types must contain exactly num_hidden_layers entries";
+                    return false;
+                }
+                int64_t dense = 0;
+                for (int64_t l = 0; l < spec.n_layer; ++l) {
+                    const auto& item = (*mlp_types)[static_cast<size_t>(l)];
+                    if (!item.is_string() || (item.get<std::string>() != "dense" && item.get<std::string>() != "sparse")) {
+                        err = "EXL3 model spec: mlp_layer_types contains an unsupported layer type";
+                        return false;
+                    }
+                    const bool is_dense = item.get<std::string>() == "dense";
+                    if (is_dense != (l < dense_lead)) {
+                        err = "EXL3 model spec: HyV3 dense layers must be exactly the leading first_k_dense_replace layers";
+                        return false;
+                    }
+                    if (is_dense) ++dense;
+                }
+                (void) dense;
+            }
+            if (dense_lead < 0 || dense_lead >= spec.n_layer || shared_count <= 0 ||
+                !positive(spec.n_ff, "intermediate_size", err) || !positive(spec.n_expert, "num_experts", err) ||
+                !positive(spec.n_expert_used, "num_experts_per_tok", err) || spec.n_expert_used > spec.n_expert ||
+                !positive(spec.n_ff_exp, "moe_intermediate_size", err)) return false;
+            if (!product(spec.n_ff_exp, shared_count, spec.n_ff_shexp, "shared expert width", err)) return false;
+            spec.n_dense_lead = dense_lead;
+            spec.n_expert_shared = shared_count;
+            spec.gating = strata::ExpertGating::Sigmoid;
+            spec.expert_bias = true;
+            if (!optional_bool(*text, "moe_router_enable_expert_bias", spec.expert_bias, err) ||
+                !optional_bool(*text, "route_norm", spec.expert_weights_norm, err) ||
+                !optional_num(*text, "router_scaling_factor", spec.expert_weights_scale, err)) return false;
+            if (spec.expert_weights_norm && spec.expert_weights_scale == 0.0) spec.expert_weights_scale = 1.0;
+            int64_t nextn = 0;
+            if (!optional_int(*text, "num_nextn_predict_layers", nextn, err) || nextn < 0) {
+                if (err.empty()) err = "EXL3 model spec: num_nextn_predict_layers is negative";
+                return false;
+            }
+            spec.n_nextn = 0;   // trunk only: the NextN block is not run yet (see the include_mtp refusal above)
+            return true;
         }
 
         int64_t interval = 0;

@@ -192,6 +192,98 @@ bool check_raw_gdn_fixture() {
     return ok;
 }
 
+bool check_hyv3_fixture() {
+    using namespace strata::artifact::exl3;
+    const auto root = std::filesystem::temp_directory_path() /
+        ("xestrata_exl3_model_map_hyv3_" +
+         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::filesystem::create_directories(root);
+    std::ofstream(root / "config.json") << R"({"model_type":"hy_v3","hidden_size":8,"vocab_size":8,"num_hidden_layers":2,"num_attention_heads":1,"num_key_value_heads":1,"head_dim":8,"intermediate_size":4,"moe_intermediate_size":4,"num_experts":2,"num_experts_per_tok":1,"num_shared_experts":1,"first_k_dense_replace":1,"num_nextn_predict_layers":0,"rms_norm_eps":1e-5})";
+    std::vector<FixtureTensor> tensors;
+    const auto add = [&](const std::string& name, std::vector<int64_t> shape) {
+        uint64_t elements = 1;
+        for (const int64_t dim : shape) elements *= static_cast<uint64_t>(dim);
+        tensors.push_back({name, "BF16", std::move(shape), elements * 2});
+    };
+    add("model.embed_tokens.weight", {8, 8});
+    add("model.norm.weight", {8});
+    add("lm_head.weight", {8, 8});
+    for (int layer = 0; layer < 2; ++layer) {
+        const std::string p = "model.layers." + std::to_string(layer) + ".";
+        add(p + "input_layernorm.weight", {8});
+        add(p + "post_attention_layernorm.weight", {8});
+        add(p + "self_attn.q_proj.weight", {8, 8});
+        add(p + "self_attn.k_proj.weight", {8, 8});
+        add(p + "self_attn.v_proj.weight", {8, 8});
+        add(p + "self_attn.o_proj.weight", {8, 8});
+        add(p + "self_attn.q_norm.weight", {8});
+        add(p + "self_attn.k_norm.weight", {8});
+        if (layer == 0) {
+            add(p + "mlp.gate_proj.weight", {4, 8});
+            add(p + "mlp.up_proj.weight", {4, 8});
+            add(p + "mlp.down_proj.weight", {8, 4});
+        } else {
+            add(p + "mlp.router.gate.weight", {2, 8});
+            add(p + "mlp.expert_bias", {2});
+            add(p + "mlp.shared_mlp.gate_proj.weight", {4, 8});
+            add(p + "mlp.shared_mlp.up_proj.weight", {4, 8});
+            add(p + "mlp.shared_mlp.down_proj.weight", {8, 4});
+            for (int e = 0; e < 2; ++e) {
+                const std::string ep = p + "mlp.experts." + std::to_string(e) + ".";
+                add(ep + "gate_proj.weight", {4, 8});
+                add(ep + "up_proj.weight", {4, 8});
+                add(ep + "down_proj.weight", {8, 4});
+            }
+        }
+    }
+    std::ostringstream header;
+    header << '{';
+    uint64_t offset = 0;
+    for (size_t i = 0; i < tensors.size(); ++i) {
+        if (i != 0) header << ',';
+        const auto& tensor = tensors[i];
+        header << '"' << tensor.name << "\":{\"dtype\":\"" << tensor.dtype << "\",\"shape\":[";
+        for (size_t j = 0; j < tensor.shape.size(); ++j) {
+            if (j != 0) header << ',';
+            header << tensor.shape[j];
+        }
+        header << "],\"data_offsets\":[" << offset << ',' << offset + tensor.bytes << "]}";
+        offset += tensor.bytes;
+    }
+    header << '}';
+    const std::string raw_header = header.str();
+    std::ofstream model(root / "model.safetensors", std::ios::binary);
+    const uint64_t header_bytes = raw_header.size();
+    for (int i = 0; i < 8; ++i) model.put(static_cast<char>(header_bytes >> (8 * i)));
+    model.write(raw_header.data(), static_cast<std::streamsize>(raw_header.size()));
+    std::vector<uint8_t> zeros(static_cast<size_t>(offset), 0);
+    model.write(reinterpret_cast<const char*>(zeros.data()), static_cast<std::streamsize>(zeros.size()));
+    model.close();
+    bool ok = false;
+    try {
+        Archive archive(root);
+        ModelMap map;
+        std::string err;
+        const bool built = build_model_map(archive, map, err);
+        ok = built && map.family == ModelFamily::hyv3 && map.unsupported.empty() &&
+             map.geometry.dense_lead == 1 && map.geometry.dense_intermediate == 4;
+        if (!built) std::cerr << "HyV3 fixture build error: " << err << '\n';
+        for (const auto& item : map.unsupported) std::cerr << "HyV3 fixture unsupported: " << item << '\n';
+        bool dense = false, bias = false, shared = false;
+        for (const auto& item : map.projections) {
+            if (item.kind == ProjectionKind::dense_gate && item.layer == 0) dense = true;
+            if (item.canonical_name == "blk.1.exp_probs_b") bias = true;
+            if (item.kind == ProjectionKind::shared_gate && item.layer == 1) shared = true;
+        }
+        ok = ok && dense && bias && shared;
+    } catch (const std::exception& e) {
+        std::cerr << "HyV3 fixture exception: " << e.what() << '\n';
+        ok = false;
+    }
+    std::filesystem::remove_all(root);
+    return ok;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -208,6 +300,11 @@ int main(int argc, char** argv) {
             return 1;
         }
         std::cout << "raw GDN mapping fixture: OK\n";
+        if (!check_hyv3_fixture()) {
+            std::cout << "HyV3 mapping fixture: FAIL\n";
+            return 1;
+        }
+        std::cout << "HyV3 mapping fixture: OK\n";
         const auto root = std::filesystem::temp_directory_path() /
             ("xestrata_exl3_model_map_unknown_" +
              std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
