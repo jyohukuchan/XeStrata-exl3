@@ -117,7 +117,8 @@ bool add_linear(ModelMap& map, const Archive& archive, ProjectionKind kind, int6
         return false;
     }
     if (descriptor == nullptr) {
-        const bool raw_exception = kind == ProjectionKind::gdn_qkv || kind == ProjectionKind::gdn_z ||
+        const bool raw_exception = kind == ProjectionKind::conv_in || kind == ProjectionKind::conv_out ||
+                                   kind == ProjectionKind::gdn_qkv || kind == ProjectionKind::gdn_z ||
                                    kind == ProjectionKind::gdn_out || kind == ProjectionKind::qsa_q ||
                                    kind == ProjectionKind::qsa_k ||
                                    kind == ProjectionKind::qsa_v || kind == ProjectionKind::qsa_out ||
@@ -318,6 +319,8 @@ AxisMapping make_v_head_axis(int64_t total, int64_t offset, int64_t key_heads, i
 
 const char* projection_kind_name(ProjectionKind kind) {
     switch (kind) {
+        case ProjectionKind::conv_in: return "conv_in";
+        case ProjectionKind::conv_out: return "conv_out";
         case ProjectionKind::gdn_qkv: return "gdn_qkv";
         case ProjectionKind::gdn_z: return "gdn_z";
         case ProjectionKind::gdn_out: return "gdn_out";

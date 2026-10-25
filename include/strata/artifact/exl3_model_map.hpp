@@ -19,7 +19,6 @@ enum class ProjectionKind {
     gdn_qkv, gdn_z, gdn_out, gdn_alpha, gdn_beta,
     qsa_q, qsa_k, qsa_v, qsa_out, qsa_indexer_q, qsa_indexer_k,
     router, shared_scalar, shared_gate, shared_up, shared_down,
-    dense_gate, dense_up, dense_down,
     expert_gate, expert_up, expert_down,
     hc_norm, hc_down, hc_up, hc_inject,
     mtp_fc,
