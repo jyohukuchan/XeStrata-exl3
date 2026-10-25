@@ -259,16 +259,6 @@ bool check_hyv3_fixture() {
     std::vector<uint8_t> zeros(static_cast<size_t>(offset), 0);
     model.write(reinterpret_cast<const char*>(zeros.data()), static_cast<std::streamsize>(zeros.size()));
     model.close();
-bool check_lfm2moe_fixture() {
-        ("xestrata_exl3_model_map_lfm2_" +
-    std::ofstream(root / "config.json")
-        << R"({"model_type":"lfm2_moe","text_config":{"hidden_size":4,"vocab_size":4,"num_hidden_layers":2,"num_experts":2,"num_experts_per_tok":1,"moe_intermediate_size":4,"intermediate_size":4,"conv_L_cache":3,"layer_types":["conv","full_attention"],"num_attention_heads":1,"num_key_value_heads":1,"num_dense_layers":1,"use_expert_bias":true}})";
-    const std::string header =
-        R"({"model.embed_tokens.weight":{"dtype":"F16","shape":[4,4],"data_offsets":[0,32]},"lm_head.weight":{"dtype":"F16","shape":[4,4],"data_offsets":[32,64]}})";
-    const uint64_t header_bytes = header.size();
-    model.write(header.data(), static_cast<std::streamsize>(header.size()));
-    for (int i = 0; i < 64; ++i) model.put(0);
-
     bool ok = false;
     try {
         Archive archive(root);
@@ -288,9 +278,40 @@ bool check_lfm2moe_fixture() {
         ok = ok && dense && bias && shared;
     } catch (const std::exception& e) {
         std::cerr << "HyV3 fixture exception: " << e.what() << '\n';
+        ok = false;
+    }
+    std::filesystem::remove_all(root);
+    return ok;
+}
+
+bool check_lfm2moe_fixture() {
+    using namespace strata::artifact::exl3;
+    const auto root = std::filesystem::temp_directory_path() /
+        ("xestrata_exl3_model_map_lfm2_" +
+         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::filesystem::create_directories(root);
+    std::ofstream(root / "config.json")
+        << R"({"model_type":"lfm2_moe","text_config":{"hidden_size":4,"vocab_size":4,"num_hidden_layers":2,"num_experts":2,"num_experts_per_tok":1,"moe_intermediate_size":4,"intermediate_size":4,"conv_L_cache":3,"layer_types":["conv","full_attention"],"num_attention_heads":1,"num_key_value_heads":1,"num_dense_layers":1,"use_expert_bias":true}})";
+    const std::string header =
+        R"({"model.embed_tokens.weight":{"dtype":"F16","shape":[4,4],"data_offsets":[0,32]},"lm_head.weight":{"dtype":"F16","shape":[4,4],"data_offsets":[32,64]}})";
+    std::ofstream model(root / "model.safetensors", std::ios::binary);
+    const uint64_t header_bytes = header.size();
+    for (int i = 0; i < 8; ++i) model.put(static_cast<char>(header_bytes >> (8 * i)));
+    model.write(header.data(), static_cast<std::streamsize>(header.size()));
+    for (int i = 0; i < 64; ++i) model.put(0);
+    model.close();
+
+    bool ok = false;
+    try {
+        Archive archive(root);
+        ModelMap map;
+        std::string err;
+        const bool built = build_model_map(archive, map, err);
         bool has_embed = false, has_head = false, names_conv = false;
+        for (const auto& item : map.projections) {
             if (item.kind == ProjectionKind::embedding) has_embed = true;
             if (item.kind == ProjectionKind::lm_head) has_head = true;
+        }
         for (const auto& item : map.unsupported)
             if (item.find("conv.in_proj") != std::string::npos) names_conv = true;
         std::string require_err;
@@ -300,6 +321,7 @@ bool check_lfm2moe_fixture() {
              has_head && names_conv && !map.unsupported.empty() && !map.require_supported(require_err) &&
              require_err.find("lfm2moe") != std::string::npos;
         if (!ok) std::cerr << "lfm2moe fixture: built=" << built << " err=" << err << '\n';
+    } catch (const std::exception& e) {
         std::cerr << "lfm2moe fixture exception: " << e.what() << '\n';
         ok = false;
     }
@@ -330,6 +352,8 @@ int main(int argc, char** argv) {
         std::cout << "HyV3 mapping fixture: OK\n";
         if (!check_lfm2moe_fixture()) {
             std::cout << "lfm2moe recognition fixture: FAIL\n";
+            return 1;
+        }
         std::cout << "lfm2moe recognition fixture: OK\n";
         const auto root = std::filesystem::temp_directory_path() /
             ("xestrata_exl3_model_map_unknown_" +
