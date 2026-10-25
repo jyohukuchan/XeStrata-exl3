@@ -174,6 +174,8 @@ int64_t exl3_flash_ple_stage(int64_t layer_count, int64_t stage_count);
 ///
 /// forward() records the existing block pre/post graphs, merges CPU expert
 /// misses with resident GPU rows, and bridges the residual between stages.
+/// Where a stage's cache is fully resident it instead replays one captured
+/// graph for the stage's whole token.
 /// The explicit expert-window API also supports callers with their own buffers.
 /// All GPU allocations and teardown use the stage device's OnDevice scope.
 class Exl3FlashModel {
@@ -222,8 +224,10 @@ public:
     bool has_mtp() const;
     const strata::artifact::exl3::ModelMap& mtp_map() const;
     /// The MTP draft block's dense weights, or null when include_mtp was not
-    /// set.  The draft expert runtime holds no device cache; misses run on
-    /// the CPU pool, which is the functional path until the fast path lands.
+    /// set.  The draft expert runtime holds a device cache of its own: when
+    /// every draft expert is resident the draft body after the embedding
+    /// gather replays as one captured graph on the GPU, otherwise misses run
+    /// on the CPU pool.
     const Exl3WeightSet* mtp_weights() const;
     /// Run one MTP draft step from the current trunk state: the trunk must
     /// have just produced `next_token` at `trunk_pos`, so `next_position()`

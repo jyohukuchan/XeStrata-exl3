@@ -214,8 +214,11 @@ strata --exl3 /path/to/qwen38-exl3 --tokens 16,10,16,28 --max-new 2 \
 この接続は既定で greedy の単 token AR を実行する。部分常駐時は CPU expert fallback を使う。
 `--dump-logits FILE` は生成時の FP32 logits を保存し、`--stop-eos` または `--eos ID` で終了条件を指定する。
 `--spec 2` から `--spec 6` は MTP の serial draft loop を実行する（窓あたり最大 N-1 draft）。verify に通った draft だけを採用し、通らない
-window は snapshot から戻して AR で書き直すので、token 列と logits は AR と一致する。draft 実行は
-非キャプチャで expert は CPU pool のため、今は AR より遅い。vision、serve、batch と複数 token の
+window は snapshot から戻して AR で書き直すので、token 列と logits は AR と一致する。draft の expert は
+自前の device cache を持ち、全 draft expert が常駐する場合は embedding gather の後の draft 本体
+（norm、射影、block、常駐 expert flow、head）全体を 1 つの graph として replay する。常駐しない場合は
+CPU pool 経路に落ちる。trunk は全 expert 常駐の stage では token 全体を 1 つの graph として replay する
+（`STRATA_EXL3_TOKEN_GRAPH=0` で層ごとの起動に戻る）。vision、serve、batch と複数 token の
 prompt chunk は引き続き要求時に拒否する。Qwen3.5 の CLI/MTP 接続は次の経路を使う。
 
 `--spec-min-p P`（0〜1 の確率、既定 0）は draft loop を選択的にする。MTP head の下での
