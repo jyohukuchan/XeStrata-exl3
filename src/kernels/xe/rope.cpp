@@ -157,7 +157,7 @@ bool native_rope_enabled() { return native_enabled.load(std::memory_order_relaxe
 void native_rope_apply(const float* x, float* out, int rows, int head_dim,
                        int n_rot, const RopeScaling& scaling, const int* positions, void* stream) {
     if (!x || !out || !positions || !stream || rows < 1 || rows > 65535 ||
-        (head_dim != 128 && head_dim != 256) || (n_rot != 64 && n_rot != head_dim) ||
+        (head_dim != 64 && head_dim != 128 && head_dim != 256) || (n_rot != 64 && n_rot != head_dim) ||
         rope_scaling_invalid(scaling) != nullptr ||
         reinterpret_cast<uintptr_t>(x) % 4 || reinterpret_cast<uintptr_t>(out) % 4 ||
         reinterpret_cast<uintptr_t>(positions) % 4) {
@@ -174,11 +174,11 @@ void native_rope_apply(const float* x, float* out, int rows, int head_dim,
     const float theta_scale = std::pow((float) scaling.freq_base, -2.0f / (float) n_rot);
     // the IMRoPE sections and the float64 angle table are Qwen3.8's 64-wide rotary slice (32 pairs): a rotation over
     // the whole head (llm-jp-4.1) computes its angles
-    const int32_t* mtab = n_rot == 64 ? mrope_table() : nullptr;
+    const int32_t* mtab = n_rot < head_dim ? mrope_table() : nullptr;
     const int width = head_dim;
     const bool scaled = scaling.type != RopeScalingType::None;
     const RopeKernelArgs ka = scaling.kernel_args(n_rot);
-    const RopeTab tab = n_rot == 64 ? rope_table_for(scaling) : RopeTab{};
+    const RopeTab tab = n_rot < head_dim ? rope_table_for(scaling) : RopeTab{};
     q.parallel_for(sycl::range<2>((size_t) rows, (size_t) width / 2), [=](sycl::id<2> id) {
         const int row = (int) id[0], pair = (int) id[1];
         const size_t start = size_t(row) * width;
@@ -204,7 +204,7 @@ bool native_norm_rope_usable(int head_dim, int n_rot) {
         const char* v = std::getenv("STRATA_NO_NORM_ROPE");
         return v == nullptr || std::strtol(v, nullptr, 10) == 0;
     }();
-    return on && (head_dim == 128 || head_dim == 256) && (n_rot == 64 || n_rot == head_dim);
+    return on && (head_dim == 64 || head_dim == 128 || head_dim == 256) && (n_rot == 64 || n_rot == head_dim);
 }
 
 // upstream 088e8a82 (#783 PR-f): native_qsa_rms_norm_weighted (its 256-item form: the same partial sums, sub-group
@@ -213,7 +213,7 @@ bool native_norm_rope_usable(int head_dim, int n_rot) {
 void native_qsa_rms_norm_rope(const float* x, int in_stride, const float* gamma, float* out, int rows, int head_dim,
                               int n_rot, float epsilon, const RopeScaling& scaling, const int* positions, void* stream) {
     if (!x || !gamma || !out || !positions || !stream || rows < 1 || rows > 65535 ||
-        (head_dim != 128 && head_dim != 256) || in_stride < head_dim || (n_rot != 64 && n_rot != head_dim) ||
+        (head_dim != 64 && head_dim != 128 && head_dim != 256) || in_stride < head_dim || (n_rot != 64 && n_rot != head_dim) ||
         !std::isfinite(epsilon) ||
         epsilon < 0.0f || rope_scaling_invalid(scaling) != nullptr || (x == out && in_stride != head_dim) ||
         reinterpret_cast<uintptr_t>(x) % 4 || reinterpret_cast<uintptr_t>(gamma) % 4 ||
@@ -221,10 +221,10 @@ void native_qsa_rms_norm_rope(const float* x, int in_stride, const float* gamma,
         throw std::invalid_argument("native_qsa_rms_norm_rope: invalid arguments");
     constexpr int BlockSize = 256;
     const float theta_scale = std::pow((float) scaling.freq_base, -2.0f / (float) n_rot);
-    const int32_t* mtab = n_rot == 64 ? mrope_table() : nullptr;   // as native_rope_apply
+    const int32_t* mtab = n_rot < head_dim ? mrope_table() : nullptr;   // as native_rope_apply
     const bool scaled = scaling.type != RopeScalingType::None;
     const RopeKernelArgs ka = scaling.kernel_args(n_rot);
-    const RopeTab tab = n_rot == 64 ? rope_table_for(scaling) : RopeTab{};
+    const RopeTab tab = n_rot < head_dim ? rope_table_for(scaling) : RopeTab{};
     const int n_cols = head_dim;
     queue_for(stream).submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> sums(sycl::range<1>(32), h);

@@ -102,8 +102,8 @@ public:
     bool load(const PlainOptions& opt, std::string& err);
     const ModelSpec& spec() const { return spec_; }
     int64_t vocab() const { return n_vocab_; }
-    /// The model carries a recurrent state (GDN layers): a sequence can be extended, not cut back to a prefix.
-    bool recurrent() const { return !gdn_state_.empty(); }
+    /// The model carries a recurrent state (GDN or short-conv layers): a sequence can be extended, not cut back.
+    bool recurrent() const { return !gdn_state_.empty() || !conv_state_.empty(); }
     int64_t max_cells() const { return opt_.max_cells; }
 
     /// Zeroes the recurrent states and the K/V cache: the next window starts a sequence at position 0.
@@ -163,17 +163,20 @@ private:
     };
     struct Block {
         bool recurrent = false;
-        int64_t gdn = -1, attn = -1;    ///< index among the GDN / attention blocks
+        bool shortconv = false;                               // lfm2moe: a short-conv mixer, no K/V
+        bool dense = false;                                   // leading layers: a dense SwiGLU, no routing
+        int64_t gdn = -1, attn = -1, conv_idx = -1;           ///< index among the GDN / attention / conv blocks
         const float *attn_norm = nullptr, *post_norm = nullptr;
         W qkv, z, alpha, beta, ssm_out;                       // GDN
         const float *conv = nullptr, *dt = nullptr, *a = nullptr, *ssm_norm = nullptr;
+        W conv_in, conv_out;                                  // shortconv
+        const float* conv_w = nullptr;                        // F32 [n_embd, shortconv_l_cache]
         W q, k, v, o;                                         // attention
         const float *q_norm = nullptr, *k_norm = nullptr;
         const float* router = nullptr;                        // F32 [n_embd, n_expert]
-        const float* router_bias = nullptr;                   // F32 [n_expert] (hy_v3 choice bias, may be null)
+        const float* router_bias = nullptr;                   // F32 [n_expert] (sigmoid choice bias, may be null)
         const float* sh_gate_inp = nullptr;                   // F32 [n_embd]
         W sh_gate, sh_up, sh_down;
-        bool dense = false;                                   // hy_v3 leading layers: a dense MLP, no routing
         W dense_gate, dense_up, dense_down;
     };
 
@@ -334,6 +337,8 @@ private:
 
     // per-sequence device state
     std::vector<float*> gdn_state_, gdn_conv_;   ///< per GDN block
+    std::vector<float*> conv_state_;             ///< per short-conv block: (l_cache - 1) rows of n_embd bx values
+    float *bcx_ = nullptr, *cy_ = nullptr;       ///< the short-conv window buffers: T x 3 n_embd, T x n_embd
     /// The recurrent states after a window's rows 0 .. n_snap_ - 1, per GDN block (gdn_snap_[block][row]), for
     /// spec_step to go back to the last accepted row.
     int n_snap_ = 0;

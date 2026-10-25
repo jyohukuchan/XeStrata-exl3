@@ -20,9 +20,9 @@ namespace strata::kernels {
 void router_top10(const float* logits, int n_tokens, int n_expert, int k, int* ids, float* weights,
                   void* stream);
 
-/// hy_v3's router: choice scores are sigmoid(logits) + bias (bias may be null), the gathered weights are
-/// sigmoid(logits) without the bias, renormalised to sum 1 when `norm` and then multiplied by `scale`.
-/// Selection ties keep the lower expert index, as in router_top10.
+/// The sigmoid router (lfm2moe, hy_v3): choice scores are sigmoid(logits) + bias (bias may be null),
+/// the gathered weights are sigmoid(logits) without the bias, renormalised to sum 1 when `norm` and
+/// then multiplied by `scale`.  Selection ties keep the lower expert index, as in router_top10.
 void router_sigmoid_topk(const float* logits, const float* bias, int n_tokens, int n_expert, int k,
                          bool norm, float scale, int* ids, float* weights, void* stream);
 

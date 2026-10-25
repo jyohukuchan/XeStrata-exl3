@@ -271,6 +271,8 @@ bool read_exl3_model_spec(const Archive& archive, strata::ModelSpec& spec, std::
                 !optional_bool(*text, "norm_topk_prob", spec.expert_weights_norm, err) ||
                 !optional_num(*text, "routed_scaling_factor", spec.expert_weights_scale, err))
                 return false;
+            if (object_field(*text, "norm_topk_prob") == nullptr) spec.expert_weights_norm = true;
+            if (object_field(*text, "routed_scaling_factor") == nullptr) spec.expert_weights_scale = 1.0;
             const Json* rope_lfm = object_field(*text, "rope_parameters");
             if (rope_lfm == nullptr || !rope_lfm->is_object() ||
                 !required_num(*rope_lfm, "rope_theta", spec.rope_base, err) || spec.rope_base <= 0.0) {

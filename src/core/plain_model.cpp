@@ -38,6 +38,7 @@
 #include "strata/kernels/rope_scaling.hpp"
 #include "strata/kernels/router_top10.hpp"
 #include "strata/kernels/sampler.hpp"
+#include "strata/kernels/shortconv.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/platform/memory.hpp"
@@ -238,13 +239,15 @@ bool PlainModel::load_exl3(std::string& err) {
     err.clear();
     try {
         exl3_archive_ = std::make_shared<strata::artifact::exl3::Archive>(opt_.exl3_dir);
-        const bool include_mtp = opt_.spec >= 2 && spec_.arch != ModelArch::HyV3;
+        const bool lfm2 = spec_.arch == ModelArch::Lfm2Moe;
+        const bool include_mtp = opt_.spec >= 2 && spec_.arch != ModelArch::HyV3 && !lfm2;
         if (!strata::artifact::exl3::build_model_map(*exl3_archive_, exl3_map_, err, include_mtp) ||
             !exl3_map_.require_supported(err))
             return false;
         if (exl3_map_.family != strata::artifact::exl3::ModelFamily::qwen35 &&
-            exl3_map_.family != strata::artifact::exl3::ModelFamily::hyv3) {
-            err = "plain model: this EXL3 integration currently supports Qwen3.5 and HyV3 only";
+            exl3_map_.family != strata::artifact::exl3::ModelFamily::hyv3 &&
+            !(lfm2 && exl3_map_.family == strata::artifact::exl3::ModelFamily::lfm2moe)) {
+            err = "plain model: this EXL3 integration currently supports Qwen3.5, HyV3 and LFM2 MoE only";
             return false;
         }
         const auto& g = exl3_map_.geometry;
@@ -267,8 +270,18 @@ bool PlainModel::load_exl3(std::string& err) {
                           g.vocab_size > 0 && g.q_heads == spec_.n_head && g.kv_heads == bootstrap_kv &&
                           g.head_dim == spec_.key_length && g.dense_lead == spec_.n_dense_lead &&
                           g.dense_intermediate == spec_.n_ff && spec_.key_length == spec_.value_length;
+        if (lfm2)
+            geometry_ok = g.hidden_size == spec_.n_embd && g.layers == spec_.n_layer &&
+                          g.experts == spec_.n_expert && g.experts_per_token == spec_.n_expert_used &&
+                          g.moe_intermediate == spec_.n_ff_exp && g.vocab_size > 0 &&
+                          g.q_heads == spec_.n_head && g.kv_heads == bootstrap_kv &&
+                          g.head_dim == spec_.key_length && g.dense_layers == spec_.n_dense_lead &&
+                          g.dense_intermediate == spec_.n_ff && g.shortconv_l_cache == spec_.shortconv_l_cache &&
+                          spec_.key_length == spec_.value_length;
         for (int64_t l = 0; geometry_ok && l < spec_.n_layer; ++l) {
-            const bool mapped_recurrent = exl3_projection(strata::artifact::exl3::ProjectionKind::gdn_qkv, l) != nullptr;
+            const bool mapped_recurrent = lfm2
+                ? exl3_projection(strata::artifact::exl3::ProjectionKind::conv_in, l) != nullptr
+                : exl3_projection(strata::artifact::exl3::ProjectionKind::gdn_qkv, l) != nullptr;
             if (mapped_recurrent != spec_.recurrent[(size_t) l]) {
                 err = "plain model: EXL3 layer attention pattern disagrees with metadata bootstrap";
                 return false;
@@ -379,12 +392,14 @@ bool PlainModel::load_exl3(std::string& err) {
         emb_ = nullptr;
         emb_row_ = 0;
         blocks_.resize((size_t) spec_.n_layer);
-        int64_t n_gdn = 0, n_attn = 0;
+        int64_t n_gdn = 0, n_attn = 0, n_conv = 0;
         for (int64_t l = 0; l < spec_.n_layer; ++l) {
             Block& b = blocks_[(size_t) l];
-            b.recurrent = spec_.recurrent[(size_t) l];
-            b.dense = spec_.arch == ModelArch::HyV3 && l < spec_.n_dense_lead;
-            if (b.recurrent) b.gdn = n_gdn++;
+            b.dense = (spec_.arch == ModelArch::HyV3 || lfm2) && l < spec_.n_dense_lead;
+            b.shortconv = lfm2 && spec_.recurrent[(size_t) l];
+            b.recurrent = !lfm2 && spec_.recurrent[(size_t) l];
+            if (b.shortconv) b.conv_idx = n_conv++;
+            else if (b.recurrent) b.gdn = n_gdn++;
             else b.attn = n_attn++;
             if (!load_exl3_block(l, b, err)) return false;
         }
@@ -478,7 +493,16 @@ bool PlainModel::load_exl3_block(int64_t l, Block& b, std::string& err) {
         !aux_name(canonical_prefix + (q35 ? "post_attention_norm.weight" : "ffn_norm.weight"), b.post_norm,
                   static_cast<uint64_t>(spec_.n_embd)))
         return false;
-    if (b.recurrent) {
+    if (b.shortconv) {
+        if (!dense(PK::conv_in, b.conv_in) || !dense(PK::conv_out, b.conv_out) ||
+            !aux_name(canonical_prefix + "shortconv_conv.weight", b.conv_w,
+                      static_cast<uint64_t>(spec_.n_embd * spec_.shortconv_l_cache)))
+            return false;
+        if (b.conv_in.n_out != 3 * spec_.n_embd || b.conv_out.n_in != spec_.n_embd) {
+            err = "plain model: EXL3 short-conv projection shapes disagree with bootstrap geometry";
+            return false;
+        }
+    } else if (b.recurrent) {
         const int64_t C = 2 * spec_.ssm_n_group * spec_.ssm_d_state + spec_.ssm_d_inner;
         if (!dense(PK::gdn_qkv, b.qkv) || !dense(PK::gdn_z, b.z) || !dense(PK::gdn_out, b.ssm_out) ||
             !dense(PK::gdn_alpha, b.alpha) || !dense(PK::gdn_beta, b.beta) ||
@@ -519,6 +543,10 @@ bool PlainModel::load_exl3_block(int64_t l, Block& b, std::string& err) {
                 break;
             }
     }
+    if (spec_.arch == ModelArch::Lfm2Moe &&
+        !aux_name(canonical_prefix + "ffn_exp_probs_b.bias", b.router_bias,
+                  static_cast<uint64_t>(spec_.n_expert)))
+        return false;
     if (has_shared_) {
         if (spec_.arch == ModelArch::HyV3) {
             if (!dense(PK::shared_gate, b.sh_gate) || !dense(PK::shared_up, b.sh_up) || !dense(PK::shared_down, b.sh_down))
@@ -561,23 +589,29 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
     }
     if (!read_model_spec(model_->meta(), spec_, err)) return false;
     const ModelSpec& s = spec_;
-    if (s.arch != ModelArch::Qwen35Moe && s.arch != ModelArch::Qwen3Moe && s.arch != ModelArch::HyV3) {
+    if (s.arch != ModelArch::Qwen35Moe && s.arch != ModelArch::Qwen3Moe && s.arch != ModelArch::HyV3 &&
+        s.arch != ModelArch::Lfm2Moe) {
         err = "plain model: " + s.arch_name + " is not run by this engine yet";
         return false;
     }
     const bool q35 = s.arch == ModelArch::Qwen35Moe;
     const bool hyv3 = s.arch == ModelArch::HyV3;
+    const bool lfm2 = s.arch == ModelArch::Lfm2Moe;
     has_gate_ = q35;
     has_shared_ = q35 || hyv3;   // hy_v3's shared expert is always on (no scalar gate; see record_block)
-    bool shape_ok = s.key_length == s.value_length && (s.key_length == 128 || s.key_length == 256) &&
+    bool shape_ok = s.key_length == s.value_length &&
+                    (s.key_length == 128 || s.key_length == 256 || (lfm2 && s.key_length == 64)) &&
                     (s.rope_dims == 64 || s.rope_dims == s.key_length) && s.n_expert_used <= 15 &&
-                    (hyv3 ? s.n_dense_lead < s.n_layer && s.n_ff > 0 : s.n_dense_lead == 0);
+                    ((hyv3 || lfm2) ? s.n_dense_lead < s.n_layer && s.n_ff > 0 : s.n_dense_lead == 0);
     if (q35)
         shape_ok = shape_ok && s.ssm_d_state == 128 && s.ssm_d_conv == 4 && s.ssm_n_group > 0 &&
                    s.ssm_dt_rank % s.ssm_n_group == 0 && s.ssm_d_inner == s.ssm_dt_rank * s.ssm_d_state &&
                    s.n_ff_shexp > 0;
     if (hyv3)
         shape_ok = shape_ok && s.gating == ExpertGating::Sigmoid && s.n_ff_shexp > 0 && s.rope_dims == s.key_length;
+    if (lfm2)
+        shape_ok = shape_ok && s.gating == ExpertGating::Sigmoid && s.expert_bias &&
+                   s.shortconv_l_cache >= 2 && s.shortconv_l_cache <= 8 && s.rope_dims == s.key_length;
     if (!shape_ok) {
         err = "plain model: a shape this engine's kernels are not built for";
         return false;
@@ -641,6 +675,16 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
     const int64_t C = 2 * s.ssm_n_group * s.ssm_d_state + s.ssm_d_inner;
     const k::QsaShapes qs = attn_shapes(s, nkv_);
     for (const Block& b : blocks_) {
+        if (b.shortconv) {
+            float* st = nullptr;
+            if (!strata::gpu::alloc_device(&st, (size_t) ((s.shortconv_l_cache - 1) * s.n_embd) * 4)) {
+                err = "plain model: no VRAM for the short-conv states";
+                return false;
+            }
+            allocs_.push_back(st);
+            conv_state_.push_back(st);
+            continue;
+        }
         if (b.recurrent) {
             float *st = nullptr, *cv = nullptr;
             if (!strata::gpu::alloc_device(&st, (size_t) (s.ssm_d_state * s.ssm_dt_rank * s.ssm_d_state) * 4) ||
@@ -709,7 +753,7 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
     const uint64_t T = (uint64_t) opt_.max_t, NH = (uint64_t) s.n_head, HD = (uint64_t) s.key_length;
     const uint64_t NKV = (uint64_t) qs.n_head_kv, HV = (uint64_t) s.ssm_dt_rank, ZV = (uint64_t) s.ssm_d_inner;
     const uint64_t K = (uint64_t) s.n_expert_used,
-                   FS = (uint64_t) std::max(s.n_ff_shexp, s.arch == ModelArch::HyV3 ? s.n_ff : 0);
+                   FS = (uint64_t) std::max(s.n_ff_shexp, (hyv3 || lfm2) ? s.n_ff : 0);
     const bool mapped_tokens = exl3_mode_ ? mapped(T * 4, (void**) &h_tokens_, (void**) &m_tokens_)
                                           : mapped(T * N * 4, (void**) &h_emb_, (void**) &m_emb_);
     if (!mapped_tokens || !mapped(T * k::kStepCount * 4, (void**) &h_step_, (void**) &m_step_) ||
@@ -737,7 +781,8 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
         !dev(&attn_scratch_, T * (uint64_t) attn_scratch_floats_ * 4) || !dev(&rlog_, T * E * 4) ||
         !dev(&ids_, T * K * 4) || !dev(&w_, T * K * 4) || !dev(&shared_, T * N * 4) || !dev(&sh_g_, (T + 4) * 4) ||
         !dev(&sh_gate_, T * FS * 4) || !dev(&sh_up_, T * FS * 4) || !dev(&moe_out_, T * N * 4) ||
-        !dev(&logits_, T * (uint64_t) n_vocab_ * 4) || (has_mtp_ && !dev(&mtp_h_, T * N * 4))) {
+        !dev(&logits_, T * (uint64_t) n_vocab_ * 4) || (has_mtp_ && !dev(&mtp_h_, T * N * 4)) ||
+        (lfm2 && (!dev(&bcx_, T * 3 * N * 4) || !dev(&cy_, T * N * 4)))) {
         err = "plain model: no VRAM for the window's buffers";
         return false;
     }
@@ -934,6 +979,8 @@ bool PlainModel::reset(std::string& err) {
     for (float* p : gdn_state_)
         ok = ok && strata::gpu::memset(p, 0, (size_t) (s.ssm_d_state * s.ssm_dt_rank * s.ssm_d_state) * 4);
     for (float* p : gdn_conv_) ok = ok && strata::gpu::memset(p, 0, (size_t) (C * (s.ssm_d_conv - 1)) * 4);
+    for (float* p : conv_state_)
+        ok = ok && strata::gpu::memset(p, 0, (size_t) ((s.shortconv_l_cache - 1) * s.n_embd) * 4);
     const k::QsaShapes qs = attn_shapes(s, nkv_);
     const size_t pool = (size_t) (n_pages_ * qs.n_head_kv * qs.page_size * qs.head_dim) * 2;
     for (size_t i = 0; i < k_pool_.size(); ++i)
@@ -987,7 +1034,11 @@ bool PlainModel::record_block(const Block& b, int64_t ml, int T, uint32_t& ring,
     };
     // the norm writes the q8_1 rows the projections read as well (one launch; after nextsycl's Qwen3.5 norm)
     k::native_qsa_rms_norm_weighted_q8_1(x_, b.attn_norm, hn_, xq_, (int) N, T, eps, cs);
-    if (b.recurrent) {
+    if (b.shortconv) {
+        proj(b.conv_in, hn_, bcx_, T, false);
+        k::shortconv_apply(conv_state_[(size_t) b.conv_idx], bcx_, b.conv_w, cy_, N, s.shortconv_l_cache, T, cs);
+        proj(b.conv_out, cy_, mix_, T, true);
+    } else if (b.recurrent) {
         float* state = gdn_state_[(size_t) b.gdn];
         float* hist = gdn_conv_[(size_t) b.gdn];
         proj(b.qkv, hn_, qkv_, T, false);
@@ -1047,7 +1098,7 @@ bool PlainModel::record_block(const Block& b, int64_t ml, int T, uint32_t& ring,
     }
     k::add_inplace(x_, mix_, (int64_t) T * N, cs);
 
-    if (b.dense) {   // hy_v3's leading layers: a plain SwiGLU MLP in the shared buffers (sized for the wider of the two)
+    if (b.dense) {   // the leading layers (hy_v3, lfm2moe): a plain SwiGLU MLP in the shared buffers (sized for the wider of the two)
         k::native_qsa_rms_norm_weighted(x_, b.post_norm, hn_, (int) N, T, eps, cs);
         proj(b.dense_gate, hn_, sh_gate_, T, true);
         proj(b.dense_up, hn_, sh_up_, T, false);
@@ -1062,7 +1113,7 @@ bool PlainModel::record_block(const Block& b, int64_t ml, int T, uint32_t& ring,
     if (sh_q8) k::native_qsa_rms_norm_weighted_q8_1(x_, b.post_norm, hn_, xq_, (int) N, T, eps, cs);
     else k::native_qsa_rms_norm_weighted(x_, b.post_norm, hn_, (int) N, T, eps, cs);
     k::f32_gemv_fp32_mmvf_multi(hn_, N, b.router, rlog_, E, N, E, T, cs);
-    if (s.arch == ModelArch::HyV3)
+    if (s.arch == ModelArch::HyV3 || s.arch == ModelArch::Lfm2Moe)
         k::router_sigmoid_topk(rlog_, b.router_bias, T, (int) E, (int) K, s.expert_weights_norm,
                                (float) s.expert_weights_scale, ids_, w_, cs);
     else
