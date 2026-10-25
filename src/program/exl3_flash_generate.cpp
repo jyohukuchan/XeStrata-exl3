@@ -141,7 +141,8 @@ void usage() {
                  "  --expert-profile-save P\n"
                  "                      record this run's expert firing frequencies and save them to P as a profile\n"
                  "  --expert-miss M     cpu (default): non-resident experts are computed on the CPU; direct: the GPU\n"
-                 "                      reads non-resident experts from pinned host memory over the bus\n"
+                 "                      reads non-resident experts from pinned host memory over the bus; dma: the GPU\n"
+                 "                      DMA-copies non-resident experts from pinned memory into VRAM and computes there\n"
                  "  --spec 0..6         2..6 run the serial MTP draft loop with up to N-1 drafts per window; 0|1 stay plain AR\n"
                  "  --spec-window R     auto (default): size each window by expected tokens per ms (DraftPolicy);\n"
                  "                      min-p: size it by the --spec-min-p floor instead. The rules are alternatives:\n"
@@ -197,6 +198,7 @@ int exl3_flash_main(int argc, char** argv) {
     std::string metadata_gguf, dump_path;
     std::string expert_profile, expert_profile_save;
     bool expert_miss_direct = false;
+    bool expert_miss_dma = false;
     int64_t max_new = 16, context = 0;
     bool stop_eos = false;
     int spec = 0, pool_workers = 0;
@@ -291,10 +293,11 @@ int exl3_flash_main(int argc, char** argv) {
         else if (argument == "--expert-profile-save") expert_profile_save = next("--expert-profile-save");
         else if (argument == "--expert-miss") {
             const std::string mode = next("--expert-miss");
-            if (mode == "cpu") expert_miss_direct = false;
-            else if (mode == "direct") expert_miss_direct = true;
+            if (mode == "cpu") { expert_miss_direct = false; expert_miss_dma = false; }
+            else if (mode == "direct") { expert_miss_direct = true; expert_miss_dma = false; }
+            else if (mode == "dma") { expert_miss_direct = false; expert_miss_dma = true; }
             else {
-                std::fprintf(stderr, "strata exl3-flash: --expert-miss accepts cpu or direct\n");
+                std::fprintf(stderr, "strata exl3-flash: --expert-miss accepts cpu, direct or dma\n");
                 return 2;
             }
         }
@@ -391,6 +394,7 @@ int exl3_flash_main(int argc, char** argv) {
     options.expert_profile = expert_profile;
     options.expert_profile_save = expert_profile_save;
     options.expert_miss_direct = expert_miss_direct;
+    options.expert_miss_dma = expert_miss_dma;
     options.vision = false;
     std::string err;
     const Clock::time_point load_begin = Clock::now();
@@ -569,14 +573,16 @@ int exl3_flash_main(int argc, char** argv) {
         std::fprintf(stderr, "strata (qwen4exp-exl3): spec-window auto cut %zu windows\n", spec_cut);
     {
         const auto cache = model.expert_cache_stats();
-        const int64_t routed = cache.hit_entries + cache.cpu_miss_entries + cache.direct_miss_entries;
+        const int64_t routed = cache.hit_entries + cache.cpu_miss_entries + cache.direct_miss_entries +
+                               cache.dma_miss_entries;
         std::fprintf(stderr,
                      "strata (qwen4exp-exl3): expert cache: %lld resident, %lld routed entries, %lld hits "
-                     "(%.2f%%), %lld cpu misses, %lld direct misses, miss mode %s\n",
+                     "(%.2f%%), %lld cpu misses, %lld direct misses, %lld dma misses, miss mode %s\n",
                      (long long) cache.resident_pairs, (long long) routed, (long long) cache.hit_entries,
                      routed > 0 ? 100.0 * static_cast<double>(cache.hit_entries) / static_cast<double>(routed) : 0.0,
                      (long long) cache.cpu_miss_entries, (long long) cache.direct_miss_entries,
-                     expert_miss_direct ? "direct" : "cpu");
+                     (long long) cache.dma_miss_entries,
+                     expert_miss_dma ? "dma" : expert_miss_direct ? "direct" : "cpu");
         if (!expert_profile_save.empty()) {
             std::string save_err;
             if (!model.save_expert_profile(expert_profile_save, save_err)) {

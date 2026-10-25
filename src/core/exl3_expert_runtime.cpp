@@ -70,15 +70,22 @@ void Exl3ExpertRuntime::close() {
     if (opened_) (void) strata::gpu::device_sync();
     cache_.close();
     if (direct_staging_ != nullptr) strata::gpu::free(direct_staging_);
+    if (dma_staging_ != nullptr) strata::gpu::free(dma_staging_);
     direct_staging_ = nullptr;
+    dma_staging_ = nullptr;
     direct_stride_ = 0;
     direct_capacity_ = 0;
     direct_ready_ = false;
+    dma_ready_ = false;
+    dma_sizes_.clear();
     heat_.clear();
     total_hit_entries_ = 0;
     total_cpu_miss_entries_ = 0;
     total_direct_miss_entries_ = 0;
+    total_dma_miss_entries_ = 0;
     direct_entries_ = 0;
+    dma_entries_ = 0;
+    last_window_gpu_complete_ = false;
     if (d_scratch_ != nullptr) strata::gpu::free(d_scratch_);
     if (d_blob_base_ != nullptr) strata::gpu::free(d_blob_base_);
     if (d_format_index_ != nullptr) strata::gpu::free(d_format_index_);
@@ -442,7 +449,7 @@ bool Exl3ExpertRuntime::open(Exl3ExpertSource& source, strata::kernels::cpu::Exp
     // largest format's stride.  The GPU reads these host addresses over the bus; no VRAM is spent on
     // misses.  A staging that cannot be allocated, or host memory the kernels cannot read, leaves the
     // CPU miss path in charge and says so once here.
-    if (miss_mode_ == MissMode::Direct) {
+    if (miss_mode_ == MissMode::Direct || miss_mode_ == MissMode::Dma) {
         uint64_t stride = 0;
         for (const auto& layout : format_table_host_) stride = std::max(stride, layout.total_bytes);
         direct_stride_ = (stride + 255u) & ~uint64_t(255u);
@@ -453,10 +460,24 @@ bool Exl3ExpertRuntime::open(Exl3ExpertSource& source, strata::kernels::cpu::Exp
             direct_staging_ = static_cast<uint8_t*>(strata::gpu::alloc_host(static_cast<size_t>(bytes)));
         }
         direct_ready_ = direct_staging_ != nullptr && strata::gpu::kernels_read_host(direct_staging_);
-        if (!direct_ready_) {
+        if (miss_mode_ == MissMode::Dma && direct_staging_ != nullptr) {
+            // VRAM twin of the pinned arena: the DMA copies land here and the grouped kernel reads
+            // VRAM instead of streaming every weight word over the bus during the kernel.
+            dma_staging_ = static_cast<uint8_t*>(strata::gpu::alloc_device(static_cast<size_t>(bytes)));
+            dma_ready_ = dma_staging_ != nullptr;
+            if (!dma_ready_) {
+                std::fprintf(stderr, "Exl3ExpertRuntime: DMA miss staging unavailable (VRAM arena "
+                                     "allocation failed); CPU misses stay in charge\n");
+            }
+        }
+        if (miss_mode_ == MissMode::Direct && !direct_ready_) {
             if (direct_staging_ != nullptr) { strata::gpu::free(direct_staging_); direct_staging_ = nullptr; }
             std::fprintf(stderr, "Exl3ExpertRuntime: direct miss read unavailable (pinned staging or host "
                                  "access failed); CPU misses stay in charge\n");
+        }
+        if (miss_mode_ == MissMode::Dma && direct_staging_ == nullptr) {
+            std::fprintf(stderr, "Exl3ExpertRuntime: DMA miss staging unavailable (pinned staging "
+                                 "allocation failed); CPU misses stay in charge\n");
         }
     }
     if (!allocate_images(err)) { close(); return false; }
@@ -498,6 +519,8 @@ bool Exl3ExpertRuntime::prepare_window(int64_t layer, const float* host_fp32_x, 
     miss_entries_ = 0;
     hit_entries_ = 0;
     direct_entries_ = 0;
+    dma_entries_ = 0;
+    dma_sizes_.clear();
     miss_ids_.clear();
     if (record_heat_ && heat_.size() != static_cast<size_t>(pair_count_))
         heat_.assign(static_cast<size_t>(pair_count_), 0);
@@ -536,7 +559,10 @@ bool Exl3ExpertRuntime::prepare_window(int64_t layer, const float* host_fp32_x, 
     // staging holds one blob per distinct miss, which the capacity bounds.
     const bool direct_active = miss_mode_ == MissMode::Direct && direct_ready_ &&
                                static_cast<int64_t>(miss_group_experts.size()) <= direct_capacity_;
-    if (direct_active) {
+    const bool dma_active = miss_mode_ == MissMode::Dma && dma_ready_ && direct_staging_ != nullptr &&
+                            static_cast<int64_t>(miss_group_experts.size()) <= direct_capacity_;
+    const bool gpu_miss_active = direct_active || dma_active;
+    if (gpu_miss_active) {
         for (size_t group = 0; group < miss_group_experts.size(); ++group) {
             uint8_t* staged = direct_staging_ + group * direct_stride_;
             if (!source_->copy_blob(layer, miss_group_experts[group], staged)) {
@@ -544,17 +570,21 @@ bool Exl3ExpertRuntime::prepare_window(int64_t layer, const float* host_fp32_x, 
                 return false;
             }
         }
+        for (size_t group = 0; group < miss_group_experts.size(); ++group) {
+            const auto* layout = source_->exl3_layout(layer, miss_group_experts[group]);
+            dma_sizes_.push_back(layout != nullptr ? layout->total_bytes : 0);
+        }
         for (const auto& entries : miss_group_entries)
             for (const int32_t entry : entries) {
                 std::fill(cpu_output + entry * ldy, cpu_output + entry * ldy + ldy, 0.0f);
-                ++direct_entries_;
+                if (dma_active) ++dma_entries_; else ++direct_entries_;
             }
     } else if (!miss_ids_.empty()) {
         source_->begin_layer(layer, miss_ids_.data(), static_cast<int64_t>(miss_ids_.size()));
         if (!source_->last_error().empty()) { err = source_->last_error(); return false; }
     }
     detail_sample.mark(1);   // source begin (guard time is a nested component)
-    if (!direct_active)
+    if (!gpu_miss_active)
     for (int64_t entry = 0; entry < n_tokens * routed_k_; ++entry) {
         const int32_t expert = routed_ids[entry];
         if (cache_.valid() && cache_.slot_of(layer, expert) >= 0) continue;
@@ -588,15 +618,16 @@ bool Exl3ExpertRuntime::prepare_window(int64_t layer, const float* host_fp32_x, 
         }
         h_start_[group + 1] = static_cast<int32_t>(cursor);
     }
-    if (direct_active) {
-        // Miss groups follow the hit groups in the same plan: their blob address is the pinned host
-        // staging, which host USM makes the device address too, so the grouped kernel reads the miss
-        // weights over the bus while it reads the hits from VRAM.
+    if (gpu_miss_active) {
+        // Miss groups follow the hit groups in the same plan.  Direct points them at the pinned host
+        // staging (host USM is device-addressable, so the kernel streams the weights over the bus);
+        // Dma points them at the VRAM twin, which copy_plan fills from the pinned staging first.
         for (size_t miss = 0; miss < miss_group_experts.size(); ++miss) {
             const size_t group = group_slots.size() + miss;
             const size_t at = pair_index(layer, miss_group_experts[miss]);
-            h_blob_base_[group] = static_cast<uint64_t>(
-                reinterpret_cast<uintptr_t>(direct_staging_ + miss * direct_stride_));
+            const uint8_t* staged = dma_active ? (dma_staging_ + miss * direct_stride_)
+                                               : (direct_staging_ + miss * direct_stride_);
+            h_blob_base_[group] = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(staged));
             h_format_index_[group] = pair_format_index_[at];
             for (int32_t entry : miss_group_entries[miss]) {
                 h_tok_[cursor] = entry / static_cast<int32_t>(routed_k_);
@@ -606,13 +637,15 @@ bool Exl3ExpertRuntime::prepare_window(int64_t layer, const float* host_fp32_x, 
             h_start_[group + 1] = static_cast<int32_t>(cursor);
         }
     }
-    *h_ngroups_ = static_cast<int32_t>(group_slots.size() + (direct_active ? miss_group_experts.size() : 0));
+    *h_ngroups_ = static_cast<int32_t>(group_slots.size() + (gpu_miss_active ? miss_group_experts.size() : 0));
     *h_nentries_ = static_cast<int32_t>(cursor);
     total_hit_entries_ += hit_entries_;
     total_cpu_miss_entries_ += miss_entries_;
     total_direct_miss_entries_ += direct_entries_;
+    total_dma_miss_entries_ += dma_entries_;
     prepared_layer_ = layer;
     prepared_ = true;
+    last_window_gpu_complete_ = (miss_entries_ == 0);
     cpu_ready_ = false;
     detail_sample.mark(3);   // host grouped hit plan
     detail_sample.success();
@@ -646,6 +679,21 @@ bool Exl3ExpertRuntime::run_cpu(std::string& err) {
 bool Exl3ExpertRuntime::copy_plan(sycl::queue& queue, const std::vector<sycl::event>& deps,
                                   std::vector<sycl::event>& copies, std::string& err) {
     try {
+        // DMA miss staging: pinned -> VRAM, on this (in-order) queue ahead of the plan copies and
+        // the grouped kernel, which both depend on `copies`.  The copies therefore overlap whatever
+        // the queue still holds from the previous layer while the host prepares the next window.
+        if (dma_ready_ && dma_staging_ != nullptr && direct_staging_ != nullptr) {
+            for (size_t group = 0; group < dma_sizes_.size(); ++group) {
+                const uint64_t bytes = dma_sizes_[group];
+                if (bytes == 0) continue;
+                uint8_t* dst = dma_staging_ + group * direct_stride_;
+                const uint8_t* src = direct_staging_ + group * direct_stride_;
+                copies.push_back(queue.submit([&](sycl::handler& h) {
+                    if (!deps.empty()) h.depends_on(deps);
+                    h.memcpy(dst, src, static_cast<size_t>(bytes));
+                }));
+            }
+        }
         auto copy = [&](void* dst, const void* src, size_t bytes) {
             copies.push_back(queue.submit([&](sycl::handler& h) {
                 if (!deps.empty()) h.depends_on(deps);

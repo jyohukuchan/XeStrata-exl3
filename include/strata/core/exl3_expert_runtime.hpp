@@ -31,8 +31,11 @@ public:
     /// computed by the CPU pool.  `Direct` stages the miss's canonical blob in pinned host memory and lets
     /// the GPU's grouped kernel read it from there over the bus (PCIe), so the GPU - not the CPU -
     /// computes the miss and no VRAM copy is made.  Direct falls back to `Cpu` per window when the pinned
-    /// staging is unavailable or the device cannot read host memory.
-    enum class MissMode { Cpu, Direct };
+    /// staging is unavailable or the device cannot read host memory.  `Dma` stages the same pinned
+    /// blobs, copies them into a VRAM staging arena on the compute queue (ordered before the grouped
+    /// kernel, so the copy engine overlaps the layers ahead of it), and computes from VRAM; it falls
+    /// back to `Cpu` per window when the staging is unavailable.
+    enum class MissMode { Cpu, Direct, Dma };
 
     Exl3ExpertRuntime() = default;
     ~Exl3ExpertRuntime();
@@ -118,7 +121,13 @@ public:
     int64_t total_hit_entries() const { return total_hit_entries_; }
     int64_t total_cpu_miss_entries() const { return total_cpu_miss_entries_; }
     int64_t total_direct_miss_entries() const { return total_direct_miss_entries_; }
+    int64_t total_dma_miss_entries() const { return total_dma_miss_entries_; }
+    bool dma_ready() const { return dma_ready_; }
 
+    /// True when the prepared window needs no CPU rows: every routed entry is computed by the
+    /// grouped GPU plan (resident hits plus Direct/Dma misses).  Callers may then skip the
+    /// device->host merge round trip.  Valid between prepare_window() and wait_gpu().
+    bool window_gpu_complete() const { return last_window_gpu_complete_; }
     bool prepared() const { return prepared_; }
     bool cpu_ready() const { return cpu_ready_; }
     bool pending_gpu() const { return pending_gpu_; }
@@ -177,15 +186,21 @@ private:
     int64_t cpu_rowparallel_jobs_ = 0;
     MissMode miss_mode_ = MissMode::Cpu;
     bool direct_ready_ = false;
-    uint8_t* direct_staging_ = nullptr;   ///< pinned host arena the GPU reads miss blobs from (Direct)
+    uint8_t* direct_staging_ = nullptr;   ///< pinned host arena the GPU reads miss blobs from (Direct/Dma)
     uint64_t direct_stride_ = 0;          ///< one staged blob's stride in direct_staging_
     int64_t direct_capacity_ = 0;         ///< distinct miss experts the arena holds
+    uint8_t* dma_staging_ = nullptr;      ///< VRAM arena Dma copies pinned miss blobs into
+    bool dma_ready_ = false;
+    int64_t total_dma_miss_entries_ = 0;
+    int64_t dma_entries_ = 0;             ///< this window's DMA entries (not CPU jobs)
+    std::vector<uint64_t> dma_sizes_;     ///< this window's staged blob byte counts, by miss group
     bool record_heat_ = false;
     std::vector<uint64_t> heat_;
     int64_t total_hit_entries_ = 0;
     int64_t total_cpu_miss_entries_ = 0;
     int64_t total_direct_miss_entries_ = 0;
     int64_t direct_entries_ = 0;          ///< this window's direct-read entries (not CPU jobs)
+    bool last_window_gpu_complete_ = false;  ///< set by prepare_window; survives wait_gpu()
 
     bool opened_ = false;
     bool prepared_ = false;

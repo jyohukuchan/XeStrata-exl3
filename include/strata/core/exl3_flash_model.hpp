@@ -91,6 +91,8 @@ struct Exl3FlashModelOptions {
                                            ///< counts and saves them as a profile for the next run
     bool expert_miss_direct = false;       ///< misses are read by the GPU from pinned host memory over
                                            ///< the bus instead of being computed on the CPU
+    bool expert_miss_dma = false;          ///< misses are DMA-copied from pinned host memory into a
+                                           ///< VRAM staging arena and computed by the GPU from VRAM
     std::string embedding_name;            ///< empty: ModelMap's HF embedding prefix
     std::string ple_sidecar;              ///< empty: discover the specialized EXL3 sidecar
 };
@@ -241,6 +243,7 @@ public:
         int64_t hit_entries = 0;
         int64_t cpu_miss_entries = 0;
         int64_t direct_miss_entries = 0;
+        int64_t dma_miss_entries = 0;
         int64_t resident_pairs = 0;
     };
     ExpertCacheStats expert_cache_stats() const;

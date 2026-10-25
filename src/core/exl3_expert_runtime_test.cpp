@@ -320,6 +320,34 @@ int main() {
             }
         }
 
+        // DMA miss mode: the GPU copies the non-resident expert from pinned host memory into VRAM
+        // and computes it there, so the merged rows match the CPU-miss run and no entry is left to
+        // the CPU pool.
+        {
+            strata::core::Exl3ExpertRuntime dma;
+            dma.set_miss_mode(strata::core::Exl3ExpertRuntime::MissMode::Dma);
+            std::vector<float> dma_cpu(expected.size(), 24680.5f), dma_gpu(expected.size(), 24680.5f);
+            float* d_dma_gpu = device.upload(dma_gpu);
+            sycl::event dma_done;
+            if (!dma.open(source, pool, max_tokens, k, {{0, 0}, {1, 0}}, err) ||
+                !dma.prepare_window(0, x.data(), ldx, ids, max_tokens, dma_cpu.data(), ldy, err) ||
+                !dma.enqueue_hit_only(queue, d_x, ldx, d_dma_gpu, ldy, dma_done, {}, err) ||
+                !dma.run_cpu(err) || !dma.wait_gpu(dma_done, err)) {
+                std::fprintf(stderr, "dma miss runtime failed: %s\n", err.c_str());
+                ++failures;
+            } else {
+                strata::parity::copy_out(dma_gpu.data(), d_dma_gpu, dma_gpu.size());
+                if (!compare_merged(dma_cpu, dma_gpu, expected, max_tokens * k, ldy, hidden,
+                                    "dma miss merge"))
+                    ++failures;
+                if (!dma.dma_ready() || dma.total_hit_entries() != 2 ||
+                    dma.total_cpu_miss_entries() != 0 || dma.total_dma_miss_entries() != 2) {
+                    std::fprintf(stderr, "dma miss counters are wrong\n");
+                    ++failures;
+                }
+            }
+        }
+
         // The all-resident graph reads device IDs on every replay, without a host plan update.
         strata::core::Exl3ExpertRuntime resident;
         if (!resident.open(source, pool, max_tokens, k, {{0, 0}, {0, 1}, {1, 0}, {1, 1}}, err) ||

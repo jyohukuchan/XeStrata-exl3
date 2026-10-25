@@ -283,9 +283,10 @@ DeviceCachePlan plan_device_cache(const Exl3ExpertSource& source, int64_t layer_
 bool open_device_cache(Exl3ExpertSource& source, strata::kernels::cpu::ExpertPool& pool, Exl3ExpertRuntime& runtime,
                        size_t stage_index, int64_t layer_begin, int64_t layer_end, int64_t n_expert,
                        int64_t n_layers, int64_t max_rows, int64_t routed_k, bool allow_cpu_miss,
-                       const std::string& profile_path, bool miss_direct, bool record_heat, std::string& err) {
-    runtime.set_miss_mode(miss_direct ? Exl3ExpertRuntime::MissMode::Direct
-                                      : Exl3ExpertRuntime::MissMode::Cpu);
+                       const std::string& profile_path, bool miss_direct, bool miss_dma, bool record_heat, std::string& err) {
+    runtime.set_miss_mode(miss_dma ? Exl3ExpertRuntime::MissMode::Dma
+                                   : miss_direct ? Exl3ExpertRuntime::MissMode::Direct
+                                                 : Exl3ExpertRuntime::MissMode::Cpu);
     runtime.set_record_heat(record_heat);
     const auto no_cache = [&](const char* why) {
         if (!allow_cpu_miss) {
@@ -1383,7 +1384,7 @@ bool Exl3FlashModel::open(const std::filesystem::path& directory, const Exl3Flas
                     if (!open_device_cache(*impl_->mtp_source, *impl_->mtp_pool, *impl_->mtp_runtime,
                                            impl_->stages.size(), 0, 1, impl_->geometry.n_expert,
                                            impl_->geometry.n_layers, options.max_rows, routed_k,
-                                           options.allow_cpu_expert_miss, "", false, false, err)) {
+                                           options.allow_cpu_expert_miss, "", false, false, false, err)) {
                         err = "EXL3 Flash MTP expert runtime: " + err;
                         return false;
                     }
@@ -1535,7 +1536,8 @@ bool Exl3FlashModel::open(const std::filesystem::path& directory, const Exl3Flas
                                    stage.layer_begin, stage.layer_end, impl_->geometry.n_expert,
                                    impl_->geometry.n_layers, std::max<int64_t>(options.max_rows, options.prompt_chunk), routed_k,
                                    options.allow_cpu_expert_miss, options.expert_profile,
-                                   options.expert_miss_direct, !options.expert_profile_save.empty(), err)) {
+                                   options.expert_miss_direct, options.expert_miss_dma,
+                                   !options.expert_profile_save.empty(), err)) {
                 return false;
             }
         }
@@ -2216,6 +2218,7 @@ bool Exl3FlashModel::forward(int32_t token, int64_t pos, int32_t& next_token, fl
                     return false;
                 }
                 timing.expert_prepare_ms += ms_since(mark);
+                const bool gpu_complete = stage.runtime->window_gpu_complete();
                 mark = std::chrono::steady_clock::now();
                 if (!wait_expert_window(stage_index, expert_done, err)) {
                     err = "EXL3 Flash: expert window layer " + std::to_string(layer) + ": " + err;
@@ -2223,6 +2226,18 @@ bool Exl3FlashModel::forward(int32_t token, int64_t pos, int32_t& next_token, fl
                 }
                 timing.expert_wait_ms += ms_since(mark);
                 mark = std::chrono::steady_clock::now();
+                if (gpu_complete) {
+                    // Every routed entry (hits + Direct/Dma misses) was computed into parts_device
+                    // by the grouped plan: no CPU rows to merge, so the download/add/upload round
+                    // trip is skipped and the post graph reads parts_device directly.
+                    if (!strata::gpu::graph_launch(stage.post_graphs[local], nullptr)) {
+                        err = "EXL3 Flash: post graph launch layer " + std::to_string(layer) + ": " +
+                              strata::gpu::last_error();
+                        return false;
+                    }
+                    timing.post_graph_ms += ms_since(mark);
+                    continue;
+                }
                 if (!strata::gpu::copy(stage.merge_output.data(), stage.parts_device,
                                        stage.merge_output.size() * sizeof(float))) {
                     err = std::string("EXL3 Flash: expert device-to-host merge copy failed: ") + strata::gpu::last_error();
@@ -2477,16 +2492,18 @@ bool Exl3FlashModel::forward_prefill(const int32_t* tokens, int64_t n, int64_t p
                                 return false;
                             }
                         }
-                        if (!strata::gpu::copy(stage.pf_merge.data(), stage.pf_parts,
-                                               (size_t) T * K * N * sizeof(float))) {
-                            err = "EXL3 Flash prefill: expert merge download failed";
-                            return false;
-                        }
-                        for (size_t i = 0; i < (size_t) T * K * N; ++i) stage.pf_merge[i] += stage.pf_miss[i];
-                        if (!strata::gpu::copy_async(stage.pf_parts, stage.pf_merge.data(),
-                                                     (size_t) T * K * N * sizeof(float), nullptr)) {
-                            err = "EXL3 Flash prefill: expert merge upload failed";
-                            return false;
+                        if (!stage.runtime->window_gpu_complete()) {
+                            if (!strata::gpu::copy(stage.pf_merge.data(), stage.pf_parts,
+                                                   (size_t) T * K * N * sizeof(float))) {
+                                err = "EXL3 Flash prefill: expert merge download failed";
+                                return false;
+                            }
+                            for (size_t i = 0; i < (size_t) T * K * N; ++i) stage.pf_merge[i] += stage.pf_miss[i];
+                            if (!strata::gpu::copy_async(stage.pf_parts, stage.pf_merge.data(),
+                                                         (size_t) T * K * N * sizeof(float), nullptr)) {
+                                err = "EXL3 Flash prefill: expert merge upload failed";
+                                return false;
+                            }
                         }
                     }
                     // Weights for the combine were downloaded for the host window;
@@ -2579,6 +2596,7 @@ Exl3FlashModel::ExpertCacheStats Exl3FlashModel::expert_cache_stats() const {
         stats.hit_entries += stage.runtime->total_hit_entries();
         stats.cpu_miss_entries += stage.runtime->total_cpu_miss_entries();
         stats.direct_miss_entries += stage.runtime->total_direct_miss_entries();
+        stats.dma_miss_entries += stage.runtime->total_dma_miss_entries();
         stats.resident_pairs += stage.runtime->cache().resident();
     }
     return stats;
