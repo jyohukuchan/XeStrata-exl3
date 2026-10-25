@@ -1746,6 +1746,10 @@ bool prefill_dense_run(Exl3Dense& owner, const float* x, int64_t ldx, float* y, 
     if (prefill_fp16_enabled() && rows > 1) {
         std::string ferr;
         if (owner.run_fp16_gemm(x, ldx, y, ldy, rows, stream, options, ferr)) {
+            static std::once_flag active_once;
+            std::call_once(active_once, [] {
+                std::fprintf(stderr, "strata: EXL3 prefill FP16 GEMM active\n");
+            });
             static const bool check = std::getenv("STRATA_EXL3_PREFILL_FP16_CHECK") != nullptr;
             if (check) {
                 // Diagnostic: run the packed product into scratch and compare (packed result wins).

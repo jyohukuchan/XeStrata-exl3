@@ -3,6 +3,7 @@
 // Explicit Qwen3.8 EXL3 Flash-model ownership and stage preparation.
 #include "strata/core/exl3_flash_model.hpp"
 
+#include "strata/core/exl3_dense.hpp"
 #include "strata/core/exl3_expert_runtime.hpp"
 #include "strata/core/exl3_expert_source.hpp"
 #include "strata/core/exl3_ple.hpp"
@@ -324,7 +325,13 @@ bool open_device_cache(Exl3ExpertSource& source, strata::kernels::cpu::ExpertPoo
             order = CacheOrder::Spread;
         }
     }
-    const uint64_t reserve = device_cache_reserve(static_cast<uint64_t>(total_b));
+    // With the FP16 prefill product opted in, its weight cache is a second resident set the
+    // expert cache would otherwise starve (the standard env's reserve above is under 1 GiB):
+    // leave the FP16 budget beside the usual reserve, so the two split the card instead of
+    // the experts taking all of it and every FP16 dequant failing on first use.
+    uint64_t reserve = device_cache_reserve(static_cast<uint64_t>(total_b));
+    if (const char* fp16 = std::getenv("STRATA_EXL3_PREFILL_FP16"); fp16 != nullptr && fp16[0] != '0')
+        reserve += prefill_fp16_cache_budget_bytes(static_cast<uint64_t>(total_b));
     uint64_t room = free_b > reserve ? static_cast<uint64_t>(free_b) - reserve : 0;
     const int64_t asked_mib = device_cache_budget_mib();
     if (asked_mib >= 0 && (static_cast<uint64_t>(asked_mib) << 20) < room)

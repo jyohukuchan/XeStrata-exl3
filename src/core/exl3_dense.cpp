@@ -15,6 +15,9 @@
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/raw_linear.hpp"
 
+#include <algorithm>
+#include <atomic>
+#include <cstdlib>
 #include <limits>
 #include <cstdio>
 #include <cstring>
@@ -116,7 +119,43 @@ bool plain_f16_weights(void* weights, size_t bytes) {
     return strata::kernels::raw::plain_f16_halves(strata::core::Runtime::get().compute(), weights, bytes);
 }
 
+/// The bytes every live FP16 weight cache holds, against prefill_fp16_cache_budget_bytes().
+std::atomic<uint64_t>& fp16_cache_used() {
+    static std::atomic<uint64_t> used{0};
+    return used;
+}
+
+bool fp16_cache_charge(size_t bytes, uint64_t budget) {
+    if (bytes == 0) return true;
+    if (static_cast<uint64_t>(bytes) > budget) return false;
+    uint64_t used = fp16_cache_used().load(std::memory_order_relaxed);
+    for (;;) {
+        if (used > budget - static_cast<uint64_t>(bytes)) return false;
+        if (fp16_cache_used().compare_exchange_weak(used, used + static_cast<uint64_t>(bytes),
+                                                    std::memory_order_relaxed))
+            return true;
+    }
+}
+
+void fp16_cache_release(size_t bytes) {
+    if (bytes != 0) fp16_cache_used().fetch_sub(static_cast<uint64_t>(bytes), std::memory_order_relaxed);
+}
+
 }  // namespace
+
+uint64_t prefill_fp16_cache_budget_bytes(uint64_t total_bytes) {
+    static const int64_t asked_mib = [] {
+        const char* text = std::getenv("STRATA_EXL3_PREFILL_FP16_CACHE_MIB");
+        if (text == nullptr || text[0] == '\0') return int64_t{-1};
+        char* end = nullptr;
+        const long long value = std::strtoll(text, &end, 10);
+        if (end == text || (end != nullptr && *end != '\0') || value < 0) return int64_t{-1};
+        return static_cast<int64_t>(value);
+    }();
+    if (asked_mib >= 0) return static_cast<uint64_t>(asked_mib) << 20;
+    if (total_bytes == 0) return 0;
+    return std::clamp<uint64_t>(total_bytes / 8, 256ull << 20, 8ull << 30);
+}
 
 Exl3Dense::Exl3Dense() = default;
 
@@ -132,14 +171,23 @@ void Exl3Dense::reset() {
     free_device(bias_);
     free_device(raw_weights_);
     free_device(raw_bias_);
-    free_device(fp16_w_);
+    if (fp16_w_borrowed_) {
+        fp16_w_ = nullptr;  // aliases raw_weights_, freed above
+    } else {
+        free_device(fp16_w_);
+    }
+    fp16_cache_release(fp16_w_bytes_);
+    fp16_w_bytes_ = 0;
+    fp16_w_borrowed_ = false;
     free_device(fp16_x_);
+    fp16_x_elems_ = 0;
     {
         void* p = fp16_xh_;
         free_device(p);
         fp16_xh_ = nullptr;
     }
-    fp16_failed_ = false;
+    fp16_xh_elems_ = 0;
+    fp16_backoff_ = 0;
     for (StreamScratch& stream : streams_) free_device(stream.data);
     streams_.clear();
     view_ = {};
@@ -533,29 +581,47 @@ bool Exl3Dense::run(const float* x, int64_t ldx, float* y, int64_t ldy, int64_t 
 
 bool Exl3Dense::run_fp16_gemm(const float* x, int64_t ldx, float* y, int64_t ldy, int64_t rows, void* stream,
                               const strata::kernels::exl3::GemvOptions& options, std::string& err) {
-    if (raw_ || view_.trellis == nullptr) {
-        err = "exl3 dense fp16: a packed owner is required";
+    const bool is_raw = raw_;
+    if (is_raw ? raw_view_.data == nullptr : view_.trellis == nullptr) {
+        err = "exl3 dense fp16: the owner is not loaded";
         return false;
     }
-    if (fp16_failed_) {
-        err = "exl3 dense fp16: the one-time dequant already failed for this owner";
-        return false;
-    }
-    const int64_t k = view_.k, n = view_.n;
+    const int64_t k = is_raw ? raw_view_.k : view_.k;
+    const int64_t n = is_raw ? raw_view_.n : view_.n;
     if (x == nullptr || y == nullptr || rows <= 0 || rows > max_rows_ || ldx != k || ldy != n) {
         err = "exl3 dense fp16: tight strides and rows <= max_rows are required";
         return false;
     }
-    const bool use_input = options.input_hadamard && view_.suh != nullptr;
-    const bool use_output = options.output_hadamard && view_.svh != nullptr;
+    // A raw owner has no basis stages: `run` ignores `options` for it, and so does this path.
+    // Its bias is the FP32 one `linear_fp32` adds after the product.
+    const bool use_input = !is_raw && options.input_hadamard && view_.suh != nullptr;
+    const bool use_output = !is_raw && options.output_hadamard && view_.svh != nullptr;
     if ((use_input && k % 128 != 0) || (use_output && n % 128 != 0)) {
         err = "exl3 dense fp16: transform widths must be multiples of 128";
         return false;
     }
-    if (view_.bias != nullptr && options.add_bias && !use_output) {
+    if (!is_raw && view_.bias != nullptr && options.add_bias && !use_output) {
         err = "exl3 dense fp16: the bias needs the output transform stage";
         return false;
     }
+    if (fp16_backoff_ > 0) {
+        --fp16_backoff_;
+        err = "exl3 dense fp16: cache allocation failed recently; retry deferred";
+        return false;
+    }
+    // Any cache-build failure frees what it took, charges nothing it did not keep, and backs
+    // off for a bounded number of calls instead of latching for the owner's lifetime: room
+    // freed later in the process lets a later chunk take the FP16 path after all.
+    const auto fail_build = [this](const char* why) {
+        if (fp16_w_ != nullptr && !fp16_w_borrowed_) strata::gpu::free(fp16_w_);
+        fp16_w_ = nullptr;
+        fp16_w_borrowed_ = false;
+        fp16_cache_release(fp16_w_bytes_);
+        fp16_w_bytes_ = 0;
+        fp16_backoff_ = 32;
+        (void) why;
+        return false;
+    };
     try {
         Runtime* stream_runtime = stream == nullptr ? &Runtime::get() : Runtime::owner_of_stream(stream);
         if (stream_runtime == nullptr || stream_runtime != runtime_) {
@@ -564,28 +630,141 @@ bool Exl3Dense::run_fp16_gemm(const float* x, int64_t ldx, float* y, int64_t ldy
         }
         sycl::queue& queue = stream_runtime->stream(stream);
         if (fp16_w_ == nullptr) {
-            // One-time dequant: reconstruct the transformed-basis weights to FP16 [k, n], then
-            // transpose to the GEMM path's W[N, K].  Waited on once; later chunks reuse the cache.
-            const size_t elems = (size_t) k * (size_t) n;
-            void* recon = strata::gpu::alloc_device(elems * sizeof(uint16_t));
-            fp16_w_ = strata::gpu::alloc_device(elems * sizeof(uint16_t));
-            fp16_x_ = strata::gpu::alloc_device((size_t) max_rows_ * (size_t) k * sizeof(uint16_t));
-            fp16_xh_ = static_cast<float*>(
-                strata::gpu::alloc_device((size_t) max_rows_ * (size_t) (k + n) * sizeof(float)));
-            if (recon == nullptr || fp16_w_ == nullptr || fp16_x_ == nullptr || fp16_xh_ == nullptr) {
-                strata::gpu::free(recon);
-                err = "exl3 dense fp16: cache allocation failed";
-                fp16_failed_ = true;
+            const size_t elems = static_cast<size_t>(k) * static_cast<size_t>(n);
+            const size_t bytes = elems * sizeof(uint16_t);
+            if (is_raw && raw_view_.dtype == strata::kernels::raw::DType::F16) {
+                // The raw F16 weights already are W[N, K]: use them in place.  No allocation,
+                // no budget charge, so a raw owner takes the FP16 path however full the
+                // device is - this is the owner the standard env's raw projections produce.
+                fp16_w_ = raw_weights_;
+                fp16_w_borrowed_ = true;
+            } else {
+                const uint64_t total = queue.get_device().get_info<sycl::info::device::global_mem_size>();
+                if (!fp16_cache_charge(bytes, prefill_fp16_cache_budget_bytes(total))) {
+                    fp16_backoff_ = 32;
+                    err = "exl3 dense fp16: the shared cache budget is exhausted; packed products";
+                    return false;
+                }
+                fp16_w_bytes_ = bytes;
+                fp16_w_ = strata::gpu::alloc_device(bytes);
+                if (fp16_w_ == nullptr) {
+                    err = std::string("exl3 dense fp16: cache allocation failed: ") + strata::gpu::last_error();
+                    return fail_build("alloc");
+                }
+                uint16_t* w16 = static_cast<uint16_t*>(fp16_w_);
+                if (is_raw) {
+                    // Convert the raw weights once, in row chunks of the output width, so the
+                    // transient is one chunk and not a second full matrix.
+                    const size_t chunk_elems = size_t{1} << 20;
+                    const strata::kernels::raw::DType dtype = raw_view_.dtype;
+                    const uint16_t* src16 = static_cast<const uint16_t*>(raw_view_.data);
+                    const float* src32 = static_cast<const float*>(raw_view_.data);
+                    for (size_t off = 0; off < elems; off += chunk_elems) {
+                        const size_t count = std::min(chunk_elems, elems - off);
+                        const uint16_t* s16 = src16 + off;
+                        const float* s32 = src32 + off;
+                        uint16_t* dst = w16 + off;
+                        queue.parallel_for(sycl::range<1>(count), [=](sycl::id<1> id) {
+                            dst[id] = dtype == strata::kernels::raw::DType::BF16
+                                          ? strata::kernels::f16_from_f32(strata::kernels::f32_from_bf16(s16[id]))
+                                          : strata::kernels::f16_from_f32(s32[id]);
+                        });
+                    }
+                } else if (view_.tile_order == strata::kernels::exl3::TileOrder::canonical) {
+                    // Dequantize in K chunks: reconstruct one [chunk_k, n] slice and transpose
+                    // it into its column slice of W[N, K].  The transient is the slice, not a
+                    // second full [k, n] matrix beside the cache.
+                    int64_t chunk_k = std::max<int64_t>(16, (int64_t{1} << 20) / std::max<int64_t>(n, 1));
+                    chunk_k = std::min<int64_t>(k, (chunk_k / 16) * 16);
+                    void* recon = strata::gpu::alloc_device(static_cast<size_t>(chunk_k) * static_cast<size_t>(n) *
+                                                            sizeof(uint16_t));
+                    void* trans = strata::gpu::alloc_device(static_cast<size_t>(chunk_k) * static_cast<size_t>(n) *
+                                                            sizeof(uint16_t));
+                    if (recon == nullptr || trans == nullptr) {
+                        strata::gpu::free(recon);
+                        strata::gpu::free(trans);
+                        err = std::string("exl3 dense fp16: chunk allocation failed: ") + strata::gpu::last_error();
+                        return fail_build("chunk");
+                    }
+                    const int64_t tiles_n = n / 16;
+                    const size_t tile_elems = static_cast<size_t>(16 * view_.bits);
+                    for (int64_t k_off = 0; k_off < k; k_off += chunk_k) {
+                        const int64_t rows_k = std::min(chunk_k, k - k_off);
+                        strata::kernels::exl3::MatrixView slice = view_;
+                        slice.k = rows_k;
+                        slice.trellis = view_.trellis +
+                                        static_cast<size_t>(k_off / 16) * static_cast<size_t>(tiles_n) * tile_elems;
+                        slice.suh = nullptr;  // codespell:ignore suh
+                        slice.svh = nullptr;
+                        slice.bias = nullptr;
+                        const sycl::event built = strata::kernels::exl3::exl3_transpose_f16(
+                            queue, static_cast<const uint16_t*>(recon), static_cast<uint16_t*>(trans), rows_k, n,
+                            {strata::kernels::exl3::exl3_reconstruct(queue, slice, static_cast<uint16_t*>(recon))});
+                        (void) built;
+                        uint16_t* dst = w16 + static_cast<size_t>(k_off);
+                        const uint16_t* src = static_cast<const uint16_t*>(trans);
+                        const int64_t stride_k = k;
+                        queue.submit([&](sycl::handler& h) {
+                            h.depends_on(built);
+                            h.parallel_for(sycl::range<1>(static_cast<size_t>(rows_k) * static_cast<size_t>(n)),
+                                           [=](sycl::id<1> id) {
+                                               const size_t flat = static_cast<size_t>(id[0]);
+                                               const size_t col = flat / static_cast<size_t>(rows_k);
+                                               const size_t row = flat % static_cast<size_t>(rows_k);
+                                               dst[col * static_cast<size_t>(stride_k) + row] =
+                                                   src[col * static_cast<size_t>(rows_k) + row];
+                                           });
+                        });
+                    }
+                    queue.wait();
+                    strata::gpu::free(recon);
+                    strata::gpu::free(trans);
+                } else {
+                    // A CPU tile order the reconstruct kernel cannot read slice-wise: keep the
+                    // whole-matrix build (transient [k, n] beside the cache), still under the
+                    // same budget and failure rules.
+                    void* recon = strata::gpu::alloc_device(bytes);
+                    if (recon == nullptr) {
+                        err = std::string("exl3 dense fp16: dequant allocation failed: ") + strata::gpu::last_error();
+                        return fail_build("recon");
+                    }
+                    const sycl::event built = strata::kernels::exl3::exl3_transpose_f16(
+                        queue, static_cast<const uint16_t*>(recon), w16, k, n,
+                        {strata::kernels::exl3::exl3_reconstruct(queue, view_, static_cast<uint16_t*>(recon))});
+                    (void) built;
+                    queue.wait();
+                    strata::gpu::free(recon);
+                }
+            }
+        }
+        // Activation/product scratch sized for this call's rows, grown only when a later call
+        // is wider - not max_rows_ up front for every owner.
+        const size_t need_x = static_cast<size_t>(rows) * static_cast<size_t>(k);
+        const size_t need_xh = static_cast<size_t>(rows) * static_cast<size_t>(k + n);
+        if (fp16_x_elems_ < need_x) {
+            void* next = strata::gpu::alloc_device(need_x * sizeof(uint16_t));
+            if (next == nullptr) {
+                fp16_backoff_ = 32;
+                err = std::string("exl3 dense fp16: activation allocation failed: ") + strata::gpu::last_error();
                 return false;
             }
-            const sycl::event built = strata::kernels::exl3::exl3_transpose_f16(
-                queue, static_cast<const uint16_t*>(recon), static_cast<uint16_t*>(fp16_w_), k, n,
-                {strata::kernels::exl3::exl3_reconstruct(queue, view_, static_cast<uint16_t*>(recon))});
-            (void) built;
-            queue.wait();
-            strata::gpu::free(recon);
+            free_device(fp16_x_);
+            fp16_x_ = next;
+            fp16_x_elems_ = need_x;
         }
-        float* z = fp16_xh_ + (size_t) max_rows_ * (size_t) k;
+        if (fp16_xh_elems_ < need_xh) {
+            void* next = strata::gpu::alloc_device(need_xh * sizeof(float));
+            if (next == nullptr) {
+                fp16_backoff_ = 32;
+                err = std::string("exl3 dense fp16: product allocation failed: ") + strata::gpu::last_error();
+                return false;
+            }
+            void* old = fp16_xh_;
+            fp16_xh_ = static_cast<float*>(next);
+            if (old != nullptr) strata::gpu::free(old);
+            fp16_xh_elems_ = need_xh;
+        }
+        float* z = fp16_xh_ + static_cast<size_t>(rows) * static_cast<size_t>(k);
         const float* src = x;
         if (use_input) {
             strata::kernels::exl3::exl3_input_hadamard_rows(queue, view_, x, ldx, fp16_xh_, rows);
@@ -597,20 +776,34 @@ bool Exl3Dense::run_fp16_gemm(const float* x, int64_t ldx, float* y, int64_t ldy
         {
             const float* x32 = src;
             uint16_t* x16 = static_cast<uint16_t*>(fp16_x_);
-            const size_t count = (size_t) rows * (size_t) k;
+            const size_t count = static_cast<size_t>(rows) * static_cast<size_t>(k);
             queue.parallel_for(sycl::range<1>(count), [=](sycl::id<1> id) {
                 x16[id] = strata::kernels::f16_from_f32(x32[id]);
             });
         }
         const uint16_t* x16 = static_cast<const uint16_t*>(fp16_x_);
         const uint16_t* w16 = static_cast<const uint16_t*>(fp16_w_);
-        if (strata::kernels::xmx_gemm_ok(x16, w16, z, n, k, n))
-            strata::kernels::xmx_gemm(strata::kernels::XmxType::f16, x16, w16, z, rows, n, k, n, stream);
+        float* out = use_output ? z : y;
+        if (is_raw && raw_view_.bias == nullptr) out = y;
+        if (strata::kernels::xmx_gemm_ok(x16, w16, out, n, k, n))
+            strata::kernels::xmx_gemm(strata::kernels::XmxType::f16, x16, w16, out, rows, n, k, n, stream);
         else
-            strata::kernels::gemm_rows(strata::kernels::XmxType::f16, x16, w16, z, rows, n, k, n, stream);
+            strata::kernels::gemm_rows(strata::kernels::XmxType::f16, x16, w16, out, rows, n, k, n, stream);
         if (use_output) {
             strata::kernels::exl3::exl3_output_hadamard_rows(queue, view_, z, y, ldy, rows, options.add_bias);
-        } else if (!strata::gpu::copy_async(y, z, (size_t) rows * (size_t) n * sizeof(float), stream)) {
+        } else if (is_raw && raw_view_.bias != nullptr) {
+            // Add the raw FP32 bias the packed output stage would have added.
+            float* dst = y;
+            const float* bias = raw_view_.bias;
+            if (out != y && !strata::gpu::copy_async(y, out, static_cast<size_t>(rows) * static_cast<size_t>(n) * sizeof(float), stream)) {
+                err = "exl3 dense fp16: output copy failed";
+                return false;
+            }
+            queue.parallel_for(sycl::range<1>(static_cast<size_t>(rows) * static_cast<size_t>(n)),
+                               [=](sycl::id<1> id) {
+                                   dst[id] += bias[id % static_cast<size_t>(n)];
+                               });
+        } else if (out != y && !strata::gpu::copy_async(y, out, static_cast<size_t>(rows) * static_cast<size_t>(n) * sizeof(float), stream)) {
             err = "exl3 dense fp16: output copy failed";
             return false;
         }
@@ -620,5 +813,4 @@ bool Exl3Dense::run_fp16_gemm(const float* x, int64_t ldx, float* y, int64_t ldy
         return false;
     }
 }
-
 }  // namespace strata::core

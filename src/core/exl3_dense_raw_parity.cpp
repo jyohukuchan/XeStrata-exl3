@@ -391,6 +391,39 @@ int run_case(const std::filesystem::path& root, const RawCase& raw_case) {
         if (mapped_ok) for (size_t at = 0; at < actual.size(); ++at)
             mapped_ok = mapped_ok && close(actual[at], at < selected.size() ? mapped_expected[at] : initial[at]);
         if (graph != nullptr) strata::gpu::graph_destroy(graph);
+        // The FP16 prefill product of the same raw owner: tight strides, the axis-mapped
+        // weights and bias, within FP16 rounding of the FP32 product above.
+        bool fp16_ok = mapped_ok;
+        if (fp16_ok) {
+            const int64_t tight_n = static_cast<int64_t>(selected.size());
+            std::vector<float> tight_in(static_cast<size_t>(rows) * static_cast<size_t>(k));
+            for (int64_t row = 0; row < rows; ++row)
+                for (int64_t col = 0; col < k; ++col)
+                    tight_in[static_cast<size_t>(row * k + col)] = input[static_cast<size_t>(row * ldx + col)];
+            float* d_tight_in = static_cast<float*>(strata::gpu::alloc_device(tight_in.size() * sizeof(float)));
+            float* d_tight_out = static_cast<float*>(
+                strata::gpu::alloc_device(static_cast<size_t>(rows * tight_n) * sizeof(float)));
+            std::vector<float> tight_out(static_cast<size_t>(rows * tight_n), 0.0f);
+            fp16_ok = d_tight_in != nullptr && d_tight_out != nullptr &&
+                      strata::gpu::copy(d_tight_in, tight_in.data(), tight_in.size() * sizeof(float)) &&
+                      detached.run_fp16_gemm(d_tight_in, k, d_tight_out, tight_n, rows, stream,
+                                             strata::kernels::exl3::GemvOptions{}, err) &&
+                      strata::gpu::stream_sync(stream) &&
+                      strata::gpu::copy(tight_out.data(), d_tight_out, tight_out.size() * sizeof(float));
+            if (fp16_ok)
+                for (int64_t row = 0; row < rows && fp16_ok; ++row)
+                    for (int64_t out = 0; out < tight_n; ++out) {
+                        const float want = mapped_expected[static_cast<size_t>(row * ldy + out)];
+                        const float got = tight_out[static_cast<size_t>(row * tight_n + out)];
+                        fp16_ok = std::isfinite(got) &&
+                                  std::fabs(got - want) <= 5e-3f * std::max(1.0f, std::fabs(want));
+                    }
+            std::cout << "raw " << raw_case.weight_dtype << " detached FP16 prefill product: "
+                      << (fp16_ok ? "OK" : err) << '\n';
+            strata::gpu::free(d_tight_in);
+            strata::gpu::free(d_tight_out);
+        }
+        ok = ok && fp16_ok;
         std::cout << "raw " << raw_case.weight_dtype << " detached axis map / three outputs / graph: "
                   << (mapped_ok ? "OK" : err) << '\n';
         ok = ok && mapped_ok;
