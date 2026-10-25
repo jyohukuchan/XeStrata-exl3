@@ -440,6 +440,13 @@ bool device_route_plan_enabled() {
     return !(text != nullptr && text[0] == '0' && text[1] == '\0');
 }
 
+/// STRATA_EXL3_TOKEN_GRAPH: 0 keeps the per-layer graph launches even where a stage's whole token
+/// was captured as one graph - the same values, kept as the comparison path for the graph's effect.
+bool token_graph_enabled() {
+    const char* text = std::getenv("STRATA_EXL3_TOKEN_GRAPH");
+    return !(text != nullptr && text[0] == '0' && text[1] == '\0');
+}
+
 /// STRATA_EXL3_RESIDENT_GRAPH: 0 submits the resident expert flow's launches one by one instead of
 /// replaying the captured graph - the same values, kept as the comparison path for the graph's effect.
 bool resident_flow_graph_enabled() {
@@ -684,6 +691,10 @@ struct Exl3FlashModel::Impl {
         // The resident expert flow's own graphs (one per layer): the clear of the expert rows, the device
         // route plan and the grouped experts' kernels, captured where the cache is fully resident.
         std::vector<strata::gpu::Graph*> expert_graphs;
+        // One graph for the stage's whole token (every layer's pre, resident expert flow and post in
+        // sequence), captured where the cache is fully resident: one launch per token per stage
+        // instead of three per layer.  Null where the stage is not fully resident.
+        strata::gpu::Graph* token_graph = nullptr;
     };
 
     Exl3FlashModelOptions options;
@@ -696,8 +707,9 @@ struct Exl3FlashModel::Impl {
     // THE MTP DRAFT BLOCK'S OWNERS.  Bound on the last stage's device when
     // include_mtp is set: dense weights over the one-layer MTP map, the MTP
     // expert names/source/pool, and one layer of session state (QSA every
-    // layer).  The expert runtime stays unopened until the draft/verify loop
-    // lands, so the draft block holds no device cache yet.
+    // layer).  The draft runtime gets a device cache of its own at open();
+    // when every draft expert is resident the draft runs from its captured
+    // expert graph, otherwise it falls back to the CPU pool.
     std::unique_ptr<WeightTable> mtp_table;
     std::unique_ptr<Exl3WeightSet> mtp_weights;
     std::vector<ExpertTensorNames> mtp_expert_names;
@@ -705,6 +717,9 @@ struct Exl3FlashModel::Impl {
     std::unique_ptr<strata::kernels::cpu::ExpertPool> mtp_pool;
     ModelGeometry mtp_geometry;
     std::unique_ptr<Exl3ExpertRuntime> mtp_runtime;
+    strata::gpu::Graph* mtp_expert_graph = nullptr;  ///< captured resident expert flow of the draft block
+    strata::gpu::Graph* mtp_body_graph = nullptr;    ///< the whole draft body (norms, projections, block, head) in one graph
+    bool mtp_device_draft = false;                   ///< draft experts run on the device cache, not the CPU pool
     strata::gpu::Stream mtp_stream = nullptr;
     void* mtp_parts_device = nullptr;
     void* mtp_fc_scratch = nullptr;
@@ -1260,9 +1275,27 @@ bool Exl3FlashModel::open(const std::filesystem::path& directory, const Exl3Flas
                 return false;
             }
             impl_->mtp_runtime = std::make_unique<Exl3ExpertRuntime>();
-            if (!impl_->mtp_runtime->open(*impl_->mtp_source, *impl_->mtp_pool, 1, routed_k, {}, err, 0, 1)) {
-                err = "EXL3 Flash MTP expert runtime: " + err;
-                return false;
+            // The draft block's experts get a device cache of their own, planned from what the
+            // device reports like a stage's (open_device_cache): one MTP layer is small, so on a
+            // card with room every draft expert is resident and the draft runs on the GPU.
+            // STRATA_EXL3_MTP_DEVICE_DRAFT=0 keeps the CPU-pool draft for comparison.
+            {
+                const char* toggle = std::getenv("STRATA_EXL3_MTP_DEVICE_DRAFT");
+                const bool want_device = !(toggle != nullptr && toggle[0] == '0' && toggle[1] == '\0');
+                if (want_device) {
+                    if (!open_device_cache(*impl_->mtp_source, *impl_->mtp_pool, *impl_->mtp_runtime,
+                                           impl_->stages.size(), 0, 1, impl_->geometry.n_expert,
+                                           impl_->geometry.n_layers, options.max_rows, routed_k,
+                                           options.allow_cpu_expert_miss, err)) {
+                        err = "EXL3 Flash MTP expert runtime: " + err;
+                        return false;
+                    }
+                    impl_->mtp_device_draft = impl_->mtp_runtime->fully_resident();
+                } else if (!impl_->mtp_runtime->open(*impl_->mtp_source, *impl_->mtp_pool, 1, routed_k,
+                                                     {}, err, 0, 1)) {
+                    err = "EXL3 Flash MTP expert runtime: " + err;
+                    return false;
+                }
             }
             const size_t mtp_fc_floats = static_cast<size_t>(3 * impl_->geometry.n_embd +
                                                             2 * impl_->geometry.hc * impl_->geometry.n_embd);
@@ -1273,6 +1306,121 @@ bool Exl3FlashModel::open(const std::filesystem::path& directory, const Exl3Flas
             if (impl_->mtp_fc_scratch == nullptr || impl_->mtp_parts_device == nullptr) {
                 err = "EXL3 Flash MTP draft scratch allocation failed";
                 return false;
+            }
+            if (impl_->mtp_device_draft) {
+                // Capture the resident expert flow (the clear of the expert rows, the device
+                // route plan and the grouped experts) like a stage's resident flow: the pointers
+                // are fixed, so one graph replays it for every draft on the draft stream.
+                strata::gpu::Stream capture_stream = strata::gpu::stream_create();
+                if (capture_stream == nullptr) {
+                    err = "EXL3 Flash: MTP expert graph capture stream creation failed";
+                    return false;
+                }
+                sycl::queue& queue = Runtime::at(impl_->mtp_device).stream(capture_stream);
+                const size_t parts_floats = static_cast<size_t>(routed_k) *
+                                            static_cast<size_t>(impl_->geometry.n_embd);
+                if (!strata::gpu::begin_capture(capture_stream) ||
+                    !strata::gpu::memset_async(impl_->mtp_parts_device, 0, parts_floats * sizeof(float),
+                                               capture_stream) ||
+                    !impl_->mtp_runtime->record_device_hit_enqueue(
+                        queue, 0, static_cast<const float*>(impl_->mtp_session.block.mixed),
+                        static_cast<const int32_t*>(impl_->mtp_session.moe.ids), 1,
+                        static_cast<float*>(impl_->mtp_parts_device), impl_->geometry.n_embd, err)) {
+                    strata::gpu::abandon_capture(capture_stream);
+                    strata::gpu::stream_destroy(capture_stream);
+                    err = "EXL3 Flash: MTP expert graph capture: " + err;
+                    return false;
+                }
+                if (!strata::gpu::end_capture(capture_stream, &impl_->mtp_expert_graph)) {
+                    strata::gpu::stream_destroy(capture_stream);
+                    err = std::string("EXL3 Flash: end MTP expert graph capture: ") +
+                          strata::gpu::last_error();
+                    return false;
+                }
+                strata::gpu::stream_destroy(capture_stream);
+                std::fprintf(stderr, "strata exl3-flash: MTP draft experts resident on the device "
+                                     "(captured expert graph; no CPU pool in the draft loop)\n");
+                // Capture the whole draft body after the embedding gather (the one step whose
+                // token argument changes per draft) as a single graph: the two norms, the fc
+                // projections, the block pre, the resident expert flow, the block post and the
+                // head.  Every pointer is a buffer bound at open and never moved, and the graph
+                // re-reads their contents at replay, so one capture serves every draft.  A
+                // capture failure keeps the uncaptured device path below, not a failed open.
+                {
+                    const int64_t N = impl_->geometry.n_embd;
+                    const int64_t HC = impl_->geometry.hc;
+                    float* scratch = static_cast<float*>(impl_->mtp_fc_scratch);
+                    float* emb = scratch;
+                    float* en = emb + N;
+                    float* hn = en + N;
+                    float* e2 = hn + HC * N;
+                    float* h2 = e2 + N;
+                    const WeightRef* enorm = impl_->mtp_table->find("mtp.pre_fc_norm_embedding.weight");
+                    const WeightRef* hnorm = impl_->mtp_table->find("mtp.pre_fc_norm_hidden.weight");
+                    const WeightRef* fc_e = impl_->mtp_table->find("mtp.fc_embedding.weight");
+                    const WeightRef* fc_h = impl_->mtp_table->find("mtp.fc_hidden.weight");
+                    auto& last_stage = impl_->stages.back();
+                    strata::gpu::Stream body_stream = strata::gpu::stream_create();
+                    // Owners with stream-local state are prepared on the capture stream first,
+                    // as the trunk's graph capture does: a first use inside the capture would
+                    // allocate, which a capture forbids.
+                    bool body_ok = body_stream != nullptr &&
+                                   impl_->mtp_weights->prepare_stream(body_stream, err) &&
+                                   last_stage.weights->prepare_stream(body_stream, err);
+                    body_ok = body_ok && enorm != nullptr && hnorm != nullptr &&
+                                   fc_e != nullptr && fc_h != nullptr && fc_e->exl3 != nullptr &&
+                                   fc_h->exl3 != nullptr && strata::gpu::begin_capture(body_stream);
+                    if (body_ok) {
+                        const float eps = static_cast<float>(impl_->spec.rms_eps);
+                        sycl::queue& queue = Runtime::at(impl_->mtp_device).stream(body_stream);
+                        strata::kernels::native_qsa_rms_norm_weighted(
+                            emb, static_cast<const float*>(enorm->data), en, static_cast<int>(N), 1, eps,
+                            body_stream);
+                        strata::kernels::native_qsa_rms_norm_weighted(
+                            last_stage.session.block.R, static_cast<const float*>(hnorm->data), hn,
+                            static_cast<int>(HC * N), 1, eps, body_stream);
+                        body_ok = fc_e->exl3->run(en, N, e2, N, 1, body_stream, err);
+                        for (int64_t s = 0; body_ok && s < HC; ++s)
+                            body_ok = fc_h->exl3->run(hn + s * N, N, h2 + s * N, N, 1, body_stream, err);
+                        if (body_ok) {
+                            strata::kernels::add_streams_broadcast(h2, e2, impl_->mtp_session.block.R, N,
+                                                                   static_cast<int>(HC), 1, body_stream);
+                            QsaState& mq = impl_->mtp_session.qsa_states[impl_->mtp_session.qsa_ord0];
+                            body_ok = block_layer_pre(*impl_->mtp_table, impl_->mtp_geometry, 0, 0, 0,
+                                                      impl_->mtp_session.gdn, mq, impl_->mtp_session.qsa_bufs,
+                                                      impl_->mtp_session.moe, routed_k,
+                                                      impl_->mtp_session.block, body_stream, err);
+                        }
+                        if (body_ok)
+                            body_ok = strata::gpu::memset_async(impl_->mtp_parts_device, 0,
+                                                                parts_floats * sizeof(float), body_stream) &&
+                                      impl_->mtp_runtime->record_device_hit_enqueue(
+                                          queue, 0, static_cast<const float*>(impl_->mtp_session.block.mixed),
+                                          static_cast<const int32_t*>(impl_->mtp_session.moe.ids), 1,
+                                          static_cast<float*>(impl_->mtp_parts_device), N, err);
+                        if (body_ok)
+                            body_ok = block_layer_post(*impl_->mtp_table, impl_->mtp_geometry, 0, routed_k,
+                                                       impl_->mtp_session.moe, impl_->mtp_session.block,
+                                                       static_cast<const float*>(impl_->mtp_parts_device),
+                                                       body_stream, err);
+                        if (body_ok) {
+                            const BlockBuffers head_bb = impl_->mtp_session.block;
+                            body_ok = lm_head(last_stage.table, impl_->geometry, head_bb,
+                                              static_cast<float*>(impl_->logits_device), body_stream, err);
+                        }
+                    }
+                    if (body_ok && strata::gpu::end_capture(body_stream, &impl_->mtp_body_graph)) {
+                        std::fprintf(stderr, "strata exl3-flash: MTP draft body captured as one graph\n");
+                    } else {
+                        if (body_stream != nullptr) strata::gpu::abandon_capture(body_stream);
+                        impl_->mtp_body_graph = nullptr;
+                        std::fprintf(stderr, "strata exl3-flash: MTP draft body capture unavailable (%s); "
+                                             "the draft runs uncaptured on the device path\n",
+                                     err.empty() ? strata::gpu::last_error() : err.c_str());
+                        err.clear();
+                    }
+                    if (body_stream != nullptr) strata::gpu::stream_destroy(body_stream);
+                }
             }
             impl_->mtp_host_ids.assign(static_cast<size_t>(routed_k), 0);
             impl_->mtp_host_weights.assign(static_cast<size_t>(routed_k), 0.0f);
@@ -1345,6 +1493,69 @@ bool Exl3FlashModel::open(const std::filesystem::path& directory, const Exl3Flas
             }
         }
 
+        // ---- ONE GRAPH FOR THE WHOLE TOKEN, WHERE THE CACHE IS FULLY RESIDENT ----
+        //
+        // The per-layer path above launches three graphs per layer (pre, expert flow, post); the
+        // launches themselves cost a graph replay's boundary each.  Where every expert of a stage
+        // is resident the token never needs the host between layers, so the same submissions are
+        // captured again as one graph per stage and forward() replays that instead.  The capture
+        // replays the per-layer bodies in order on one stream: every pointer is a session buffer
+        // bound before this point, the position staging is re-read from its pinned buffers at
+        // replay (stage_token runs per token, before the launch), and the PLE rows are uploaded
+        // before the launch and read where the PLE layer sits inside the graph.
+        if (token_graph_enabled()) {
+            for (size_t stage_index = 0; stage_index < impl_->stages.size(); ++stage_index) {
+                auto& stage = impl_->stages[stage_index];
+                const OnDevice on(stage.device);
+                if (!stage.runtime->fully_resident()) continue;
+                strata::gpu::Stream capture_stream = strata::gpu::stream_create();
+                if (capture_stream == nullptr) {
+                    err = "EXL3 Flash: token graph capture stream creation failed";
+                    return false;
+                }
+                if (!stage.weights->prepare_stream(capture_stream, err) ||
+                    (stage.session.ple.table != nullptr && !impl_->ple->prepare_stream(capture_stream, err))) {
+                    strata::gpu::stream_destroy(capture_stream);
+                    err = "EXL3 Flash: preparing token graph owners: " + err;
+                    return false;
+                }
+                stage_token(impl_->geometry, 0, 0, stage.session);
+                sycl::queue& queue = Runtime::at(stage.device).stream(capture_stream);
+                if (!strata::gpu::begin_capture(capture_stream)) {
+                    strata::gpu::stream_destroy(capture_stream);
+                    err = "EXL3 Flash: begin token graph capture failed";
+                    return false;
+                }
+                bool captured = true;
+                for (int64_t layer = stage.layer_begin; captured && layer < stage.layer_end; ++layer) {
+                    point_gdn(impl_->geometry, layer, stage.session);
+                    QsaState& qsa = qsa_for(impl_->geometry, layer, stage.session);
+                    captured = block_layer_pre(stage.table, impl_->geometry, layer, 0, 0, stage.session.gdn, qsa,
+                                               stage.session.qsa_bufs, stage.session.moe, routed_k,
+                                               stage.session.block, capture_stream, err, &stage.doorbell,
+                                               stage.session.ple.table != nullptr ? &stage.session.ple : nullptr) &&
+                               strata::gpu::memset_async(stage.parts_device, 0,
+                                                         stage.merge_output.size() * sizeof(float),
+                                                         capture_stream) &&
+                               stage.runtime->record_device_hit_enqueue(
+                                   queue, layer, static_cast<const float*>(stage.session.block.mixed),
+                                   stage.doorbell.d_ids, 1, static_cast<float*>(stage.parts_device),
+                                   impl_->geometry.n_embd, err) &&
+                               block_layer_post(stage.table, impl_->geometry, layer, routed_k, stage.session.moe,
+                                                stage.session.block,
+                                                static_cast<const float*>(stage.parts_device), capture_stream, err);
+                    if (!captured) err = "EXL3 Flash: token graph layer " + std::to_string(layer) + ": " + err;
+                }
+                if (!captured || !strata::gpu::end_capture(capture_stream, &stage.token_graph)) {
+                    if (captured) err = std::string("EXL3 Flash: end token graph capture: ") + strata::gpu::last_error();
+                    else strata::gpu::abandon_capture(capture_stream);
+                    strata::gpu::stream_destroy(capture_stream);
+                    return false;
+                }
+                strata::gpu::stream_destroy(capture_stream);
+            }
+        }
+
         layer_set_fused_gr(impl_->previous_fused_gr);
         layer_set_shared_early(impl_->previous_shared_early);
         impl_->policy_saved = false;
@@ -1370,6 +1581,10 @@ bool Exl3FlashModel::close(std::string& err) noexcept {
             destroy_graphs(stage.pre_graphs);
             destroy_graphs(stage.post_graphs);
             destroy_graphs(stage.expert_graphs);
+            if (stage.token_graph != nullptr) {
+                strata::gpu::graph_destroy(stage.token_graph);
+                stage.token_graph = nullptr;
+            }
             session_release(stage.session);
             if (stage.session.qsa_states != nullptr) {
                 for (int64_t ordinal = 0; ordinal < impl_->geometry.n_qsa_layers(); ++ordinal) {
@@ -1424,6 +1639,15 @@ bool Exl3FlashModel::close(std::string& err) noexcept {
             if (impl_->mtp_session_arena != nullptr) strata::gpu::free(impl_->mtp_session_arena);
             impl_->mtp_session_arena = nullptr;
             if (impl_->mtp_weights) impl_->mtp_weights->close();
+            if (impl_->mtp_body_graph != nullptr) {
+                strata::gpu::graph_destroy(impl_->mtp_body_graph);
+                impl_->mtp_body_graph = nullptr;
+            }
+            if (impl_->mtp_expert_graph != nullptr) {
+                strata::gpu::graph_destroy(impl_->mtp_expert_graph);
+                impl_->mtp_expert_graph = nullptr;
+            }
+            impl_->mtp_device_draft = false;
             if (impl_->mtp_runtime) {
                 Runtime::at(impl_->mtp_device).finish();
                 impl_->mtp_runtime->close();
@@ -1729,6 +1953,12 @@ bool Exl3FlashModel::forward(int32_t token, int64_t pos, int32_t& next_token, fl
         for (auto& stage : impl_->stages) {
             stage_token(impl_->geometry, pos, 0, stage.session);
         }
+        // The whole token runs as one graph per stage where every stage captured one: the host
+        // stages the position and the PLE rows, launches each stage's graph, and meets the data
+        // only at the stage crossings and the head.  Any stage without a token graph (its cache
+        // is not fully resident) keeps the per-layer path for the whole token.
+        bool use_token_graph = token_graph_enabled() && device_route_plan_enabled();
+        for (const auto& stage : impl_->stages) use_token_graph = use_token_graph && stage.token_graph != nullptr;
         for (size_t stage_index = 0; stage_index < impl_->stages.size(); ++stage_index) {
             auto& stage = impl_->stages[stage_index];
             const OnDevice on(stage.device);
@@ -1754,7 +1984,31 @@ bool Exl3FlashModel::forward(int32_t token, int64_t pos, int32_t& next_token, fl
                 timing.bridge_ms += ms_since(mark);
             }
             const bool resident_route = stage.runtime->fully_resident();
-            for (int64_t layer = stage.layer_begin; layer < stage.layer_end; ++layer) {
+            if (use_token_graph) {
+                doorbell_reset(stage.doorbell);
+                if (static_cast<int>(stage_index) == impl_->ple_stage_index &&
+                    ple_stage.session.ple.table != nullptr) {
+                    // The PLE rows sit inside the stage's graph where the PLE layer is, so the
+                    // read is collected and uploaded before the launch instead of before that
+                    // layer: the same rows, staged earlier on the same queue the graph runs on.
+                    mark = std::chrono::steady_clock::now();
+                    const bool finished = ple_finish_token(ple_stage.session.ple, nullptr, err);
+                    timing.ple_collect_ms += ms_since(mark);
+                    ple_guard.disarm();
+                    if (!finished) {
+                        err = "EXL3 Flash: PLE token staging: " + err;
+                        return false;
+                    }
+                    ple_collected = true;
+                }
+                mark = std::chrono::steady_clock::now();
+                if (!strata::gpu::graph_launch(stage.token_graph, nullptr)) {
+                    err = "EXL3 Flash: token graph launch stage " + std::to_string(stage_index) + ": " +
+                          strata::gpu::last_error();
+                    return false;
+                }
+                timing.pre_graph_ms += ms_since(mark);
+            } else for (int64_t layer = stage.layer_begin; layer < stage.layer_end; ++layer) {
                 const size_t local = static_cast<size_t>(layer - stage.layer_begin);
                 doorbell_reset(stage.doorbell);
                 if (layer == PLE_LAYER && static_cast<int>(stage_index) == impl_->ple_stage_index &&
@@ -2337,6 +2591,36 @@ bool Exl3FlashModel::mtp_draft(int32_t next_token, int64_t trunk_pos, int32_t& d
         }
         void* ds = impl_->mtp_stream;
         impl_->embedding->gather_one(next_token, emb, ds);
+        if (impl_->mtp_body_graph != nullptr) {
+            // CAPTURED DRAFT: the gather above is the only step whose argument changes per
+            // draft; everything after it replays as the one graph captured at open, and the
+            // logits it leaves are read back by the shared tail below.
+            if (!strata::gpu::graph_launch(impl_->mtp_body_graph, ds)) {
+                err = std::string("EXL3 Flash MTP draft body graph launch failed: ") +
+                      strata::gpu::last_error();
+                return false;
+            }
+            if (!strata::gpu::stream_sync(ds) ||
+                !strata::gpu::copy(impl_->logits_host.data(), impl_->logits_device,
+                                   impl_->logits_host.size() * sizeof(float))) {
+                err = std::string("EXL3 Flash MTP draft head readback failed: ") + strata::gpu::last_error();
+                return false;
+            }
+            double best = -std::numeric_limits<double>::infinity();
+            for (size_t i = 0; i < impl_->logits_host.size(); ++i) {
+                const double value = impl_->logits_host[i];
+                if (std::isfinite(value) && value > best) {
+                    best = value;
+                    draft = static_cast<int32_t>(i);
+                }
+            }
+            if (draft < 0) { err = "EXL3 Flash: MTP draft logits are all non-finite"; return false; }
+            if (draft_prob != nullptr)
+                *draft_prob = exl3_flash_draft_probability(impl_->logits_host.data(), impl_->logits_host.size(), draft);
+            if (host_logits != nullptr)
+                std::copy(impl_->logits_host.begin(), impl_->logits_host.end(), host_logits);
+            return true;
+        }
         const float eps = static_cast<float>(impl_->spec.rms_eps);
         strata::kernels::native_qsa_rms_norm_weighted(emb, static_cast<const float*>(enorm->data), en,
                                                       static_cast<int>(N), 1, eps, ds);
@@ -2362,30 +2646,58 @@ bool Exl3FlashModel::mtp_draft(int32_t next_token, int64_t trunk_pos, int32_t& d
             err = "EXL3 Flash MTP draft block: " + err;
             return false;
         }
-        if (!strata::gpu::stream_sync(ds)) {
-            err = std::string("EXL3 Flash MTP draft pre sync failed: ") + strata::gpu::last_error();
-            return false;
-        }
-        if (!strata::gpu::copy(impl_->mtp_host_ids.data(), impl_->mtp_session.moe.ids,
-                               static_cast<size_t>(k) * sizeof(int32_t)) ||
-            !strata::gpu::copy(impl_->mtp_host_weights.data(), impl_->mtp_session.moe.weights,
-                               static_cast<size_t>(k) * sizeof(float)) ||
-            !strata::gpu::copy(impl_->mtp_host_x.data(), impl_->mtp_session.block.mixed,
-                               static_cast<size_t>(N) * sizeof(float))) {
-            err = std::string("EXL3 Flash MTP draft router readback failed: ") + strata::gpu::last_error();
-            return false;
-        }
-        if (!impl_->mtp_runtime->prepare_window(0, impl_->mtp_host_x.data(), N, impl_->mtp_host_ids.data(), 1,
-                                                impl_->mtp_cpu_out.data(), N, err) ||
-            !impl_->mtp_runtime->run_cpu(err)) {
-            err = "EXL3 Flash MTP draft experts: " + err;
-            return false;
-        }
-        impl_->mtp_runtime->mark_gpu_consumed();
-        if (!strata::gpu::copy_async(static_cast<float*>(impl_->mtp_parts_device), impl_->mtp_cpu_out.data(),
-                                     static_cast<size_t>(k) * static_cast<size_t>(N) * sizeof(float), ds)) {
-            err = std::string("EXL3 Flash MTP draft expert upload failed: ") + strata::gpu::last_error();
-            return false;
+        if (impl_->mtp_device_draft) {
+            // DEVICE DRAFT: the routed ids and the activation stay on the device. The captured
+            // expert graph resolves the routes against the draft cache's pair table on the
+            // device and writes every expert row into mtp_parts_device; no stream sync, no
+            // router readback and no CPU-pool work sits in the draft loop. The post block
+            // follows on the same in-order stream.
+            if (impl_->mtp_expert_graph != nullptr) {
+                if (!strata::gpu::graph_launch(impl_->mtp_expert_graph, ds)) {
+                    err = std::string("EXL3 Flash MTP draft expert graph launch failed: ") +
+                          strata::gpu::last_error();
+                    return false;
+                }
+            } else {
+                sycl::event done;
+                sycl::queue& queue = Runtime::at(impl_->mtp_device).stream(ds);
+                if (!strata::gpu::memset_async(impl_->mtp_parts_device, 0,
+                                               static_cast<size_t>(k) * static_cast<size_t>(N) * sizeof(float),
+                                               ds) ||
+                    !impl_->mtp_runtime->enqueue_device_hit(
+                        queue, 0, static_cast<const float*>(impl_->mtp_session.block.mixed),
+                        static_cast<const int32_t*>(impl_->mtp_session.moe.ids), 1,
+                        static_cast<float*>(impl_->mtp_parts_device), N, done, {}, err)) {
+                    err = "EXL3 Flash MTP draft experts: " + err;
+                    return false;
+                }
+            }
+        } else {
+            if (!strata::gpu::stream_sync(ds)) {
+                err = std::string("EXL3 Flash MTP draft pre sync failed: ") + strata::gpu::last_error();
+                return false;
+            }
+            if (!strata::gpu::copy(impl_->mtp_host_ids.data(), impl_->mtp_session.moe.ids,
+                                   static_cast<size_t>(k) * sizeof(int32_t)) ||
+                !strata::gpu::copy(impl_->mtp_host_weights.data(), impl_->mtp_session.moe.weights,
+                                   static_cast<size_t>(k) * sizeof(float)) ||
+                !strata::gpu::copy(impl_->mtp_host_x.data(), impl_->mtp_session.block.mixed,
+                                   static_cast<size_t>(N) * sizeof(float))) {
+                err = std::string("EXL3 Flash MTP draft router readback failed: ") + strata::gpu::last_error();
+                return false;
+            }
+            if (!impl_->mtp_runtime->prepare_window(0, impl_->mtp_host_x.data(), N, impl_->mtp_host_ids.data(), 1,
+                                                    impl_->mtp_cpu_out.data(), N, err) ||
+                !impl_->mtp_runtime->run_cpu(err)) {
+                err = "EXL3 Flash MTP draft experts: " + err;
+                return false;
+            }
+            impl_->mtp_runtime->mark_gpu_consumed();
+            if (!strata::gpu::copy_async(static_cast<float*>(impl_->mtp_parts_device), impl_->mtp_cpu_out.data(),
+                                         static_cast<size_t>(k) * static_cast<size_t>(N) * sizeof(float), ds)) {
+                err = std::string("EXL3 Flash MTP draft expert upload failed: ") + strata::gpu::last_error();
+                return false;
+            }
         }
         if (!block_layer_post(*impl_->mtp_table, impl_->mtp_geometry, 0, k, impl_->mtp_session.moe,
                               impl_->mtp_session.block, static_cast<const float*>(impl_->mtp_parts_device),
