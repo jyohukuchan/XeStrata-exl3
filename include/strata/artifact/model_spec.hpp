@@ -282,6 +282,12 @@ inline bool read_model_spec(const GgufFile& g, ModelSpec& s, std::string& err) {
     }
     s.expert_weights_norm = spec_int(g, A, "expert_weights_norm") != 0;
     s.expert_weights_scale = spec_num(g, A, "expert_weights_scale");
+    if (s.arch == ModelArch::Lfm2Moe) {
+        // llama.cpp's lfm2moe defaults (HF norm_topk_prob, routed_scaling_factor): the converter
+        // writes neither key, so an absent key means renormalised weights at scale 1
+        if (!spec_get(g, A, "expert_weights_norm")) s.expert_weights_norm = true;
+        if (!spec_get(g, A, "expert_weights_scale")) s.expert_weights_scale = 1.0;
+    }
     spec_per_layer(g, A, "swiglu_clamp_exp", n_all, s.swiglu_clamp_exp);
     spec_per_layer(g, A, "swiglu_clamp_shexp", n_all, s.swiglu_clamp_shexp);
     if (s.n_expert <= 0 || s.n_expert_used <= 0 || s.n_expert_used > s.n_expert || s.n_ff_exp <= 0) {

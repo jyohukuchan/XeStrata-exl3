@@ -449,7 +449,7 @@ if(STRATA_ENABLE_XE)
                                     src/kernels/xe/exl3_grouped.cpp src/kernels/xe/exl3_fused.cpp
                                     src/kernels/xe/raw_linear.cpp
                                     src/kernels/xe/native_mmvq.cpp src/kernels/xe/rope.cpp
-                                    src/kernels/xe/router.cpp src/kernels/xe/bf16_gemv.cpp
+                                    src/kernels/xe/router.cpp src/kernels/xe/shortconv.cpp src/kernels/xe/bf16_gemv.cpp
                                     src/kernels/xe/quantize_act.cpp src/kernels/xe/qsa.cpp
                                     src/kernels/xe/kv_q8.cpp src/kernels/xe/kv_q4.cpp
                                     src/kernels/xe/qsa_decode_attn.cpp src/kernels/xe/kv_stream.cpp
@@ -904,6 +904,10 @@ if(STRATA_ENABLE_XE)
     add_executable(router_top10_parity src/kernels/router_top10_parity.cpp)
     target_link_libraries(router_top10_parity PRIVATE strata_kernels)
     add_test(NAME router_top10_parity COMMAND router_top10_parity --selftest)
+    add_executable(shortconv_parity src/kernels/shortconv_parity.cpp)
+    target_link_libraries(shortconv_parity PRIVATE strata_kernels)
+    target_compile_options(shortconv_parity PRIVATE -fno-fast-math -ffp-contract=off)
+    add_test(NAME shortconv_parity COMMAND shortconv_parity --selftest)
     add_executable(bf16_gemv_parity src/kernels/bf16_gemv_parity.cpp)
     target_link_libraries(bf16_gemv_parity PRIVATE strata_kernels)
     add_test(NAME bf16_gemv_parity COMMAND bf16_gemv_parity --selftest)

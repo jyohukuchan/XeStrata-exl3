@@ -141,7 +141,7 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
                          float* part_m_all, float* part_l_all, int n_chunks, size_t n_q, int cap,
                          long long scratch_stride) {
     static_assert(G >= 1 && G <= 16, "reduce12 sums at most 16 heads");
-    static_assert(HD % 128 == 0 && HD <= 256, "a lane holds HD/32 dimensions inside one Q4_0 half");
+    static_assert((HD == 64 || HD % 128 == 0) && HD <= 256, "a lane holds HD/32 dimensions inside one Q4_0 half");
     constexpr int THREADS = HD;           // one work-item per dimension in the value loop
     constexpr int WARPS = THREADS / WARP;
     constexpr int N = HD / WARP;          // dimensions a lane holds in the score loop
@@ -342,7 +342,8 @@ void run_shape(const float* q, const QsaAttnPools& pools, const int32_t* ids, co
 bool shape_ok(const QsaShapes& s) {
     if (s.n_head_kv <= 0 || s.n_head % s.n_head_kv) return false;
     const int64_t g = s.n_head / s.n_head_kv;
-    return (s.head_dim == 256 && (g == 12 || g == 8)) || (s.head_dim == 128 && g == 10);
+    return (s.head_dim == 256 && (g == 12 || g == 8)) || (s.head_dim == 128 && g == 10) ||
+           (s.head_dim == 64 && g == 4);
 }
 
 void run(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
@@ -350,6 +351,7 @@ void run(const float* q, const QsaAttnPools& pools, const int32_t* ids, const in
     const int64_t g = s.n_head / s.n_head_kv;
     if (s.head_dim == 256 && g == 12) run_shape<256, 12>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream);
     else if (s.head_dim == 256 && g == 8) run_shape<256, 8>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream);
+    else if (s.head_dim == 64 && g == 4) run_shape<64, 4>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream);
     else run_shape<128, 10>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream);
 }
 

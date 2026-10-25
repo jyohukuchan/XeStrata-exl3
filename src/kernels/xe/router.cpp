@@ -142,6 +142,69 @@ sycl::event router_top10_launch(sycl::queue& q, const float* logits, int n_token
         });
     });
 }
+template <typename D>
+sycl::event router_sigmoid_launch(sycl::queue& q, const float* logits, const float* bias, int n_tokens,
+                                  int n_expert, int k, bool norm, float scale, int* ids, float* weights,
+                                  int threads, int nw) {
+    return q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<unsigned char, 1> s_taken(sycl::range<1>((size_t) n_expert), h);
+        sycl::local_accessor<float, 1> s_p(sycl::range<1>((size_t) n_expert), h);
+        sycl::local_accessor<float, 1> s_score(sycl::range<1>((size_t) n_expert), h);
+        sycl::local_accessor<float, 1> s_red(sycl::range<1>(RT_MAX_THREADS / WARP), h);
+        sycl::local_accessor<int, 1> s_rid(sycl::range<1>(RT_MAX_THREADS / WARP), h);
+        h.parallel_for(sycl::nd_range<1>((size_t) n_tokens * threads, threads),
+                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+            const auto g = it.get_group();
+            const sycl::sub_group sg = it.get_sub_group();
+            const int t = (int) it.get_group(0);
+            const int tid = (int) it.get_local_id(0), nt = threads;
+            const int warp = (int) sg.get_group_linear_id(), lane = (int) sg.get_local_linear_id();
+            const float* l = logits + (size_t) t * n_expert;
+            for (int x = tid; x < n_expert; x += nt) {
+                const D v = (D) l[x];
+                const float p = (float) ((D) 1 / ((D) 1 + sycl::exp(-v)));
+                s_p[x] = p;
+                s_score[x] = p + (bias ? bias[x] : 0.0f);
+                s_taken[x] = 0;
+            }
+            sycl::group_barrier(g);
+            for (int i = 0; i < k; ++i) {
+                float bv = -INFINITY;
+                int bi = n_expert;
+                for (int x = tid; x < n_expert; x += nt) {
+                    if (s_taken[x]) continue;
+                    const float pe = s_score[x];
+                    if (pe > bv) { bv = pe; bi = x; }
+                }
+                for (int off = 16; off > 0; off >>= 1)
+                    better(bv, bi, sycl::permute_group_by_xor(sg, bv, off), sycl::permute_group_by_xor(sg, bi, off));
+                if (lane == 0) { s_red[warp] = bv; s_rid[warp] = bi; }
+                sycl::group_barrier(g);
+                if (warp == 0) {
+                    float v = lane < nw ? s_red[lane] : -INFINITY;
+                    int ix = lane < nw ? s_rid[lane] : n_expert;
+                    for (int off = 16; off > 0; off >>= 1)
+                        better(v, ix, sycl::permute_group_by_xor(sg, v, off), sycl::permute_group_by_xor(sg, ix, off));
+                    if (lane == 0 && ix < n_expert) {
+                        ids[(size_t) t * k + i] = ix;
+                        weights[(size_t) t * k + i] = s_p[ix];
+                        s_taken[ix] = 1;
+                    }
+                }
+                sycl::group_barrier(g);
+            }
+            if (tid == 0) {
+                D s = 0;
+                if (norm) for (int i = 0; i < k; ++i) s += (D) weights[(size_t) t * k + i];
+                for (int i = 0; i < k; ++i) {
+                    D w = (D) weights[(size_t) t * k + i];
+                    if (norm) w = w / (s + (D) 1e-20);
+                    weights[(size_t) t * k + i] = (float) (w * (D) scale);
+                }
+            }
+        });
+    });
+}
 }  // namespace
 
 // One work-group per token.  See the CUDA file for why each step is shaped as it is: the max is an exact tree, the
@@ -162,6 +225,23 @@ void router_top10(const float* logits, int n_tokens, int n_expert, int k, int* i
                        ? router_top10_launch<double>(q, logits, n_tokens, n_expert, k, ids, weights, threads, nw)
                        : router_top10_launch<float>(q, logits, n_tokens, n_expert, k, ids, weights, threads, nw);
     if (!stream) core::Runtime::get().wait(e, "router_top10");
+}
+
+void router_sigmoid_topk(const float* logits, const float* bias, int n_tokens, int n_expert, int k,
+                         bool norm, float scale, int* ids, float* weights, void* stream) {
+    if (n_tokens <= 0 || n_expert <= 0 || k <= 0) return;
+    if (k > 64) throw core::DeviceError("router_sigmoid_topk: k " + std::to_string(k) + " exceeds the kernel's 64");
+    if (n_expert > RT_MAX_THREADS * 64)
+        throw core::DeviceError("router_sigmoid_topk: n_expert " + std::to_string(n_expert) + " is past the kernel's " +
+                                std::to_string(RT_MAX_THREADS * 64));
+    int threads = n_expert < RT_MAX_THREADS ? n_expert : RT_MAX_THREADS;
+    threads = (threads + WARP - 1) & ~(WARP - 1);
+    const int nw = threads / WARP;
+    auto& q = queue_for(stream, false);
+    const auto e = xe::has_fp64(q)
+                       ? router_sigmoid_launch<double>(q, logits, bias, n_tokens, n_expert, k, norm, scale, ids, weights, threads, nw)
+                       : router_sigmoid_launch<float>(q, logits, bias, n_tokens, n_expert, k, norm, scale, ids, weights, threads, nw);
+    if (!stream) core::Runtime::get().wait(e, "router_sigmoid_topk");
 }
 
 void native_router_set_enabled(bool value) { native_enabled.store(value, std::memory_order_relaxed); }
