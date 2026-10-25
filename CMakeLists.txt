@@ -701,6 +701,16 @@ if(STRATA_ENABLE_XE)
     target_include_directories(strata_prefill SYSTEM PRIVATE $<TARGET_PROPERTY:onemath,INTERFACE_INCLUDE_DIRECTORIES>)
     target_link_libraries(strata_prefill PRIVATE $<TARGET_FILE:onemath>)
     target_compile_definitions(strata_prefill PRIVATE STRATA_ONEMATH=1)
+    # the series of the oneMKL the build links ("2026.2", from its mkl_version.h): the Windows engine looks for that
+    # series's DLLs first (src/prefill/gemm.cpp), as another's SYCL library may not load on the engine's runtime
+    if(_strata_onemkl AND MKL_ROOT AND EXISTS "${MKL_ROOT}/include/mkl_version.h")
+      file(STRINGS "${MKL_ROOT}/include/mkl_version.h" _strata_mkl_v REGEX "#define[ \t]+INTEL_MKL_VERSION[ \t]")
+      string(REGEX MATCH "[0-9]+$" _strata_mkl_v "${_strata_mkl_v}")
+      math(EXPR _strata_mkl_year "${_strata_mkl_v} / 10000")
+      math(EXPR _strata_mkl_update "${_strata_mkl_v} / 100 % 100")
+      target_compile_definitions(strata_prefill PRIVATE
+                                 STRATA_ONEMKL_SERIES="${_strata_mkl_year}.${_strata_mkl_update}")
+    endif()
   endif()
 
   # `strata generate` (P2.S6): the program that composes the components into tokens
