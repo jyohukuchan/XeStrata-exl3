@@ -27,6 +27,13 @@ class Exl3ExpertRuntime {
 public:
     using ResidentPair = std::pair<int32_t, int32_t>;
 
+    /// How a non-resident (miss) expert is computed.  `Cpu` is the original path: the source's blob is
+    /// computed by the CPU pool.  `Direct` stages the miss's canonical blob in pinned host memory and lets
+    /// the GPU's grouped kernel read it from there over the bus (PCIe), so the GPU - not the CPU -
+    /// computes the miss and no VRAM copy is made.  Direct falls back to `Cpu` per window when the pinned
+    /// staging is unavailable or the device cannot read host memory.
+    enum class MissMode { Cpu, Direct };
+
     Exl3ExpertRuntime() = default;
     ~Exl3ExpertRuntime();
     Exl3ExpertRuntime(const Exl3ExpertRuntime&) = delete;
@@ -92,6 +99,26 @@ public:
     /// in-order graph (all previous plan/row/merge readers have finished). Graph events cannot be waited directly.
     void mark_gpu_consumed();
 
+    /// Selects the miss path.  Call before open(); the default is `MissMode::Cpu`.
+    void set_miss_mode(MissMode mode) { miss_mode_ = mode; }
+    MissMode miss_mode() const { return miss_mode_; }
+    /// True when the Direct staging was allocated and the device can read it (set by open()).
+    bool direct_ready() const { return direct_ready_; }
+
+    /// Records every routed (layer, expert) entry's count while set (before open()).  The counts are the
+    /// firing-frequency profile a later run ranks its resident set with (write_expert_profile's format).
+    void set_record_heat(bool on) { record_heat_ = on; }
+    bool record_heat() const { return record_heat_; }
+    /// Per-pair routed-entry counts, [n_layers * n_expert]; empty until a window is prepared with
+    /// recording on.
+    const std::vector<uint64_t>& heat() const { return heat_; }
+
+    /// Cumulative routed-entry counts since open(): resident hits, CPU-computed misses and
+    /// direct-read misses.  Their sum is every routed entry prepared.
+    int64_t total_hit_entries() const { return total_hit_entries_; }
+    int64_t total_cpu_miss_entries() const { return total_cpu_miss_entries_; }
+    int64_t total_direct_miss_entries() const { return total_direct_miss_entries_; }
+
     bool prepared() const { return prepared_; }
     bool cpu_ready() const { return cpu_ready_; }
     bool pending_gpu() const { return pending_gpu_; }
@@ -148,6 +175,18 @@ private:
     int64_t max_ff_ = 0;
     // Optional packed output-block workspace; zero keeps whole-expert dispatch.
     int64_t cpu_rowparallel_jobs_ = 0;
+    MissMode miss_mode_ = MissMode::Cpu;
+    bool direct_ready_ = false;
+    uint8_t* direct_staging_ = nullptr;   ///< pinned host arena the GPU reads miss blobs from (Direct)
+    uint64_t direct_stride_ = 0;          ///< one staged blob's stride in direct_staging_
+    int64_t direct_capacity_ = 0;         ///< distinct miss experts the arena holds
+    bool record_heat_ = false;
+    std::vector<uint64_t> heat_;
+    int64_t total_hit_entries_ = 0;
+    int64_t total_cpu_miss_entries_ = 0;
+    int64_t total_direct_miss_entries_ = 0;
+    int64_t direct_entries_ = 0;          ///< this window's direct-read entries (not CPU jobs)
+
     bool opened_ = false;
     bool prepared_ = false;
     bool cpu_ready_ = false;

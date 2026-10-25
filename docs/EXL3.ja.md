@@ -244,6 +244,25 @@ STRATA_EXL3_DEVICE_CACHE_PROFILE=PATH # profile order の profile ファイル
 埋めてから次の層へ進む。`profile` は `tools/make_profile.py` の profile（`STRP` 形式）の
 順に、hot な組から入れる。
 
+常駐セットはコマンドラインからも選べる（Strata の `--expert-profile` 相当）:
+
+```sh
+strata --exl3 DIR --tokens-file PROMPT --expert-profile-save profile.bin   # 計測実行: 発火頻度を記録
+strata --exl3 DIR --tokens-file PROMPT --expert-profile profile.bin        # 頻度順に常駐
+strata --exl3 DIR --tokens-file PROMPT --expert-miss direct                # 非常駐を GPU が直接読む
+```
+
+`--expert-profile-save PATH` はその実行の routed entry を (層, expert) ごとに数え、終了時に
+全組を頻度順に並べた `STRP` profile を書く。`--expert-profile PATH` はその順で常駐セットを
+決める。profile がない・読めない・モデルが違う場合は従来の `spread` にフォールバックし、
+その旨を表示する。実行終了時に常駐数・routed entry 数・ヒット数と率・CPU/direct miss 数を
+表示する。
+
+`--expert-miss direct` は非常駐 expert の miss 経路を変える: miss の canonical blob を
+pinned host メモリに置き、GPU の grouped kernel が PCIe 経由で直接読んで計算する
+（VRAM へのコピーはしない）。pinned の確保や device の host 読取ができない場合は
+CPU miss にフォールバックする。既定の `--expert-miss cpu` が従来経路である。
+
 測定（V620 0000:43:00.0、Qwen3.8 EXL3 3.05 bpw、`STRATA_EXL3_CPU_INTDOT=1` と
 `STRATA_EXL3_CPU_ROWPARALLEL=1`、context 512、63 decode token、engine 自身の
 `STRATA_EXL3_PREPARE_DETAIL=1` の counter）:

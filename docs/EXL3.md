@@ -253,6 +253,25 @@ STRATA_EXL3_DEVICE_CACHE_PROFILE=PATH # the profile file the profile order ranks
 before the next layer's, in the order the layers are visited. `profile` takes the pairs a profile
 (`tools/make_profile.py`'s `STRP` format) ranks first, the hottest ones first.
 
+The resident set can also be chosen from the command line (Strata's `--expert-profile` equivalent):
+
+```sh
+strata --exl3 DIR --tokens-file PROMPT --expert-profile-save profile.bin   # a measuring run: record the frequencies
+strata --exl3 DIR --tokens-file PROMPT --expert-profile profile.bin        # resident in frequency order
+strata --exl3 DIR --tokens-file PROMPT --expert-miss direct                # the GPU reads the misses directly
+```
+
+`--expert-profile-save PATH` counts the run's routed entries per (layer, expert) pair and, at the end,
+writes an `STRP` profile ranking every pair by frequency. `--expert-profile PATH` fills the resident
+set in that order. A profile that is missing, unreadable or for another model falls back to the
+`spread` order, and says so. At the end of a run the resident count, the routed entries, the hits and
+their rate, and the CPU/direct miss counts are reported.
+
+`--expert-miss direct` changes the miss path for non-resident experts: a miss's canonical blob is
+staged in pinned host memory and the GPU's grouped kernel reads it over the bus (PCIe) and computes
+it, with no copy into VRAM. When the pinned staging cannot be allocated or the device cannot read
+host memory, the CPU miss path takes over. The default `--expert-miss cpu` is the original path.
+
 Measured on the V620 at 0000:43:00.0 with the Qwen3.8 EXL3 3.05 bpw checkpoint, `STRATA_EXL3_CPU_INTDOT=1`
 and `STRATA_EXL3_CPU_ROWPARALLEL=1`, context 512, 63 decode tokens, and the engine's own
 `STRATA_EXL3_PREPARE_DETAIL=1` counters:
