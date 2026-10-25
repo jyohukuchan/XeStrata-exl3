@@ -1727,4 +1727,576 @@ bool block_layer(const WeightTable& tables, const ModelGeometry& g, int64_t laye
 // which holds for `session_token`, where the caller supplies them, and does NOT hold for a host loop that
 // has only just seen the router.  That is why the captured path calls the halves separately.
 if (!block_layer_pre(tables, g, layer, pos, pos_base, gb, qst, qb, mb, k, bb, stream, err, db, ple))        return false;    return block_layer_post(tables, g, layer, k, mb, bb, parts, stream, err);}}
-// namespace strata::core
+namespace strata::core {
+// ================================ BATCHED PREFILL ================================
+namespace {
+bool prefill_proj(const WeightRef& w, const float* x_b, int64_t n_in, float* y_b, int64_t n_out, int64_t T,
+                  void* stream, std::string& err, const char* what) {
+    if (w.exl3 == nullptr) {
+        err = std::string("prefill: ") + what + " has no EXL3 owner; the batched path needs EXL3 projections";
+        return false;
+    }
+    return w.exl3->run(x_b, n_in, y_b, n_out, T, stream, err);
+}
+}  // namespace
+
+uint64_t prefill_scratch_bytes(const ModelGeometry& g, int64_t T) {
+    if (T <= 0) return 0;
+    const uint64_t t = (uint64_t) T;
+    const uint64_t parts[] = {
+        t * (uint64_t) g.hc * (uint64_t) g.n_embd * 4,   // xn
+        t * (uint64_t) g.hc_lr * 4,                     // lo
+        t * (uint64_t) g.hc * (uint64_t) g.n_embd * 4,  // gated
+        t * (uint64_t) g.ssm_conv_channels * 4,         // qkv
+        t * (uint64_t) g.ssm_conv_channels * 4,         // h
+        t * (uint64_t) g.ssm_v_heads * 4,               // alpha
+        t * (uint64_t) g.ssm_v_heads * 4,               // beta
+        t * (uint64_t) g.ssm_v_heads * 4,               // gate
+        t * (uint64_t) g.ssm_v_heads * (uint64_t) g.ssm_state_size * 4,  // o
+        t * (uint64_t) std::max(g.ssm_value_dim, g.n_ff) * 4,            // z (also shared gate temp)
+        t * (uint64_t) g.ssm_value_dim * 4,             // y
+        t * (uint64_t) g.n_head * 2 * (uint64_t) g.head_dim * 4,  // q_full
+        t * (uint64_t) g.n_head * (uint64_t) g.head_dim * 4,      // qcur
+        t * (uint64_t) g.n_head_kv * (uint64_t) g.head_dim * 4,   // kcur
+        t * (uint64_t) g.n_head_kv * (uint64_t) g.head_dim * 4,   // vcur
+        t * (uint64_t) g.idx_key_dim * 4,               // idx_raw
+        t * (uint64_t) g.idx_q_heads * (uint64_t) g.idx_key_dim * 4,  // q_idx
+        t * (uint64_t) g.n_head * (uint64_t) g.head_dim * 4,      // attn
+        t * (uint64_t) g.n_head * (uint64_t) g.head_dim * 4,      // attn32
+        t * (uint64_t) g.n_ff * 4,                      // sh_gate
+        t * (uint64_t) g.n_ff * 4,                      // sh_up
+        t * 4,                                          // sh_scalar
+        t * (uint64_t) g.n_expert * 4,                  // router_logits
+    };
+    uint64_t total = 0;
+    for (const uint64_t v : parts) total += (v + 15) & ~(uint64_t) 15;
+    return total;
+}
+
+uint64_t prefill_scratch_init(const ModelGeometry& g, int64_t T, void* base, PrefillScratch& s) {
+    const uint64_t t = (uint64_t) T;
+    const uint64_t counts[] = {
+        t * (uint64_t) g.hc * (uint64_t) g.n_embd, t * (uint64_t) g.hc_lr,
+        t * (uint64_t) g.hc * (uint64_t) g.n_embd, t * (uint64_t) g.ssm_conv_channels,
+        t * (uint64_t) g.ssm_conv_channels,        t * (uint64_t) g.ssm_v_heads,
+        t * (uint64_t) g.ssm_v_heads,              t * (uint64_t) g.ssm_v_heads,
+        t * (uint64_t) g.ssm_v_heads * (uint64_t) g.ssm_state_size,
+        t * (uint64_t) std::max(g.ssm_value_dim, g.n_ff), t * (uint64_t) g.ssm_value_dim,
+        t * (uint64_t) g.n_head * 2 * (uint64_t) g.head_dim,
+        t * (uint64_t) g.n_head * (uint64_t) g.head_dim,
+        t * (uint64_t) g.n_head_kv * (uint64_t) g.head_dim,
+        t * (uint64_t) g.n_head_kv * (uint64_t) g.head_dim, t * (uint64_t) g.idx_key_dim,
+        t * (uint64_t) g.idx_q_heads * (uint64_t) g.idx_key_dim,
+        t * (uint64_t) g.n_head * (uint64_t) g.head_dim, t * (uint64_t) g.n_head * (uint64_t) g.head_dim,
+        t * (uint64_t) g.n_ff, t * (uint64_t) g.n_ff, t, t * (uint64_t) g.n_expert,
+    };
+    float** fields[] = {&s.xn,  &s.lo,   &s.gated, &s.qkv, &s.h,   &s.alpha, &s.beta, &s.gate,
+                        &s.o,   &s.z,    &s.y,     &s.q_full, &s.qcur, &s.kcur, &s.vcur, &s.idx_raw,
+                        &s.q_idx, &s.attn, &s.attn32, &s.sh_gate, &s.sh_up, &s.sh_scalar, &s.router_logits};
+    uint8_t* p = (uint8_t*) base;
+    uint64_t used = 0;
+    for (size_t i = 0; i < sizeof(counts) / sizeof(counts[0]); ++i) {
+        *fields[i] = (float*) (p + used);
+        used += (counts[i] * 4 + 15) & ~(uint64_t) 15;
+    }
+    return used;
+}
+
+bool gr_read_exl3_batched(const WeightRef& norm, const WeightRef& down, const WeightRef& up,
+                          const WeightRef* inject, const float* R_b, int64_t T,
+                          const strata::kernels::GrShapes& shapes, PrefillScratch& s, float* mixed_b,
+                          float* inject_b, void* stream, std::string& err) {
+    if (R_b == nullptr || mixed_b == nullptr || s.xn == nullptr || s.lo == nullptr || s.gated == nullptr ||
+        norm.exl3 != nullptr || !down.exl3 || !up.exl3 || (inject != nullptr && !inject->exl3) ||
+        (inject != nullptr && inject_b == nullptr)) {
+        err = "prefill GR: EXL3 down/up owners and batched scratch are required";
+        return false;
+    }
+    if (norm.kind != WeightKind::F32 || norm.data == nullptr) {
+        err = "prefill GR: the norm must be a loaded F32 vector";
+        return false;
+    }
+    const int64_t n = shapes.n_embd, hc = shapes.hc, lr = shapes.hc_lr;
+    const int64_t dim = n * hc;
+    try {
+        for (int64_t t = 0; t < T; ++t)
+            strata::kernels::native_gr_rms_norm_weighted(R_b + (size_t) t * dim, (const float*) norm.data,
+                                                         s.xn + (size_t) t * dim, (int) n, (int) hc, RMS_EPS,
+                                                         stream);
+        if (!down.exl3->run(s.xn, dim, s.lo, lr, T, stream, err)) return false;
+        for (int64_t t = 0; t < T; ++t)
+            strata::kernels::native_gr_down_silu(s.lo + (size_t) t * lr, (int) lr, (int) hc, stream);
+        if (!up.exl3->run(s.lo, lr, s.gated, dim, T, stream, err)) return false;
+        for (int64_t t = 0; t < T; ++t)
+            strata::kernels::native_gr_pre_gated(s.xn + (size_t) t * dim, s.gated + (size_t) t * dim,
+                                                 mixed_b + (size_t) t * n, (int) n, (int) hc,
+                                                 inject != nullptr, stream);
+        if (inject != nullptr && !inject->exl3->run(s.xn, dim, inject_b, hc, T, stream, err)) return false;
+    } catch (const std::exception& error) {
+        err = std::string("prefill GR: ") + error.what();
+        return false;
+    }
+    return true;
+}
+
+bool gdn_layer_prefill(const WeightTable& tables, const ModelGeometry& g, int64_t layer, const GdnBuffers& gb,
+                       const float* mixed_b, float* out_b, int64_t T, PrefillScratch& s, void* stream,
+                       std::string& err) {
+    const LayerView v(tables, layer);
+    const int64_t C = g.ssm_conv_channels, V = g.ssm_value_dim, HV = g.ssm_v_heads;
+    const WeightRef* w_qkv = v.get("attn_qkv.weight");
+    const WeightRef* w_gate = v.get("attn_gate.weight");
+    const WeightRef* w_out = v.get("ssm_out.weight");
+    const WeightRef* w_alpha = v.get("ssm_alpha.weight");
+    const WeightRef* w_beta = v.get("ssm_beta.weight");
+    const WeightRef* w_conv = v.get("ssm_conv1d.weight");
+    const WeightRef* w_norm = v.get("ssm_norm.weight");
+    const WeightRef* w_dt = v.get("ssm_dt.bias");
+    const WeightRef* w_a = v.get("ssm_a");
+    if (!w_qkv || !w_gate || !w_out || !w_alpha || !w_beta || !w_conv || !w_norm || !w_dt || !w_a) {
+        err = v.name("gdn") + ": a GDN tensor is missing";
+        return false;
+    }
+    if (!w_qkv->exl3 || !w_gate->exl3 || !w_out->exl3 || !w_alpha->exl3 || !w_beta->exl3) {
+        err = v.name("gdn") + ": the batched path needs EXL3 projections";
+        return false;
+    }
+    const float* conv_kernel = (const float*) w_conv->data;
+    const float* ssm_norm = (const float*) w_norm->data;
+    const float* dt = (const float*) w_dt->data;
+    const float* ssm_a = (const float*) w_a->data;
+    const int64_t qk = g.ssm_state_size * g.ssm_k_heads;
+    using namespace strata::kernels;
+    // Batched dense products first: every token's qkv/z/alpha/beta from its own mixed row.
+    if (!prefill_proj(*w_qkv, mixed_b, g.n_embd, s.qkv, C, T, stream, err, "attn_qkv") ||
+        !prefill_proj(*w_alpha, mixed_b, g.n_embd, s.alpha, HV, T, stream, err, "ssm_alpha") ||
+        !prefill_proj(*w_beta, mixed_b, g.n_embd, s.beta, HV, T, stream, err, "ssm_beta"))
+        return false;
+    const bool fused_tail = w_gate->exl3->packed() != nullptr && w_out->exl3->packed() != nullptr &&
+                            g.ssm_state_size == 128 && V % 128 == 0 && g.n_embd % 128 == 0 &&
+                            exl3::exl3_fused_tail_enabled() && exl3::exl3_fused_tail_supported(stream);
+    if (fused_tail) {
+        exl3::GemvOptions tail_stages{};
+        tail_stages.output_hadamard = false;
+        tail_stages.add_bias = false;
+        if (!w_gate->exl3->run(mixed_b, g.n_embd, s.z, V, T, stream, tail_stages, err)) return false;
+    } else {
+        if (!prefill_proj(*w_gate, mixed_b, g.n_embd, s.z, V, T, stream, err, "attn_gate")) return false;
+    }
+    // Stateful walk in token order: conv, norms, gates, recurrence, output norm.
+    try {
+        gdn_gate_beta(s.alpha, dt, ssm_a, s.gate, s.beta, T, HV, stream);
+        for (int64_t t = 0; t < T; ++t) {
+            float* h_t = s.h + (size_t) t * C;
+            if (native_gdn_enabled())
+                native_gdn_conv_silu(gb.conv_state, s.qkv + (size_t) t * C, conv_kernel, gb.conv_out, h_t, C,
+                                     g.ssm_d_conv, stream);
+            else
+                gdn_conv_silu(gb.conv_state, s.qkv + (size_t) t * C, conv_kernel, h_t, C, g.ssm_d_conv, stream);
+            if (native_gdn_enabled()) {
+                native_gdn_l2_norm(h_t, g.ssm_k_heads, g.ssm_state_size, RMS_EPS, stream);
+                native_gdn_l2_norm(h_t + qk, g.ssm_k_heads, g.ssm_state_size, RMS_EPS, stream);
+            } else {
+                const float qk_scale = 1.0f / std::sqrt((float) g.ssm_state_size);
+                gdn_l2_norm_scaled(h_t, g.ssm_k_heads, g.ssm_state_size, RMS_EPS, qk_scale, stream);
+                gdn_l2_norm(h_t + qk, g.ssm_k_heads, g.ssm_state_size, RMS_EPS, stream);
+            }
+        }
+        const GdnShapes gs{g.ssm_state_size, g.ssm_k_heads, g.ssm_v_heads};
+        const bool fused_step = g_fused_gdn && native_gdn_enabled() && g.ssm_state_size == 128;
+        if (fused_tail) {
+            // The tail consumes every token's o and z together after the recurrence walk.
+            for (int64_t t = 0; t < T; ++t) {
+                float* h_t = s.h + (size_t) t * C;
+                gdn_step(gb.state, h_t, h_t + qk, h_t + 2 * qk, s.gate + (size_t) t * HV,
+                         s.beta + (size_t) t * HV, s.o + (size_t) t * HV * g.ssm_state_size, gs, stream);
+            }
+            // The tail's rows are one token's GDN heads: its Hadamard/bias
+            // vectors span a single token's value dim, so it runs per token
+            // with that token's o/z/y rows, in token order.
+            for (int64_t t = 0; t < T; ++t) {
+                exl3::exl3_fused_gdn_tail_fp32(*w_gate->exl3->packed(), *w_out->exl3->packed(),
+                                               s.o + (size_t) t * HV * g.ssm_state_size,
+                                               s.z + (size_t) t * V, ssm_norm, s.y + (size_t) t * V, HV,
+                                               gdn_silu_gate(), RMS_EPS, stream);
+            }
+            exl3::GemvOptions out_stages{};
+            out_stages.input_hadamard = false;
+            if (!w_out->exl3->run(s.y, V, out_b, g.n_embd, T, stream, out_stages, err)) return false;
+            return true;
+        }
+        for (int64_t t = 0; t < T; ++t) {
+            float* h_t = s.h + (size_t) t * C;
+            float* o_t = s.o + (size_t) t * HV * g.ssm_state_size;
+            if (fused_step) {
+                fused_gdn_step_norm(gb.state, h_t, h_t + qk, h_t + 2 * qk, s.gate + (size_t) t * HV,
+                                    s.beta + (size_t) t * HV, s.z + (size_t) t * V, ssm_norm, RMS_EPS,
+                                    s.y + (size_t) t * V, (int) g.ssm_k_heads, (int) HV, stream);
+            } else if (native_gdn_enabled()) {
+                native_gdn_step(gb.state, h_t, h_t + qk, h_t + 2 * qk, s.gate + (size_t) t * HV,
+                                s.beta + (size_t) t * HV, o_t, gs, stream);
+                native_gdn_out_norm(o_t, s.z + (size_t) t * V, ssm_norm, s.y + (size_t) t * V, HV,
+                                    g.ssm_state_size, RMS_EPS, stream);
+            } else {
+                gdn_step(gb.state, h_t, h_t + qk, h_t + 2 * qk, s.gate + (size_t) t * HV,
+                         s.beta + (size_t) t * HV, o_t, gs, stream);
+                gdn_out_norm(o_t, s.z + (size_t) t * V, ssm_norm, s.y + (size_t) t * V, HV, g.ssm_state_size,
+                             RMS_EPS, stream);
+            }
+        }
+    } catch (const std::exception& error) {
+        err = v.name("gdn_prefill") + ": " + error.what();
+        return false;
+    }
+    if (!prefill_proj(*w_out, s.y, V, out_b, g.n_embd, T, stream, err, "ssm_out")) return false;
+    return true;
+}
+
+bool qsa_layer_prefill(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t pos0,
+                       QsaState& st, const QsaBuffers& qb, const float* x_b, float* out_b, int64_t T,
+                       PrefillScratch& s, void* stream, std::string& err) {
+    const QsaShapes shapes = qsa_shapes(g);
+    const LayerView v(tables, layer);
+    const WeightRef* w_idxk = v.get("indexer.k_proj.weight");
+    const WeightRef* w_attnq = v.get("attn_q.weight");
+    const WeightRef* w_attnk = v.get("attn_k.weight");
+    const WeightRef* w_attnv = v.get("attn_v.weight");
+    const WeightRef* w_attno = v.get("attn_output.weight");
+    const WeightRef* w_idxq = v.get("indexer.q_proj.weight");
+    const WeightRef* w_qn = v.get("attn_q_norm.weight");
+    const WeightRef* w_kn = v.get("attn_k_norm.weight");
+    const WeightRef* w_iqn = v.get("indexer.q_norm.weight");
+    const WeightRef* w_ikn = v.get("indexer.k_norm.weight");
+    if (!w_idxk || !w_attnq || !w_attnk || !w_attnv || !w_attno || !w_idxq || !w_qn || !w_kn || !w_iqn || !w_ikn) {
+        err = v.name("qsa") + ": a QSA tensor is missing";
+        return false;
+    }
+    if (!w_idxk->exl3 || !w_attnq->exl3 || !w_attnk->exl3 || !w_attnv->exl3 || !w_attno->exl3 || !w_idxq->exl3) {
+        err = v.name("qsa") + ": the batched path needs EXL3 projections";
+        return false;
+    }
+    if (st.kv_int8 || st.kv_q4 || st.kv_hybrid || st.kv_mode != 0) {
+        err = v.name("qsa") + ": the batched path needs the default FP16 resident K/V form";
+        return false;
+    }
+    const int64_t NH = g.n_head, NKV = g.n_head_kv, HD = g.head_dim;
+    const int64_t cap = qsa_selection_width(strata::kernels::kTopkMaxCells, shapes);
+    const int64_t max_blocks = (st.max_cells / shapes.idx_block) + 2;
+    using namespace strata::kernels;
+    if (!prefill_proj(*w_idxk, x_b, g.n_embd, s.idx_raw, g.idx_key_dim, T, stream, err, "indexer.k") ||
+        !prefill_proj(*w_attnk, x_b, g.n_embd, s.kcur, NKV * HD, T, stream, err, "attn_k") ||
+        !prefill_proj(*w_attnv, x_b, g.n_embd, s.vcur, NKV * HD, T, stream, err, "attn_v") ||
+        !prefill_proj(*w_attnq, x_b, g.n_embd, s.q_full, NH * 2 * HD, T, stream, err, "attn_q") ||
+        !prefill_proj(*w_idxq, x_b, g.n_embd, s.q_idx, g.idx_q_heads * g.idx_key_dim, T, stream, err,
+                      "indexer.q"))
+        return false;
+    // Split q/gate per token into qcur (contiguous first halves).
+    for (int64_t t = 0; t < T; ++t) {
+        if (!strata::gpu::copy2d_async(s.qcur + (size_t) t * NH * HD, (size_t) HD * 4,
+                                       s.q_full + (size_t) t * NH * 2 * HD, (size_t) HD * 2 * 4, (size_t) HD * 4,
+                                       (size_t) NH, stream)) {
+            err = "qsa prefill: the q/gate split failed";
+            return false;
+        }
+    }
+    try {
+        for (int64_t t = 0; t < T; ++t) {
+            const int64_t pos = pos0 + t;
+            if (pos < 0 || pos >= st.max_cells) {
+                err = "qsa prefill: position is outside the state's cells";
+                return false;
+            }
+            qsa_step_fill(st.host_step, pos, shapes);
+            for (int64_t h = 0; h < NH; ++h) st.host_pos[h] = (int32_t) pos;
+            int32_t* m_step = nullptr;
+            int32_t* m_pos = nullptr;
+            if (g_publish_kernel && strata::gpu::device_pointer((void**) &m_step, st.host_step) &&
+                strata::gpu::device_pointer((void**) &m_pos, st.host_pos)) {
+                copy_i32_from_mapped(st.step, m_step, kStepCount, stream);
+                copy_i32_from_mapped(st.pos_dev, m_pos, NH, stream);
+            } else if (!strata::gpu::copy_async(st.step, st.host_step, qsa_step_bytes(), stream) ||
+                       !strata::gpu::copy_async(st.pos_dev, st.host_pos, (size_t) NH * 4, stream)) {
+                err = "qsa prefill: the step-state upload failed";
+                return false;
+            }
+            float* k_t = s.kcur + (size_t) t * NKV * HD;
+            float* v_t = s.vcur + (size_t) t * NKV * HD;
+            float* q_t = s.qcur + (size_t) t * NH * HD;
+            float* qi_t = s.q_idx + (size_t) t * g.idx_q_heads * g.idx_key_dim;
+            auto norm_rope = [&](float* data, const WeightRef* norm, int rows, int cols) {
+                if (native_qsa_enabled())
+                    native_qsa_rms_norm_weighted(data, (const float*) norm->data, data, cols, rows, RMS_EPS, stream);
+                else
+                    rms_norm_weighted(data, (const float*) norm->data, rows, cols, RMS_EPS, stream);
+                if (native_rope_enabled())
+                    native_rope_apply(data, data, rows, cols, (int) shapes.n_rot, rope_scaling(), st.pos_dev, stream);
+                else
+                    rope_neox_apply(data, data, rows, cols, (int) shapes.n_rot, st.cos_tab, st.sin_tab, st.pos_dev,
+                                    stream);
+            };
+            norm_rope(k_t, w_kn, (int) NKV, (int) HD);
+            kv_append_step(st.k_pool, st.v_pool, st.page_table, st.step, k_t, v_t, shapes, stream, &st.host);
+            const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
+            if (native_qsa_indexer_enabled())
+                native_qsa_indexer_append(s.idx_raw + (size_t) t * g.idx_key_dim, st.step + kStepPos, 0,
+                                          (const float*) w_ikn->data, RMS_EPS, ib, shapes, st.max_cells,
+                                          rope_scaling(), stream);
+            else
+                indexer_key_append(s.idx_raw + (size_t) t * g.idx_key_dim, st.pos_dev, 0,
+                                   (const float*) w_ikn->data, RMS_EPS, ib, shapes, st.cos_tab, st.sin_tab,
+                                   stream);
+            norm_rope(q_t, w_qn, (int) NH, (int) HD);
+            norm_rope(qi_t, w_iqn, (int) g.idx_q_heads, (int) g.idx_key_dim);
+            if (g_fast_select) {
+                qsa_block_scores(st.idx_pooled, st.idx_dead, qi_t, st.step, 1, max_blocks, shapes, qb.cell_scores,
+                                 stream);
+                qsa_block_topk(qb.cell_scores, st.step, 1, max_blocks, cap, shapes, qb.ids, stream);
+            } else {
+                qsa_index_step(st.idx_pooled, qi_t, nullptr, shapes, st.step, max_blocks, qb.cell_scores, stream);
+                topk_512_step(qb.cell_scores, shapes, cap, st.step, qb.ids, stream);
+            }
+            qsa_kv_resolve(st, g, qb.ids, st.step, 1, cap, stream);
+            float* attn_t = s.attn + (size_t) t * NH * HD;
+            if (g_fast_attn && !native_flash_attn_short) {
+                const QsaAttnPools pools = qsa_attn_pools(st);
+                qsa_decode_attn_step(q_t, pools, qb.ids, st.step, cap, shapes, qb.attn_scratch, attn_t, stream);
+            } else {
+                kv_gather_step(st.k_pool, st.v_pool, st.page_table, qb.ids, st.step, cap, shapes, qb.k_scratch,
+                               qb.v_scratch, stream);
+                qsa_attend_step(q_t, qb.k_scratch, qb.v_scratch, st.step, cap, shapes, attn_t, nullptr, stream);
+            }
+            float* attn32_t = s.attn32 + (size_t) t * NH * HD;
+            if (native_qsa_enabled())
+                native_qsa_gate_apply(attn_t, s.q_full + (size_t) t * NH * 2 * HD, attn32_t, (int) NH, (int) HD,
+                                      stream);
+            else
+                qsa_gate_apply_f32(attn_t, s.q_full + (size_t) t * NH * 2 * HD, shapes, attn32_t, stream);
+        }
+    } catch (const std::exception& error) {
+        err = v.name("qsa_prefill") + ": " + error.what();
+        return false;
+    }
+    if (!prefill_proj(*w_attno, s.attn32, NH * HD, out_b, g.n_embd, T, stream, err, "attn_output")) return false;
+    return true;
+}
+
+bool moe_route_prefill(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k,
+                       const float* x_b, int64_t T, PrefillScratch& s, int32_t* ids_b, float* weights_b,
+                       void* stream, std::string& err) {
+    const LayerView v(tables, layer);
+    const WeightRef* w_router = v.get("ffn_gate_inp.weight");
+    if (w_router == nullptr) {
+        err = v.name("ffn_gate_inp.weight") + " is missing";
+        return false;
+    }
+    if (!prefill_proj(*w_router, x_b, g.n_embd, s.router_logits, g.n_expert, T, stream, err, "router"))
+        return false;
+    using namespace strata::kernels;
+    try {
+        if (native_router_enabled() && g.n_expert == 512 && k == 10)
+            native_router_top10_multi(s.router_logits, ids_b, weights_b, (int) T, stream);
+        else
+            router_top10(s.router_logits, (int) T, (int) g.n_expert, (int) k, ids_b, weights_b, stream);
+    } catch (const std::exception& error) {
+        err = v.name("router_prefill") + ": " + error.what();
+        return false;
+    }
+    return true;
+}
+
+bool moe_shared_prefill(const WeightTable& tables, const ModelGeometry& g, int64_t layer, const float* x_b,
+                        int64_t T, PrefillScratch& s, float* shared_b, void* stream, std::string& err) {
+    const LayerView v(tables, layer);
+    const WeightRef* w_ginp = v.get("ffn_gate_inp_shexp.weight");
+    const WeightRef* w_sgate = v.get("ffn_gate_shexp.weight");
+    const WeightRef* w_sup = v.get("ffn_up_shexp.weight");
+    const WeightRef* w_sdown = v.get("ffn_down_shexp.weight");
+    if (!w_ginp || !w_sgate || !w_sup || !w_sdown) {
+        err = v.name("shared_expert") + ": a shared tensor is missing";
+        return false;
+    }
+    if (!w_ginp->exl3 || !w_sgate->exl3 || !w_sup->exl3 || !w_sdown->exl3) {
+        err = v.name("shared_expert") + ": the batched path needs EXL3 shared projections";
+        return false;
+    }
+    using namespace strata::kernels;
+    const auto* gate_view = w_sgate->exl3->packed();
+    const auto* up_view = w_sup->exl3->packed();
+    const auto* down_view = w_sdown->exl3->packed();
+    const bool fused_tail = gate_view != nullptr && up_view != nullptr && down_view != nullptr &&
+                            g.n_ff % 128 == 0 && g.n_embd % 128 == 0 && exl3::exl3_fused_tail_enabled() &&
+                            exl3::exl3_fused_tail_supported(stream);
+    if (fused_tail) {
+        exl3::GemvOptions tail_stages{};
+        tail_stages.output_hadamard = false;
+        tail_stages.add_bias = false;
+        // The dual input transform takes the two owners' planes at rows == T.
+        float* gate_plane = nullptr;
+        float* up_plane = nullptr;
+        const bool dual = tail_stages.input_hadamard && gate_view->suh != nullptr && up_view->suh != nullptr &&
+                          g.n_embd % 128 == 0 &&
+                          w_sgate->exl3->input_scratch(stream, T, gate_plane, err) &&
+                          w_sup->exl3->input_scratch(stream, T, up_plane, err);
+        if (dual) {
+            exl3::GemvOptions dot_stages = tail_stages;
+            dot_stages.input_hadamard = false;
+            try {
+                exl3::exl3_input_hadamard_dual_fp32(*gate_view, *up_view, x_b, g.n_embd, gate_plane, up_plane, T,
+                                                    stream);
+            } catch (const std::exception& error) {
+                err = v.name("shared_expert") + ": " + error.what();
+                return false;
+            }
+            if (!w_sgate->exl3->run(gate_plane, g.n_embd, s.sh_gate, g.n_ff, T, stream, dot_stages, err) ||
+                !w_sup->exl3->run(up_plane, g.n_embd, s.sh_up, g.n_ff, T, stream, dot_stages, err))
+                return false;
+        } else {
+            err.clear();
+            if (!w_sgate->exl3->run(x_b, g.n_embd, s.sh_gate, g.n_ff, T, stream, tail_stages, err) ||
+                !w_sup->exl3->run(x_b, g.n_embd, s.sh_up, g.n_ff, T, stream, tail_stages, err))
+                return false;
+        }
+        try {
+            exl3::exl3_fused_swiglu_tail_fp32(*gate_view, *up_view, *down_view, s.sh_gate, s.sh_up, s.sh_gate, T,
+                                              stream);
+        } catch (const std::exception& error) {
+            err = v.name("shared_expert") + ": " + error.what();
+            return false;
+        }
+        exl3::GemvOptions down_stages{};
+        down_stages.input_hadamard = false;
+        if (!w_sdown->exl3->run(s.sh_gate, g.n_ff, shared_b, g.n_embd, T, stream, down_stages, err) ||
+            !w_ginp->exl3->run(x_b, g.n_embd, s.sh_scalar, 1, T, stream, err))
+            return false;
+        for (int64_t t = 0; t < T; ++t)
+            shared_expert_sigmoid_scale_fp32(shared_b + (size_t) t * g.n_embd, s.sh_scalar + (size_t) t, g.n_embd,
+                                             stream);
+        return true;
+    }
+    if (!w_sgate->exl3->run(x_b, g.n_embd, s.sh_gate, g.n_ff, T, stream, err) ||
+        !w_sup->exl3->run(x_b, g.n_embd, s.sh_up, g.n_ff, T, stream, err))
+        return false;
+    for (int64_t t = 0; t < T; ++t)
+        shared_expert_swiglu_fp32(s.sh_gate + (size_t) t * g.n_ff, s.sh_up + (size_t) t * g.n_ff, g.n_ff, stream);
+    if (!w_sdown->exl3->run(s.sh_gate, g.n_ff, shared_b, g.n_embd, T, stream, err) ||
+        !w_ginp->exl3->run(x_b, g.n_embd, s.sh_scalar, 1, T, stream, err))
+        return false;
+    for (int64_t t = 0; t < T; ++t)
+        shared_expert_sigmoid_scale_fp32(shared_b + (size_t) t * g.n_embd, s.sh_scalar + (size_t) t, g.n_embd,
+                                         stream);
+    return true;
+}
+
+void moe_combine_prefill(const ModelGeometry& g, int64_t k, const float* parts_b, const float* weights_b,
+                         const float* shared_b, float* out_b, int64_t T, void* stream) {
+    using namespace strata::kernels;
+    if (native_moe_combine_enabled()) {
+        native_moe_combine_multi(parts_b, weights_b, shared_b, out_b, g.n_embd, k, (int) T, stream);
+        return;
+    }
+    for (int64_t t = 0; t < T; ++t)
+        moe_combine(parts_b + (size_t) t * k * g.n_embd, weights_b + (size_t) t * k,
+                    shared_b + (size_t) t * g.n_embd, out_b + (size_t) t * g.n_embd, g.n_embd, k, stream);
+}
+
+bool block_layer_prefill_pre(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t pos0,
+                             const GdnBuffers& gb, QsaState& qst, const QsaBuffers& qb, int64_t k, float* R_b,
+                             float* mixed_b, float* block_out_b, float* inject_b, PrefillScratch& s,
+                             float* /*router_logits_unused*/, int32_t* ids_b, float* weights_b, float* shared_b,
+                             const PleRun* ple, const float* emb_b, int64_t T, void* stream, std::string& err) {
+    const LayerView v(tables, layer);
+    const strata::kernels::GrShapes gs{g.n_embd, g.hc, g.hc_lr};
+    const float* ple_hist = ple != nullptr ? ple->hist : nullptr;
+    // PLE at layer 1, in token order: the history advances once per token, as in the
+    // single-token path.  emb_b rows were staged by the caller (host gather + upload).
+    if (ple != nullptr && ple->ready() && layer == PLE_LAYER && emb_b != nullptr) {
+        if (ple->key_exl3 == nullptr || ple->value_exl3 == nullptr) {
+            err = "block_layer_prefill PLE: EXL3 key/value owners are required";
+            return false;
+        }
+        // Batched PLE projections over the chunk's gathered rows.  The owners write
+        // into per-token preprojection rows carved from the GR scratch (xn/gated are
+        // free until the GR read below overwrites them per token in order; the block
+        // consumes one token at a time, so the rows must survive until their token:
+        // use the dedicated batch buffers z/y as the preprojection store is wrong
+        // width, so run the projections token by token into the owner's own rows
+        // through the single-token buffers the caller bound (pre_key_out/pre_value_out
+        // are one row each).  The block runs immediately per token, in order.
+        for (int64_t t = 0; t < T; ++t) {
+            const float* emb_t = emb_b + (size_t) t * strata::kernels::NG_N_EMBD;
+            if (!ple->key_exl3->run(emb_t, strata::kernels::NG_N_EMBD, ple->pre_key_out,
+                                    strata::kernels::NG_HC_DIM, 1, stream, err) ||
+                !ple->value_exl3->run(emb_t, strata::kernels::NG_N_EMBD, ple->pre_value_out,
+                                      strata::kernels::NG_N_EMBD, 1, stream, err))
+                return false;
+            strata::kernels::PleWeights pw = ple->w;
+            pw.pre_key = ple->pre_key_out;
+            pw.pre_value = ple->pre_value_out;
+            strata::kernels::PleOut po;
+            po.normalized = (float*) ((uint8_t*) ple->scratch + strata::kernels::ple_block_scratch_bytes());
+            po.result = R_b + (size_t) t * g.hc * g.n_embd;
+            // ple_block reads hidden as the token's residual stack; R_b rows are
+            // contiguous per token, which is the single-token layout.
+            try {
+                strata::kernels::ple_block(emb_t, po.result, ple_hist, pw, po, ple->scratch, stream);
+            } catch (const std::exception& error) {
+                err = std::string("block_layer_prefill PLE: ") + error.what();
+                return false;
+            }
+            try {
+                strata::kernels::ple_history_advance(ple->hist, po.normalized, stream);
+            } catch (const std::exception& error) {
+                err = std::string("block_layer_prefill PLE history: ") + error.what();
+                return false;
+            }
+        }
+    }
+    const char* pre[2] = {"hc_attn_", "hc_ffn_"};
+    const WeightRef* w_norm[2];
+    const WeightRef* w_down[2];
+    const WeightRef* w_up[2];
+    const WeightRef* w_inject[2];
+    for (int h = 0; h < 2; ++h) {
+        w_norm[h] = v.get((std::string(pre[h]) + "norm.weight").c_str());
+        w_down[h] = v.get((std::string(pre[h]) + "down.weight").c_str());
+        w_up[h] = v.get((std::string(pre[h]) + "up.weight").c_str());
+        w_inject[h] = v.get((std::string(pre[h]) + "inject.weight").c_str());
+        if (!w_norm[h] || !w_down[h] || !w_up[h] || !w_inject[h]) {
+            err = v.name(pre[h]) + ": a hyper-connection tensor is missing";
+            return false;
+        }
+    }
+    // Attn half: GR read, mixer, GR write.
+    // The attn injection is consumed by this write, so it shares inject_b's storage
+    // only until the write; the FFN read then rewrites inject_b with its own.
+    if (!gr_read_exl3_batched(*w_norm[0], *w_down[0], *w_up[0], w_inject[0], R_b, T, gs, s, mixed_b, inject_b,
+                              stream, err))
+        return false;
+    if (is_qsa_layer(g, layer)) {
+        if (!qsa_layer_prefill(tables, g, layer, pos0, qst, qb, mixed_b, block_out_b, T, s, stream, err))
+            return false;
+    } else {
+        if (!gdn_layer_prefill(tables, g, layer, gb, mixed_b, block_out_b, T, s, stream, err)) return false;
+    }
+    strata::kernels::gr_write_multi(R_b, block_out_b, inject_b, gs, R_b, (int) T, stream);
+    // FFN half front: GR read into mixed_b, router, shared expert (early, as captured).
+    if (!gr_read_exl3_batched(*w_norm[1], *w_down[1], *w_up[1], w_inject[1], R_b, T, gs, s, mixed_b, inject_b,
+                              stream, err))
+        return false;
+    if (!moe_route_prefill(tables, g, layer, k, mixed_b, T, s, ids_b, weights_b, stream, err)) return false;
+    if (!moe_shared_prefill(tables, g, layer, mixed_b, T, s, shared_b, stream, err)) return false;
+    return true;
+}
+
+bool block_layer_prefill_post(const ModelGeometry& g, int64_t layer, int64_t k, const float* parts_b,
+                              const float* weights_b, const float* shared_b, float* R_b, const float* /*mixed_b*/,
+                              float* block_out_b, const float* inject_b, int64_t T, void* stream,
+                              std::string& err) {
+    (void) layer;
+    (void) err;
+    moe_combine_prefill(g, k, parts_b, weights_b, shared_b, block_out_b, T, stream);
+    const strata::kernels::GrShapes gs{g.n_embd, g.hc, g.hc_lr};
+    strata::kernels::gr_write_multi(R_b, block_out_b, inject_b, gs, R_b, (int) T, stream);
+    return true;
+}
+}  // namespace strata::core

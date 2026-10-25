@@ -150,6 +150,20 @@ int main() {
         !explicit_split_is_refused(48, 3, {24, -1, 25}, "a stage without a layer") ||
         !explicit_split_is_refused(48, 3, {24, 24}, "one count short of the stages"))
         return 1;
+    // Batched prefill chunking: full chunks, one short last chunk, and no chunk at
+    // all when the prompt runs token by token.
+    using strata::core::exl3_flash_prefill_chunk_sizes;
+    if (exl3_flash_prefill_chunk_sizes(2048, 256) != std::vector<int64_t>(8, 256) ||
+        exl3_flash_prefill_chunk_sizes(2050, 256) !=
+            std::vector<int64_t>({256, 256, 256, 256, 256, 256, 256, 256, 2}) ||
+        exl3_flash_prefill_chunk_sizes(3, 256) != std::vector<int64_t>({3}) ||
+        exl3_flash_prefill_chunk_sizes(1, 1) != std::vector<int64_t>({1}) ||
+        !exl3_flash_prefill_chunk_sizes(0, 256).empty() ||
+        !exl3_flash_prefill_chunk_sizes(10, 0).empty() ||
+        !exl3_flash_prefill_chunk_sizes(10, -1).empty()) {
+        std::cerr << "the prefill chunk sizes are wrong\n";
+        return 1;
+    }
     std::cout << "EXL3 Flash stage split checks: OK\n";
     return 0;
 }

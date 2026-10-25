@@ -212,14 +212,18 @@ strata --exl3 /path/to/qwen38-exl3 --tokens 16,10,16,28 --max-new 2 \
 ```
 
 この接続は既定で greedy の単 token AR を実行する。部分常駐時は CPU expert fallback を使う。
+正の `--prompt-chunk N` は prompt を N token の chunk で batched prefill として実行する: 密な射影は
+chunk の行全体への1回の行列積になり、GDN の回帰、QSA の K/V 追加と sparse attention、1層目の
+PLE 履歴と token 窓は chunk 内で token 順に進み、各層の routed expert は chunk 全体でまとめて計算する。
+prompt 後の状態は token 逐次 AR が残す状態と同じで、`--prompt-chunk 0` はその AR を保つ。
+batched prefill は既定の FP16 常駐 K/V 形式を必要とし、chunk 内の QSA 層は stream 順に自位置以前だけを読む。
 `--dump-logits FILE` は生成時の FP32 logits を保存し、`--stop-eos` または `--eos ID` で終了条件を指定する。
 `--spec 2` から `--spec 6` は MTP の serial draft loop を実行する（窓あたり最大 N-1 draft）。verify に通った draft だけを採用し、通らない
 window は snapshot から戻して AR で書き直すので、token 列と logits は AR と一致する。draft の expert は
 自前の device cache を持ち、全 draft expert が常駐する場合は embedding gather の後の draft 本体
 （norm、射影、block、常駐 expert flow、head）全体を 1 つの graph として replay する。常駐しない場合は
 CPU pool 経路に落ちる。trunk は全 expert 常駐の stage では token 全体を 1 つの graph として replay する
-（`STRATA_EXL3_TOKEN_GRAPH=0` で層ごとの起動に戻る）。vision、serve、batch と複数 token の
-prompt chunk は引き続き要求時に拒否する。Qwen3.5 の CLI/MTP 接続は次の経路を使う。
+（`STRATA_EXL3_TOKEN_GRAPH=0` で層ごとの起動に戻る）。vision、serve、batch は引き続き要求時に拒否する。Qwen3.5 の CLI/MTP 接続は次の経路を使う。
 
 `--spec-min-p P`（0〜1 の確率、既定 0）は draft loop を選択的にする。MTP head の下での
 softmax 確率が P 未満の draft の後は、その窓ではそれ以上 draft を提案しない（窓の最初の

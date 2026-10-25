@@ -670,4 +670,99 @@ bool block_layer_post(const WeightTable& tables, const ModelGeometry& g, int64_t
                       const MoEBuffers& mb, const BlockBuffers& bb, const float* parts, void* stream,
                       std::string& err);
 
+// ================================ BATCHED PREFILL (CHUNK) ================================
+//
+// The same block, T tokens at a time, for prompt processing.  Dense projections run as one
+// GEMM of T rows (Exl3Dense::run with rows == T); every stateful or per-token step (the GDN
+// conv and recurrence, the QSA K/V append and sparse attention, the PLE history) walks the
+// chunk's tokens in order on the same stream, so the state after the chunk is the state the
+// T single-token calls would have left.  The causal order is the stream order: a token's
+// K/V append precedes its own attention and every later token's attention.
+//
+// Scratch is caller-owned device memory, carved once for the largest chunk and reused for
+// every layer.  All batch buffers are row-major with the token as the slow index.
+
+/// Per-layer batched scratch.  Widths come from ModelGeometry at carve time.
+struct PrefillScratch {
+    float* xn = nullptr;       ///< GR: (T, hc*n_embd)
+    float* lo = nullptr;       ///< GR: (T, hc_lr)
+    float* gated = nullptr;    ///< GR: (T, hc*n_embd)
+    float* qkv = nullptr;      ///< GDN: (T, ssm_conv_channels)
+    float* h = nullptr;        ///< GDN: (T, ssm_conv_channels)
+    float* alpha = nullptr;    ///< GDN: (T, ssm_v_heads)
+    float* beta = nullptr;     ///< GDN: (T, ssm_v_heads)
+    float* gate = nullptr;     ///< GDN: (T, ssm_v_heads)
+    float* o = nullptr;        ///< GDN: (T, ssm_v_heads*ssm_state_size)
+    float* z = nullptr;        ///< GDN/shared: (T, ssm_value_dim) / (T, n_ff) reuse by phase
+    float* y = nullptr;        ///< GDN: (T, ssm_value_dim)
+    float* q_full = nullptr;   ///< QSA: (T, n_head*2*head_dim)
+    float* qcur = nullptr;     ///< QSA: (T, n_head*head_dim)
+    float* kcur = nullptr;     ///< QSA: (T, n_head_kv*head_dim)
+    float* vcur = nullptr;     ///< QSA: (T, n_head_kv*head_dim)
+    float* idx_raw = nullptr;  ///< QSA: (T, idx_key_dim)
+    float* q_idx = nullptr;    ///< QSA: (T, idx_q_heads*idx_key_dim)
+    float* attn = nullptr;     ///< QSA: (T, n_head*head_dim)
+    float* attn32 = nullptr;   ///< QSA: (T, n_head*head_dim)
+    float* sh_gate = nullptr;  ///< MoE shared: (T, n_ff)
+    float* sh_up = nullptr;    ///< MoE shared: (T, n_ff)
+    float* sh_scalar = nullptr;  ///< MoE shared: (T,)
+    float* router_logits = nullptr;  ///< MoE: (T, n_expert)
+};
+
+/// Bytes for `s` at chunk size `T` (16-byte aligned regions), or 0 on overflow.
+uint64_t prefill_scratch_bytes(const ModelGeometry& g, int64_t T);
+/// Carves `base` (device memory) into `s` for chunk size `T`.  Returns the bytes used.
+uint64_t prefill_scratch_init(const ModelGeometry& g, int64_t T, void* base, PrefillScratch& s);
+
+/// Batched hyper-connection read (EXL3 owners only, as gr_read_exl3).  R_b is
+/// (T, hc, n_embd); mixed_b is (T, n_embd); inject_b is (T, hc) or null.
+bool gr_read_exl3_batched(const WeightRef& norm, const WeightRef& down, const WeightRef& up,
+                          const WeightRef* inject, const float* R_b, int64_t T,
+                          const strata::kernels::GrShapes& shapes, PrefillScratch& s, float* mixed_b,
+                          float* inject_b, void* stream, std::string& err);
+
+/// Batched GDN mixer.  `gb` supplies the per-layer recurrent/conv state (pointed at the
+/// layer by the caller); its single-token scratch fields are used as per-token temporaries.
+bool gdn_layer_prefill(const WeightTable& tables, const ModelGeometry& g, int64_t layer,
+                       const GdnBuffers& gb, const float* mixed_b, float* out_b, int64_t T,
+                       PrefillScratch& s, void* stream, std::string& err);
+
+/// Batched QSA mixer for the default FP16, fully resident K/V form.  `qst` is the layer's
+/// state (its step/pos staging is rewritten per token, in order); `qb` supplies the
+/// single-token selection/gather scratch, reused per token.
+bool qsa_layer_prefill(const WeightTable& tables, const ModelGeometry& g, int64_t layer,
+                       int64_t pos0, QsaState& qst, const QsaBuffers& qb, const float* x_b,
+                       float* out_b, int64_t T, PrefillScratch& s, void* stream, std::string& err);
+
+/// Batched router: logits, top-k ids and weights for T rows.  ids_b is (T, k) int32,
+/// weights_b is (T, k).
+bool moe_route_prefill(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k,
+                       const float* x_b, int64_t T, PrefillScratch& s, int32_t* ids_b, float* weights_b,
+                       void* stream, std::string& err);
+
+/// Batched shared expert (EXL3 owners) into shared_b (T, n_embd).
+bool moe_shared_prefill(const WeightTable& tables, const ModelGeometry& g, int64_t layer,
+                        const float* x_b, int64_t T, PrefillScratch& s, float* shared_b, void* stream,
+                        std::string& err);
+
+/// Batched combine: parts_b is (T, k, n_embd) in router order; out_b is (T, n_embd).
+void moe_combine_prefill(const ModelGeometry& g, int64_t k, const float* parts_b, const float* weights_b,
+                         const float* shared_b, float* out_b, int64_t T, void* stream);
+
+/// The prefill block halves.  `pre` leaves mixed_b holding the FFN half's normed rows and
+/// inject_b the FFN injection, exactly as block_layer_pre leaves bb.mixed/bb.inject;
+/// `post` consumes them with this layer's parts_b.  R_b/mixed_b/block_out_b are (T, ...)
+/// batch buffers; `ple`/`emb_b` handle layer 1's PLE (emb_b is (T, NG_N_EMBD), staged by
+/// the caller; null skips the PLE, as in the single-token path).
+bool block_layer_prefill_pre(const WeightTable& tables, const ModelGeometry& g, int64_t layer,
+                             int64_t pos0, const GdnBuffers& gb, QsaState& qst, const QsaBuffers& qb,
+                             int64_t k, float* R_b, float* mixed_b, float* block_out_b, float* inject_b,
+                             PrefillScratch& s, float* router_logits_unused, int32_t* ids_b,
+                             float* weights_b, float* shared_b, const PleRun* ple, const float* emb_b,
+                             int64_t T, void* stream, std::string& err);
+bool block_layer_prefill_post(const ModelGeometry& g, int64_t layer, int64_t k, const float* parts_b,
+                              const float* weights_b, const float* shared_b, float* R_b,
+                              const float* mixed_b, float* block_out_b, const float* inject_b, int64_t T,
+                              void* stream, std::string& err);
+
 }  // namespace strata::core

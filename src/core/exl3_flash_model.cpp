@@ -574,6 +574,17 @@ Exl3FlashStageRange exl3_flash_stage_range(int64_t layer_count, int64_t stage_co
     return range;
 }
 
+std::vector<int64_t> exl3_flash_prefill_chunk_sizes(int64_t n, int64_t chunk) {
+    std::vector<int64_t> sizes;
+    if (n <= 0 || chunk <= 0) return sizes;
+    for (int64_t left = n; left > 0;) {
+        const int64_t take = std::min(chunk, left);
+        sizes.push_back(take);
+        left -= take;
+    }
+    return sizes;
+}
+
 bool exl3_flash_stage_ranges(int64_t layer_count, int64_t stage_count, const std::vector<int64_t>& counts,
                              std::vector<Exl3FlashStageRange>& ranges, std::string& err) {
     ranges.clear();
@@ -702,6 +713,26 @@ struct Exl3FlashModel::Impl {
         // sequence), captured where the cache is fully resident: one launch per token per stage
         // instead of three per layer.  Null where the stage is not fully resident.
         strata::gpu::Graph* token_graph = nullptr;
+        // Batched prefill (prompt_chunk > 0): one arena carved into the chunk's
+        // batch buffers and per-layer scratch, plus host staging for the expert
+        // window.  Null when the prompt runs token by token.
+        void* prefill_arena = nullptr;
+        size_t prefill_arena_bytes = 0;
+        PrefillScratch prefill_scratch;
+        float* pf_R = nullptr;
+        float* pf_mixed = nullptr;
+        float* pf_block_out = nullptr;
+        float* pf_inject = nullptr;
+        float* pf_shared = nullptr;
+        float* pf_parts = nullptr;
+        float* pf_emb = nullptr;
+        float* pf_ids = nullptr;
+        float* pf_weights = nullptr;
+        std::vector<float> pf_host_x;
+        std::vector<int32_t> pf_host_ids;
+        std::vector<float> pf_host_weights;
+        std::vector<float> pf_miss;
+        std::vector<float> pf_merge;
     };
 
     Exl3FlashModelOptions options;
@@ -798,8 +829,12 @@ bool Exl3FlashModel::open(const std::filesystem::path& directory, const Exl3Flas
             err = "EXL3 Flash: pool_workers must be nonnegative";
             return false;
         }
-        if (options.max_rows != 1) {
-            err = "EXL3 Flash: the initial coordinator accepts exactly one autoregressive row";
+        if (options.max_rows < 1) {
+            err = "EXL3 Flash: max_rows must be positive";
+            return false;
+        }
+        if (options.prompt_chunk < 0) {
+            err = "EXL3 Flash: prompt_chunk must be nonnegative (0: token by token)";
             return false;
         }
         if (options.stage_devices.empty()) {
@@ -976,7 +1011,7 @@ bool Exl3FlashModel::open(const std::filesystem::path& directory, const Exl3Flas
             weight_options.layer_end = current.layer_end;
             weight_options.include_head = current.layer_end == layer_count;
             weight_options.include_final_hc = current.layer_end == layer_count;
-            weight_options.max_rows = options.max_rows;
+            weight_options.max_rows = std::max<int64_t>(options.max_rows, options.prompt_chunk);
             if (!current.weights->load(*impl_->archive, impl_->map, current.table, weight_options, err)) {
                 err = "EXL3 Flash: stage " + std::to_string(stage_index) + " dense weights: " + err;
                 return false;
@@ -1016,7 +1051,8 @@ bool Exl3FlashModel::open(const std::filesystem::path& directory, const Exl3Flas
         impl_->ple_device = impl_->stages[static_cast<size_t>(ple_owner_stage_index)].device;
         {
             const OnDevice on(impl_->ple_device);
-            if (!impl_->ple->load(*impl_->archive, impl_->map, impl_->ple_device, options.max_rows, err)) {
+            if (!impl_->ple->load(*impl_->archive, impl_->map, impl_->ple_device,
+                                  std::max<int64_t>(options.max_rows, options.prompt_chunk), err)) {
                 err = "EXL3 Flash: PLE projection owner: " + err;
                 return false;
             }
@@ -1071,6 +1107,60 @@ bool Exl3FlashModel::open(const std::filesystem::path& directory, const Exl3Flas
             if (stage_index == 0) {
                 impl_->embedding->gather_one(0, stage.embedding_device, nullptr);
                 session_zero(stage.session, impl_->geometry, stage.embedding_device, nullptr);
+            }
+        }
+        // Batched prefill buffers, sized by the open-time chunk (the existing
+        // --prompt-chunk option体系; no device-name or model-name constant).
+        // Allocated before the device cache so the cache plans around them.
+        if (options.prompt_chunk > 0) {
+            const int64_t Tcap = options.prompt_chunk;
+            const int64_t N = impl_->geometry.n_embd, HC = impl_->geometry.hc;
+            const uint64_t scratch_bytes = prefill_scratch_bytes(impl_->geometry, Tcap);
+            if (scratch_bytes == 0) {
+                err = "EXL3 Flash: prefill scratch sizing failed";
+                return false;
+            }
+            auto aligned = [](uint64_t v) { return (v + 15) & ~(uint64_t) 15; };
+            const uint64_t batch_bytes =
+                aligned((uint64_t) Tcap * HC * N * 4) + aligned((uint64_t) Tcap * N * 4) +
+                aligned((uint64_t) Tcap * N * 4) + aligned((uint64_t) Tcap * HC * 4) +
+                aligned((uint64_t) Tcap * N * 4) +
+                aligned((uint64_t) Tcap * (uint64_t) routed_k * N * 4) +
+                aligned((uint64_t) Tcap * (uint64_t) strata::kernels::NG_N_EMBD * 4) +
+                aligned((uint64_t) Tcap * (uint64_t) routed_k * 4) +
+                aligned((uint64_t) Tcap * (uint64_t) routed_k * 4);
+            for (size_t stage_index = 0; stage_index < impl_->stages.size(); ++stage_index) {
+                auto& stage = impl_->stages[stage_index];
+                const OnDevice on(stage.device);
+                stage.prefill_arena_bytes = static_cast<size_t>(scratch_bytes + batch_bytes);
+                stage.prefill_arena = strata::gpu::alloc_device(stage.prefill_arena_bytes);
+                if (stage.prefill_arena == nullptr) {
+                    err = "EXL3 Flash: stage " + std::to_string(stage_index) +
+                          " prefill buffer allocation failed";
+                    return false;
+                }
+                uint8_t* base = static_cast<uint8_t*>(stage.prefill_arena);
+                prefill_scratch_init(impl_->geometry, Tcap, base, stage.prefill_scratch);
+                uint8_t* p = base + scratch_bytes;
+                auto take = [&](uint64_t bytes) {
+                    float* r = reinterpret_cast<float*>(p);
+                    p += aligned(bytes);
+                    return r;
+                };
+                stage.pf_R = take((uint64_t) Tcap * HC * N * 4);
+                stage.pf_mixed = take((uint64_t) Tcap * N * 4);
+                stage.pf_block_out = take((uint64_t) Tcap * N * 4);
+                stage.pf_inject = take((uint64_t) Tcap * HC * 4);
+                stage.pf_shared = take((uint64_t) Tcap * N * 4);
+                stage.pf_parts = take((uint64_t) Tcap * (uint64_t) routed_k * N * 4);
+                stage.pf_emb = take((uint64_t) Tcap * (uint64_t) strata::kernels::NG_N_EMBD * 4);
+                stage.pf_ids = take((uint64_t) Tcap * (uint64_t) routed_k * 4);
+                stage.pf_weights = take((uint64_t) Tcap * (uint64_t) routed_k * 4);
+                stage.pf_host_x.assign((size_t) Tcap * N, 0.0f);
+                stage.pf_host_ids.assign((size_t) Tcap * routed_k, 0);
+                stage.pf_host_weights.assign((size_t) Tcap * routed_k, 0.0f);
+                stage.pf_miss.assign((size_t) Tcap * routed_k * N, 0.0f);
+                stage.pf_merge.assign((size_t) Tcap * routed_k * N, 0.0f);
             }
         }
         // THE RESIDUAL'S PATH ACROSS EACH BOUNDARY, FROM A REAL COPY.  It is probed with the
@@ -1293,7 +1383,7 @@ bool Exl3FlashModel::open(const std::filesystem::path& directory, const Exl3Flas
                     if (!open_device_cache(*impl_->mtp_source, *impl_->mtp_pool, *impl_->mtp_runtime,
                                            impl_->stages.size(), 0, 1, impl_->geometry.n_expert,
                                            impl_->geometry.n_layers, options.max_rows, routed_k,
-                                           options.allow_cpu_expert_miss, err)) {
+                                           options.allow_cpu_expert_miss, "", false, false, err)) {
                         err = "EXL3 Flash MTP expert runtime: " + err;
                         return false;
                     }
@@ -1443,7 +1533,7 @@ bool Exl3FlashModel::open(const std::filesystem::path& directory, const Exl3Flas
             const OnDevice on(stage.device);
             if (!open_device_cache(*stage.source, *stage.pool, *stage.runtime, stage_index,
                                    stage.layer_begin, stage.layer_end, impl_->geometry.n_expert,
-                                   impl_->geometry.n_layers, options.max_rows, routed_k,
+                                   impl_->geometry.n_layers, std::max<int64_t>(options.max_rows, options.prompt_chunk), routed_k,
                                    options.allow_cpu_expert_miss, options.expert_profile,
                                    options.expert_miss_direct, !options.expert_profile_save.empty(), err)) {
                 return false;
@@ -1613,6 +1703,11 @@ bool Exl3FlashModel::close(std::string& err) noexcept {
             if (stage.embedding_device != nullptr) strata::gpu::free(stage.embedding_device);
             if (stage.parts_device != nullptr) strata::gpu::free(stage.parts_device);
             if (stage.session_arena != nullptr) strata::gpu::free(stage.session_arena);
+            if (stage.prefill_arena != nullptr) strata::gpu::free(stage.prefill_arena);
+            stage.prefill_arena = nullptr;
+            stage.prefill_arena_bytes = 0;
+            stage.pf_R = stage.pf_mixed = stage.pf_block_out = stage.pf_inject = stage.pf_shared = nullptr;
+            stage.pf_parts = stage.pf_emb = stage.pf_ids = stage.pf_weights = nullptr;
             stage.embedding_device = nullptr;
             stage.parts_device = nullptr;
             stage.session_arena = nullptr;
@@ -2229,6 +2324,238 @@ bool Exl3FlashModel::forward(int32_t token, int64_t pos, int32_t& next_token, fl
         return true;
     } catch (const std::exception& e) {
         err = std::string("EXL3 Flash: forward: ") + e.what();
+        return false;
+    }
+}
+
+bool Exl3FlashModel::forward_prefill(const int32_t* tokens, int64_t n, int64_t pos0, int32_t& next_token,
+                                     float* host_logits, std::string& err) {
+    err.clear();
+    next_token = -1;
+    if (!loaded()) { err = "EXL3 Flash: model is not open"; return false; }
+    if (impl_->options.prompt_chunk <= 0) {
+        err = "EXL3 Flash: batched prefill needs prompt_chunk > 0 at open()";
+        return false;
+    }
+    if (tokens == nullptr || n <= 0) { err = "EXL3 Flash: prefill needs a nonempty token list"; return false; }
+    if (!impl_->initialized && !reset(err)) return false;
+    if (pos0 != impl_->next_position) {
+        err = "EXL3 Flash: prefill position " + std::to_string(pos0) +
+              " does not follow reset/previous forward at " + std::to_string(impl_->next_position);
+        return false;
+    }
+    if (pos0 < 0 || n > impl_->options.max_cells - pos0) {
+        err = "EXL3 Flash: prefill runs past the configured max_cells";
+        return false;
+    }
+    for (int64_t i = 0; i < n; ++i)
+        if (tokens[i] < 0 || static_cast<int64_t>(tokens[i]) >= impl_->map.geometry.vocab_size) {
+            err = "EXL3 Flash: prefill token is outside the embedding vocabulary";
+            return false;
+        }
+    PleTicketGuard ple_guard;
+    try {
+        const int64_t N = impl_->geometry.n_embd, HC = impl_->geometry.hc;
+        const int64_t K = impl_->options.routed_k;
+        auto& ple_stage = impl_->stages[static_cast<size_t>(impl_->ple_stage_index)];
+        const auto chunks = exl3_flash_prefill_chunk_sizes(n, impl_->options.prompt_chunk);
+        int64_t done = 0;
+        for (const int64_t T : chunks) {
+            const int64_t chunk_pos = pos0 + done;
+            // Stage this chunk's PLE rows on the home stage (host gather per token,
+            // in order; the device history advances later inside layer 1).
+            if (ple_stage.session.ple.table != nullptr) {
+                const OnDevice on_ple(ple_stage.device);
+                for (int64_t t = 0; t < T; ++t) {
+                    impl_->ple_token = tokens[done + t];
+                    if (!ple_issue_token(ple_stage.session.ple, err)) {
+                        err = "EXL3 Flash prefill: PLE token staging: " + err;
+                        return false;
+                    }
+                    ple_guard.arm(ple_stage.session.ple.table, ple_stage.session.ple.emb_host);
+                    if (!ple_finish_token(ple_stage.session.ple, nullptr, err)) {
+                        err = "EXL3 Flash prefill: PLE token staging: " + err;
+                        return false;
+                    }
+                    ple_guard.disarm();
+                    if (!strata::gpu::copy_async(ple_stage.pf_emb + (size_t) t * strata::kernels::NG_N_EMBD,
+                                                 ple_stage.session.ple.emb_dev,
+                                                 (size_t) strata::kernels::NG_N_EMBD * sizeof(float), nullptr)) {
+                        err = "EXL3 Flash prefill: PLE row staging failed";
+                        return false;
+                    }
+                    impl_->ple_prev[0] = impl_->ple_prev[1];
+                    impl_->ple_prev[1] = tokens[done + t];
+                }
+                if (!strata::gpu::stream_sync(nullptr)) {
+                    err = "EXL3 Flash prefill: PLE staging sync failed";
+                    return false;
+                }
+            }
+            for (size_t stage_index = 0; stage_index < impl_->stages.size(); ++stage_index) {
+                auto& stage = impl_->stages[stage_index];
+                const OnDevice on(stage.device);
+                if (stage_index == 0) {
+                    // Embeddings broadcast to every residual stream, per token.
+                    for (int64_t t = 0; t < T; ++t) {
+                        impl_->embedding->gather_one(tokens[done + t], stage.embedding_device, nullptr);
+                        for (int64_t sIdx = 0; sIdx < HC; ++sIdx)
+                            if (!strata::gpu::copy_async(
+                                    stage.pf_R + (size_t) t * HC * N + (size_t) sIdx * N, stage.embedding_device,
+                                    (size_t) N * sizeof(float), nullptr)) {
+                                err = "EXL3 Flash prefill: embedding broadcast failed";
+                                return false;
+                            }
+                    }
+                    impl_->seeded = true;
+                } else {
+                    // The previous stage's handover already placed this chunk's
+                    // residual in pf_R (direct copy, or per-token host bridge).
+                    if (!strata::gpu::event_sync(impl_->cross_event)) {
+                        err = "EXL3 Flash prefill: stage boundary wait failed";
+                        return false;
+                    }
+                }
+                for (int64_t layer = stage.layer_begin; layer < stage.layer_end; ++layer) {
+                    point_gdn(impl_->geometry, layer, stage.session);
+                    QsaState& qsa = qsa_for(impl_->geometry, layer, stage.session);
+                    const PleRun* ple_ptr = nullptr;
+                    const float* emb_ptr = nullptr;
+                    if (layer == PLE_LAYER && static_cast<int>(stage_index) == impl_->ple_stage_index &&
+                        ple_stage.session.ple.table != nullptr) {
+                        ple_ptr = &ple_stage.session.ple;
+                        emb_ptr = ple_stage.pf_emb;
+                    }
+                    if (!block_layer_prefill_pre(stage.table, impl_->geometry, layer, chunk_pos, stage.session.gdn,
+                                                 qsa, stage.session.qsa_bufs, K, stage.pf_R, stage.pf_mixed,
+                                                 stage.pf_block_out, stage.pf_inject, stage.prefill_scratch,
+                                                 nullptr, reinterpret_cast<int32_t*>(stage.pf_ids),
+                                                 stage.pf_weights, stage.pf_shared, ple_ptr, emb_ptr, T, nullptr,
+                                                 err)) {
+                        err = "EXL3 Flash prefill layer " + std::to_string(layer) + ": " + err;
+                        return false;
+                    }
+                    // Experts over the whole chunk: grouped by expert per layer.
+                    if (stage.runtime->fully_resident()) {
+                        sycl::event done_ev;
+                        if (!stage.runtime->enqueue_device_hit(
+                                Runtime::at(stage.device).stream(nullptr), layer,
+                                static_cast<const float*>(stage.pf_mixed),
+                                reinterpret_cast<const int32_t*>(stage.pf_ids), T, stage.pf_parts, N, done_ev,
+                                {}, err) ||
+                            !stage.runtime->wait_gpu(done_ev, err)) {
+                            err = "EXL3 Flash prefill experts layer " + std::to_string(layer) + ": " + err;
+                            return false;
+                        }
+                    } else {
+                        if (!strata::gpu::stream_sync(nullptr) ||
+                            !strata::gpu::copy(stage.pf_host_x.data(), stage.pf_mixed,
+                                               (size_t) T * N * sizeof(float)) ||
+                            !strata::gpu::copy(stage.pf_host_ids.data(), stage.pf_ids,
+                                               (size_t) T * K * sizeof(int32_t)) ||
+                            !strata::gpu::copy(stage.pf_host_weights.data(), stage.pf_weights,
+                                               (size_t) T * K * sizeof(float))) {
+                            err = "EXL3 Flash prefill: expert window readback failed";
+                            return false;
+                        }
+                        if (!strata::gpu::memset_async(stage.pf_parts, 0, (size_t) T * K * N * sizeof(float),
+                                                       nullptr)) {
+                            err = "EXL3 Flash prefill: clearing expert output failed";
+                            return false;
+                        }
+                        sycl::event expert_done;
+                        {
+                            sycl::queue& queue = Runtime::at(stage.device).stream(nullptr);
+                            if (!stage.runtime->prepare_window(layer, stage.pf_host_x.data(), N,
+                                                               stage.pf_host_ids.data(), T, stage.pf_miss.data(),
+                                                               N, err) ||
+                                !stage.runtime->enqueue_hit_only(queue, static_cast<const float*>(stage.pf_mixed),
+                                                                 N, stage.pf_parts, N, expert_done, {}, err) ||
+                                !stage.runtime->run_cpu(err) ||
+                                !stage.runtime->wait_gpu(expert_done, err)) {
+                                err = "EXL3 Flash prefill experts layer " + std::to_string(layer) + ": " + err;
+                                return false;
+                            }
+                        }
+                        if (!strata::gpu::copy(stage.pf_merge.data(), stage.pf_parts,
+                                               (size_t) T * K * N * sizeof(float))) {
+                            err = "EXL3 Flash prefill: expert merge download failed";
+                            return false;
+                        }
+                        for (size_t i = 0; i < (size_t) T * K * N; ++i) stage.pf_merge[i] += stage.pf_miss[i];
+                        if (!strata::gpu::copy_async(stage.pf_parts, stage.pf_merge.data(),
+                                                     (size_t) T * K * N * sizeof(float), nullptr)) {
+                            err = "EXL3 Flash prefill: expert merge upload failed";
+                            return false;
+                        }
+                    }
+                    // Weights for the combine were downloaded for the host window;
+                    // the device combine needs them on device: pf_weights already
+                    // holds them (router wrote them there), so post reads it.
+                    if (!block_layer_prefill_post(impl_->geometry, layer, K, stage.pf_parts, stage.pf_weights,
+                                                  stage.pf_shared, stage.pf_R, stage.pf_mixed, stage.pf_block_out,
+                                                  stage.pf_inject, T, nullptr, err)) {
+                        err = "EXL3 Flash prefill post layer " + std::to_string(layer) + ": " + err;
+                        return false;
+                    }
+                }
+                if (stage_index + 1 < impl_->stages.size()) {
+                    const size_t bytes = (size_t) T * HC * N * sizeof(float);
+                    bool sent = false;
+                    if (impl_->residual_direct[stage_index]) {
+                        sent = strata::gpu::copy_async(impl_->stages[stage_index + 1].pf_R, stage.pf_R, bytes,
+                                                       nullptr);
+                    } else if (bytes <= impl_->bridge_host.size() * sizeof(float)) {
+                        sent = strata::gpu::copy_async(impl_->bridge_host.data(), stage.pf_R, bytes, nullptr);
+                    } else {
+                        // Host bridge per token (bridge_host holds one residual).
+                        sent = true;
+                        for (int64_t t = 0; t < T && sent; ++t) {
+                            if (!strata::gpu::copy(impl_->bridge_host.data(),
+                                                   stage.pf_R + (size_t) t * HC * N,
+                                                   impl_->bridge_host.size() * sizeof(float)) ||
+                                !strata::gpu::copy_async(impl_->stages[stage_index + 1].pf_R +
+                                                             (size_t) t * HC * N,
+                                                         impl_->bridge_host.data(),
+                                                         impl_->bridge_host.size() * sizeof(float), nullptr))
+                                sent = false;
+                        }
+                    }
+                    if (!sent || !strata::gpu::event_record(impl_->cross_event, nullptr)) {
+                        err = "EXL3 Flash prefill: stage boundary handover failed";
+                        return false;
+                    }
+                }
+            }
+            done += T;
+        }
+        // Head over the last token's residual (last stage, last chunk row).
+        auto& last = impl_->stages.back();
+        const OnDevice on_last(last.device);
+        BlockBuffers bb = last.session.block;
+        bb.R = last.pf_R + (size_t) (chunks.back() - 1) * HC * N;
+        bb.mixed = last.pf_mixed;
+        if (!lm_head(last.table, impl_->geometry, bb, static_cast<float*>(impl_->logits_device), nullptr, err) ||
+            !strata::gpu::stream_sync(nullptr) ||
+            !strata::gpu::copy(impl_->logits_host.data(), impl_->logits_device,
+                               impl_->logits_host.size() * sizeof(float))) {
+            err = "EXL3 Flash prefill: output head: " + (err.empty() ? strata::gpu::last_error() : err);
+            return false;
+        }
+        double best = -std::numeric_limits<double>::infinity();
+        for (size_t i = 0; i < impl_->logits_host.size(); ++i) {
+            const double value = impl_->logits_host[i];
+            if (std::isfinite(value) && value > best) {
+                best = value;
+                next_token = static_cast<int32_t>(i);
+            }
+        }
+        if (next_token < 0) { err = "EXL3 Flash prefill: output logits are all non-finite"; return false; }
+        if (host_logits != nullptr) std::copy(impl_->logits_host.begin(), impl_->logits_host.end(), host_logits);
+        impl_->next_position = pos0 + n;
+        return true;
+    } catch (const std::exception& e) {
+        err = std::string("EXL3 Flash prefill: ") + e.what();
         return false;
     }
 }

@@ -145,7 +145,7 @@ void usage() {
                  "  --spec-min-p P      stop a window's draft chain after a draft whose softmax probability is below P\n"
                  "                      (0..1, default 0: never stop early; the first draft is always proposed)\n"
                  "  --max-t 1           single-token AR only\n"
-                 "  --prompt-chunk 0    prompt chunks are not supported\n");
+                 "  --prompt-chunk N    batched prefill chunk size (0: token by token, default)\n");
 }
 
 bool read_metadata_eos(const std::string& path, std::vector<int32_t>& eos) {
@@ -196,6 +196,7 @@ int exl3_flash_main(int argc, char** argv) {
     bool stop_eos = false;
     int spec = 0, pool_workers = 0;
     double spec_min_p = 0.0;
+    int64_t prompt_chunk = 0;
     bool prompt_seen = false, eos_explicit = false;
     for (int i = 1; i < argc; ++i) {
         const std::string argument = argv[i];
@@ -319,9 +320,8 @@ int exl3_flash_main(int argc, char** argv) {
             }
         } else if (argument == "--max-t1" || argument == "--prompt-chunk0") {
         } else if (argument == "--prompt-chunk") {
-            int64_t value = 0;
-            if (!parse_i64(next("--prompt-chunk"), value) || value != 0) {
-                std::fprintf(stderr, "strata exl3-flash: only --prompt-chunk 0 is supported\n");
+            if (!parse_i64(next("--prompt-chunk"), prompt_chunk) || prompt_chunk < 0) {
+                std::fprintf(stderr, "strata exl3-flash: --prompt-chunk must be a nonnegative int64\n");
                 return 2;
             }
         } else if (argument == "--serve" || argument == "--batch" || argument == "--vision" || argument == "--mtp") {
@@ -370,6 +370,7 @@ int exl3_flash_main(int argc, char** argv) {
     options.stage_layers = stage_layers;
     options.pool_workers = pool_workers;
     options.max_cells = context;
+    options.prompt_chunk = prompt_chunk;
     options.include_mtp = (spec >= 2);
     options.expert_profile = expert_profile;
     options.expert_profile_save = expert_profile_save;
@@ -401,11 +402,19 @@ int exl3_flash_main(int argc, char** argv) {
     }
     int32_t next_token = -1;
     const Clock::time_point prompt_begin = Clock::now();
-    for (size_t position = 0; position < prompt.size(); ++position) {
-        if (!model.forward(prompt[position], static_cast<int64_t>(position), next_token,
-                           dump_path.empty() ? nullptr : logits.data(), err)) {
-            std::fprintf(stderr, "strata exl3-flash: prompt position %zu: %s\n", position, err.c_str());
+    if (prompt_chunk > 0) {
+        if (!model.forward_prefill(prompt.data(), static_cast<int64_t>(prompt.size()), 0, next_token,
+                                   dump_path.empty() ? nullptr : logits.data(), err)) {
+            std::fprintf(stderr, "strata exl3-flash: prompt prefill: %s\n", err.c_str());
             return 1;
+        }
+    } else {
+        for (size_t position = 0; position < prompt.size(); ++position) {
+            if (!model.forward(prompt[position], static_cast<int64_t>(position), next_token,
+                               dump_path.empty() ? nullptr : logits.data(), err)) {
+                std::fprintf(stderr, "strata exl3-flash: prompt position %zu: %s\n", position, err.c_str());
+                return 1;
+            }
         }
     }
     const Clock::time_point prompt_end = Clock::now();
