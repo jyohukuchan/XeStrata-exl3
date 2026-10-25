@@ -48,6 +48,7 @@ struct Exl3FlashModelOptions {
     int64_t max_rows = 1;                 ///< persistent projection/expert row capacity
     int64_t max_cells = 0;                ///< 0: config.max_position_embeddings
     int64_t routed_k = 0;                 ///< 0: text_config.num_experts_per_tok
+    int64_t prompt_chunk = 0;             ///< 0: prompt runs token by token; >0: batched prefill chunk size
     bool include_mtp = false;             ///< bind the archive MTP map (draft/verify loop still AR-only)
     bool vision = false;                  ///< currently rejected
     bool allow_cpu_expert_miss = true;    ///< misses use Exl3ExpertSource + ExpertPool
@@ -107,6 +108,11 @@ struct Exl3FlashSnapshot {
 /// The range of stage `stage_index` of `stage_count` over `layer_count` layers.  The split is the
 /// same for every layer count and stage count, and it is the only place the split is written down.
 Exl3FlashStageRange exl3_flash_stage_range(int64_t layer_count, int64_t stage_count, int64_t stage_index);
+
+/// The chunk sizes of a batched prefill of `n` tokens at chunk size `chunk`: full chunks
+/// first, then one short last chunk when `n` is not a multiple.  Empty when either is
+/// nonpositive (the caller then runs the prompt token by token).
+std::vector<int64_t> exl3_flash_prefill_chunk_sizes(int64_t n, int64_t chunk);
 
 /// The stage ranges of one split: every stage's layers, contiguous and in order.
 ///
@@ -175,6 +181,14 @@ public:
     /// exact expert merge, post graph, final EXL3 head, and host argmax.
     /// `host_logits` may be null; argmax is still computed internally.
     bool forward(int32_t token, int64_t pos, int32_t& next_token, float* host_logits, std::string& err);
+    /// Run `n` prompt tokens at positions pos0 .. pos0+n-1 in chunks of the open-time
+    /// prompt_chunk size: dense projections batched per chunk, stateful steps in token
+    /// order, experts grouped per layer over the chunk.  Leaves the state the `n`
+    /// single-token forwards would have left; `next_token`/`host_logits` are the last
+    /// token's.  Requires prompt_chunk > 0 at open(); otherwise fails closed so the
+    /// caller runs forward() per token.
+    bool forward_prefill(const int32_t* tokens, int64_t n, int64_t pos0, int32_t& next_token,
+                         float* host_logits, std::string& err);
 
     bool validate_token_request(int64_t n_tokens, int64_t batch, std::string& err) const;
 
