@@ -1008,4 +1008,34 @@ sycl::event exl3_reconstruct(sycl::queue& queue, const MatrixView& view, uint16_
     return submit_reconstruct<false>(queue, view, out, deps);
 }
 
+sycl::event exl3_input_hadamard_rows(sycl::queue& queue, const MatrixView& view, const float* x, int64_t ldx,
+                                     float* transformed, int64_t rows, const std::vector<sycl::event>& deps) {
+    if (view.suh == nullptr || view.k % 128 != 0)
+        throw std::invalid_argument("exl3_input_hadamard_rows: suh and k % 128 == 0 are required");
+    return submit_input_hadamard_rows(queue, view, x, ldx, transformed, rows, deps);
+}
+
+sycl::event exl3_output_hadamard_rows(sycl::queue& queue, const MatrixView& view, const float* dot, float* y,
+                                      int64_t ldy, int64_t rows, bool add_bias,
+                                      const std::vector<sycl::event>& deps) {
+    if (view.svh == nullptr || view.n % 128 != 0)
+        throw std::invalid_argument("exl3_output_hadamard_rows: svh and n % 128 == 0 are required");
+    return submit_output_hadamard_rows(queue, view, dot, y, ldy, rows, deps, add_bias);
+}
+
+sycl::event exl3_transpose_f16(sycl::queue& queue, const uint16_t* in, uint16_t* out, int64_t k, int64_t n,
+                               const std::vector<sycl::event>& deps) {
+    if (in == nullptr || out == nullptr || k <= 0 || n <= 0)
+        throw std::invalid_argument("exl3_transpose_f16: bad matrix");
+    return queue.submit([&](sycl::handler& h) {
+        if (!deps.empty()) h.depends_on(deps);
+        h.parallel_for(sycl::range<1>((size_t) k * (size_t) n), [=](sycl::id<1> id) {
+            const size_t flat = (size_t) id[0];
+            const int64_t r = (int64_t) (flat / (size_t) n);
+            const int64_t c = (int64_t) (flat % (size_t) n);
+            out[(size_t) c * (size_t) k + (size_t) r] = in[flat];
+        });
+    });
+}
+
 }  // namespace strata::kernels::exl3
