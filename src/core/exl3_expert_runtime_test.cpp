@@ -290,6 +290,36 @@ int main() {
         if (stream != nullptr) strata::gpu::stream_destroy(stream);
         restore_resident_shards();
 
+        // Direct miss mode: the GPU reads the non-resident expert from pinned host memory and computes
+        // it itself, so the merged rows match the CPU-miss run and no entry is left to the CPU pool.
+        // Heat recording counts every routed entry for the profile a later run ranks with.
+        {
+            strata::core::Exl3ExpertRuntime direct;
+            direct.set_miss_mode(strata::core::Exl3ExpertRuntime::MissMode::Direct);
+            direct.set_record_heat(true);
+            std::vector<float> direct_cpu(expected.size(), 24680.5f), direct_gpu(expected.size(), 24680.5f);
+            float* d_direct_gpu = device.upload(direct_gpu);
+            sycl::event direct_done;
+            if (!direct.open(source, pool, max_tokens, k, {{0, 0}, {1, 0}}, err) ||
+                !direct.prepare_window(0, x.data(), ldx, ids, max_tokens, direct_cpu.data(), ldy, err) ||
+                !direct.enqueue_hit_only(queue, d_x, ldx, d_direct_gpu, ldy, direct_done, {}, err) ||
+                !direct.run_cpu(err) || !direct.wait_gpu(direct_done, err)) {
+                std::fprintf(stderr, "direct miss runtime failed: %s\n", err.c_str());
+                ++failures;
+            } else {
+                strata::parity::copy_out(direct_gpu.data(), d_direct_gpu, direct_gpu.size());
+                if (!compare_merged(direct_cpu, direct_gpu, expected, max_tokens * k, ldy, hidden,
+                                    "direct-read miss merge"))
+                    ++failures;
+                if (!direct.direct_ready() || direct.total_hit_entries() != 2 ||
+                    direct.total_cpu_miss_entries() != 0 || direct.total_direct_miss_entries() != 2 ||
+                    direct.heat().size() != 4 || direct.heat()[0] != 2 || direct.heat()[1] != 2) {
+                    std::fprintf(stderr, "direct miss counters/heat are wrong\n");
+                    ++failures;
+                }
+            }
+        }
+
         // The all-resident graph reads device IDs on every replay, without a host plan update.
         strata::core::Exl3ExpertRuntime resident;
         if (!resident.open(source, pool, max_tokens, k, {{0, 0}, {0, 1}, {1, 0}, {1, 1}}, err) ||

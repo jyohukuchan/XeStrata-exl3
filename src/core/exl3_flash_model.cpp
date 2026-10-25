@@ -282,7 +282,11 @@ DeviceCachePlan plan_device_cache(const Exl3ExpertSource& source, int64_t layer_
 /// because the run's numbers depend on it (the prepare detail's miss count).
 bool open_device_cache(Exl3ExpertSource& source, strata::kernels::cpu::ExpertPool& pool, Exl3ExpertRuntime& runtime,
                        size_t stage_index, int64_t layer_begin, int64_t layer_end, int64_t n_expert,
-                       int64_t n_layers, int64_t max_rows, int64_t routed_k, bool allow_cpu_miss, std::string& err) {
+                       int64_t n_layers, int64_t max_rows, int64_t routed_k, bool allow_cpu_miss,
+                       const std::string& profile_path, bool miss_direct, bool record_heat, std::string& err) {
+    runtime.set_miss_mode(miss_direct ? Exl3ExpertRuntime::MissMode::Direct
+                                      : Exl3ExpertRuntime::MissMode::Cpu);
+    runtime.set_record_heat(record_heat);
     const auto no_cache = [&](const char* why) {
         if (!allow_cpu_miss) {
             err = "EXL3 Flash: stage " + std::to_string(stage_index) + " expert runtime: the device cache is " +
@@ -303,9 +307,12 @@ bool open_device_cache(Exl3ExpertSource& source, strata::kernels::cpu::ExpertPoo
     if (!strata::gpu::mem_info(&free_b, &total_b))
         return no_cache("the device does not report its free memory");
     CacheOrder order = device_cache_order();
+    // An explicit profile (the --expert-profile option) selects the profile order on its own; the
+    // environment pair stays the fallback for runs that do not pass the option.
+    if (!profile_path.empty()) order = CacheOrder::Profile;
     std::vector<std::pair<int32_t, int32_t>> ranked;
     if (order == CacheOrder::Profile) {
-        const std::string path = device_cache_profile_path();
+        const std::string path = profile_path.empty() ? device_cache_profile_path() : profile_path;
         std::string profile_error;
         int64_t slots = 0;
         if (path.empty() || !read_expert_profile(path, n_layers, n_expert, ranked, slots, profile_error)) {
@@ -1437,7 +1444,8 @@ bool Exl3FlashModel::open(const std::filesystem::path& directory, const Exl3Flas
             if (!open_device_cache(*stage.source, *stage.pool, *stage.runtime, stage_index,
                                    stage.layer_begin, stage.layer_end, impl_->geometry.n_expert,
                                    impl_->geometry.n_layers, options.max_rows, routed_k,
-                                   options.allow_cpu_expert_miss, err)) {
+                                   options.allow_cpu_expert_miss, options.expert_profile,
+                                   options.expert_miss_direct, !options.expert_profile_save.empty(), err)) {
                 return false;
             }
         }
@@ -2235,6 +2243,42 @@ bool Exl3FlashModel::validate_token_request(int64_t n_tokens, int64_t batch, std
 }
 
 bool Exl3FlashModel::loaded() const { return impl_ != nullptr && impl_->opened; }
+
+Exl3FlashModel::ExpertCacheStats Exl3FlashModel::expert_cache_stats() const {
+    ExpertCacheStats stats;
+    if (!loaded()) return stats;
+    for (const auto& stage : impl_->stages) {
+        if (stage.runtime == nullptr) continue;
+        stats.hit_entries += stage.runtime->total_hit_entries();
+        stats.cpu_miss_entries += stage.runtime->total_cpu_miss_entries();
+        stats.direct_miss_entries += stage.runtime->total_direct_miss_entries();
+        stats.resident_pairs += stage.runtime->cache().resident();
+    }
+    return stats;
+}
+
+bool Exl3FlashModel::save_expert_profile(const std::string& path, std::string& err) const {
+    err.clear();
+    if (!loaded()) { err = "EXL3 Flash: model is not open"; return false; }
+    const int64_t layers = impl_->geometry.n_layers;
+    const int64_t experts = impl_->geometry.n_expert;
+    if (layers <= 0 || experts <= 0) { err = "EXL3 Flash: model geometry is invalid"; return false; }
+    std::vector<double> heat(static_cast<size_t>(layers) * static_cast<size_t>(experts), 0.0);
+    bool recorded = false;
+    for (const auto& stage : impl_->stages) {
+        if (stage.runtime == nullptr || stage.runtime->heat().empty()) continue;
+        recorded = true;
+        const auto& stage_heat = stage.runtime->heat();
+        const size_t count = std::min(heat.size(), stage_heat.size());
+        for (size_t i = 0; i < count; ++i) heat[i] += static_cast<double>(stage_heat[i]);
+    }
+    if (!recorded) {
+        err = "EXL3 Flash: no expert firing frequencies were recorded (expert_profile_save was not set)";
+        return false;
+    }
+    const auto ranked = rank_learned_profile(layers, experts, {}, heat, {});
+    return write_expert_profile(path, layers, experts, ranked, err);
+}
 size_t Exl3FlashModel::stage_count() const { return impl_ == nullptr ? 0 : impl_->stages.size(); }
 
 Exl3FlashStageView Exl3FlashModel::stage(size_t index) const {

@@ -84,6 +84,12 @@ struct Exl3FlashModelOptions {
     bool include_mtp = false;             ///< bind the archive MTP map (draft/verify loop still AR-only)
     bool vision = false;                  ///< currently rejected
     bool allow_cpu_expert_miss = true;    ///< misses use Exl3ExpertSource + ExpertPool
+    std::string expert_profile;            ///< empty: STRATA_EXL3_DEVICE_CACHE_PROFILE / spread order;
+                                           ///< a path ranks the device cache's resident set by firing frequency
+    std::string expert_profile_save;       ///< empty: no recording; a path records this run's routed-entry
+                                           ///< counts and saves them as a profile for the next run
+    bool expert_miss_direct = false;       ///< misses are read by the GPU from pinned host memory over
+                                           ///< the bus instead of being computed on the CPU
     std::string embedding_name;            ///< empty: ModelMap's HF embedding prefix
     std::string ple_sidecar;              ///< empty: discover the specialized EXL3 sidecar
 };
@@ -214,6 +220,20 @@ public:
     bool validate_token_request(int64_t n_tokens, int64_t batch, std::string& err) const;
 
     bool loaded() const;
+
+    /// Routed-entry counts summed over the stages, for the run report: resident hits, misses computed
+    /// on the CPU and misses the GPU read directly from pinned host memory, plus the resident pair count.
+    struct ExpertCacheStats {
+        int64_t hit_entries = 0;
+        int64_t cpu_miss_entries = 0;
+        int64_t direct_miss_entries = 0;
+        int64_t resident_pairs = 0;
+    };
+    ExpertCacheStats expert_cache_stats() const;
+    /// Writes the firing frequencies recorded this run (options.expert_profile_save) as a profile file
+    /// ranking every (layer, expert) pair, hottest first.  False with `err` when nothing was recorded.
+    bool save_expert_profile(const std::string& path, std::string& err) const;
+
     size_t stage_count() const;
     Exl3FlashStageView stage(size_t index) const;
     const strata::ModelSpec& spec() const;

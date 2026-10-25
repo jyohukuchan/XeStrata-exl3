@@ -135,6 +135,12 @@ void usage() {
                  "  --eos-ids LIST      replace EOS IDs and enable stopping\n"
                  "  --metadata-gguf P   optional GGUF metadata/tokenizer EOS source\n"
                  "  --dump-logits PATH  write FP32 logits rows for generated choices\n"
+                 "  --expert-profile P  rank the device cache's resident experts by this firing-frequency profile\n"
+                 "                      (STRP format, as --expert-profile-save writes); without it the spread order is used\n"
+                 "  --expert-profile-save P\n"
+                 "                      record this run's expert firing frequencies and save them to P as a profile\n"
+                 "  --expert-miss M     cpu (default): non-resident experts are computed on the CPU; direct: the GPU\n"
+                 "                      reads non-resident experts from pinned host memory over the bus\n"
                  "  --spec 0..6         2..6 run the serial MTP draft loop with up to N-1 drafts per window; 0|1 stay plain AR\n"
                  "  --spec-min-p P      stop a window's draft chain after a draft whose softmax probability is below P\n"
                  "                      (0..1, default 0: never stop early; the first draft is always proposed)\n"
@@ -184,6 +190,8 @@ int exl3_flash_main(int argc, char** argv) {
     std::vector<int64_t> stage_layers;
     std::vector<int32_t> eos = config_eos;
     std::string metadata_gguf, dump_path;
+    std::string expert_profile, expert_profile_save;
+    bool expert_miss_direct = false;
     int64_t max_new = 16, context = 0;
     bool stop_eos = false;
     int spec = 0, pool_workers = 0;
@@ -271,6 +279,17 @@ int exl3_flash_main(int argc, char** argv) {
             eos_explicit = true;
             stop_eos = true;
         } else if (argument == "--metadata-gguf") metadata_gguf = next("--metadata-gguf");
+        else if (argument == "--expert-profile") expert_profile = next("--expert-profile");
+        else if (argument == "--expert-profile-save") expert_profile_save = next("--expert-profile-save");
+        else if (argument == "--expert-miss") {
+            const std::string mode = next("--expert-miss");
+            if (mode == "cpu") expert_miss_direct = false;
+            else if (mode == "direct") expert_miss_direct = true;
+            else {
+                std::fprintf(stderr, "strata exl3-flash: --expert-miss accepts cpu or direct\n");
+                return 2;
+            }
+        }
         else if (argument == "--dump-logits") dump_path = next("--dump-logits");
         else if (argument == "--spec0") spec = 0;
         else if (argument == "--spec1") spec = 1;
@@ -352,6 +371,9 @@ int exl3_flash_main(int argc, char** argv) {
     options.pool_workers = pool_workers;
     options.max_cells = context;
     options.include_mtp = (spec >= 2);
+    options.expert_profile = expert_profile;
+    options.expert_profile_save = expert_profile_save;
+    options.expert_miss_direct = expert_miss_direct;
     options.vision = false;
     std::string err;
     const Clock::time_point load_begin = Clock::now();
@@ -504,6 +526,26 @@ int exl3_flash_main(int argc, char** argv) {
                      spec_drafted == 0 ? 0.0 : 100.0 * static_cast<double>(spec_accepted) / static_cast<double>(spec_drafted));
     if (use_spec && spec_min_p > 0.0)
         std::fprintf(stderr, "strata (qwen4exp-exl3): spec-min-p %.3f cut %zu windows\n", spec_min_p, spec_cut);
+    {
+        const auto cache = model.expert_cache_stats();
+        const int64_t routed = cache.hit_entries + cache.cpu_miss_entries + cache.direct_miss_entries;
+        std::fprintf(stderr,
+                     "strata (qwen4exp-exl3): expert cache: %lld resident, %lld routed entries, %lld hits "
+                     "(%.2f%%), %lld cpu misses, %lld direct misses, miss mode %s\n",
+                     (long long) cache.resident_pairs, (long long) routed, (long long) cache.hit_entries,
+                     routed > 0 ? 100.0 * static_cast<double>(cache.hit_entries) / static_cast<double>(routed) : 0.0,
+                     (long long) cache.cpu_miss_entries, (long long) cache.direct_miss_entries,
+                     expert_miss_direct ? "direct" : "cpu");
+        if (!expert_profile_save.empty()) {
+            std::string save_err;
+            if (!model.save_expert_profile(expert_profile_save, save_err)) {
+                std::fprintf(stderr, "strata exl3-flash: --expert-profile-save: %s\n", save_err.c_str());
+                return 1;
+            }
+            std::fprintf(stderr, "strata (qwen4exp-exl3): expert profile saved to %s\n",
+                         expert_profile_save.c_str());
+        }
+    }
     return 0;
 }
 
