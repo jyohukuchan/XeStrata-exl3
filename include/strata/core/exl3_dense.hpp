@@ -103,6 +103,17 @@ public:
     bool raw() const { return raw_; }
     strata::kernels::raw::DType raw_dtype() const { return raw_view_.dtype; }
 
+    /// The FP16 GEMM prefill product of this packed projection: the same transform stages as
+    /// `run` (input/output Hadamard and bias, per `options`), with the dot itself run as an FP16
+    /// product (strata/prefill/gemm.hpp) over weights dequantized once by `exl3_reconstruct` and
+    /// cached transposed as W[N, K].  False (with `err`) when this owner cannot take the path
+    /// (a raw owner, a bias the output transform would not add, unaligned strides); the caller
+    /// then keeps `run`.  Requires tight strides (`ldx == k`, `ldy == n`).
+    bool run_fp16_gemm(const float* x, int64_t ldx, float* y, int64_t ldy, int64_t rows, void* stream,
+                       const strata::kernels::exl3::GemvOptions& options, std::string& err);
+    /// Whether the FP16 weights are already cached (the one-time dequant has run).
+    bool fp16_ready() const { return fp16_w_ != nullptr; }
+
 private:
     struct StreamScratch {
         const void* queue = nullptr;
@@ -120,6 +131,10 @@ private:
     void* bias_ = nullptr;
     void* raw_weights_ = nullptr;
     void* raw_bias_ = nullptr;
+    void* fp16_w_ = nullptr;    ///< cached dequantized weights, FP16 W[N, K] (run_fp16_gemm)
+    void* fp16_x_ = nullptr;    ///< FP16 activations, max_rows_ * k halves
+    float* fp16_xh_ = nullptr;  ///< FP32 transform/product rows, max_rows_ * (k + n)
+    bool fp16_failed_ = false;  ///< the one-time dequant failed; do not retry every chunk
     size_t scratch_elements_ = 0;
     int64_t max_rows_ = 0;
     Runtime* runtime_ = nullptr;

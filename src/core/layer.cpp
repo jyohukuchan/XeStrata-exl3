@@ -47,6 +47,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <vector>
 namespace strata::core {
 namespace { bool g_shared_early = true; bool g_fused_gr = false; bool g_fast_attn = true; bool g_publish_kernel = true; bool g_fused_gdn = true; bool g_fast_select = true; }
@@ -1730,13 +1731,67 @@ if (!block_layer_pre(tables, g, layer, pos, pos_base, gb, qst, qb, mb, k, bb, st
 namespace strata::core {
 // ================================ BATCHED PREFILL ================================
 namespace {
+/// STRATA_EXL3_PREFILL_FP16=1: a batched dense product through the FP16 GEMM path
+/// (Exl3Dense::run_fp16_gemm); unset (the default) every product keeps the packed path.
+/// An owner that cannot take the FP16 path falls back to it, with the reason printed once.
+bool prefill_fp16_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_EXL3_PREFILL_FP16");
+        return v != nullptr && v[0] != '0';
+    }();
+    return on;
+}
+bool prefill_dense_run(Exl3Dense& owner, const float* x, int64_t ldx, float* y, int64_t ldy, int64_t rows,
+                       void* stream, const strata::kernels::exl3::GemvOptions& options, std::string& err) {
+    if (prefill_fp16_enabled() && rows > 1) {
+        std::string ferr;
+        if (owner.run_fp16_gemm(x, ldx, y, ldy, rows, stream, options, ferr)) {
+            static const bool check = std::getenv("STRATA_EXL3_PREFILL_FP16_CHECK") != nullptr;
+            if (check) {
+                // Diagnostic: run the packed product into scratch and compare (packed result wins).
+                const int64_t n_out = owner.packed() != nullptr ? owner.packed()->n : ldy;
+                float* ref = static_cast<float*>(strata::gpu::alloc_device((size_t) rows * ldy * sizeof(float)));
+                std::string rerr;
+                if (ref != nullptr && owner.run(x, ldx, ref, ldy, rows, stream, options, rerr)) {
+                    std::vector<float> a((size_t) rows * ldy), b((size_t) rows * ldy);
+                    strata::gpu::stream_sync(stream);
+                    strata::gpu::copy(a.data(), y, a.size() * sizeof(float));
+                    strata::gpu::copy(b.data(), ref, b.size() * sizeof(float));
+                    double mx = 0; size_t bad = 0;
+                    for (size_t i = 0; i < a.size(); ++i) {
+                        const double d = std::fabs((double) a[i] - (double) b[i]);
+                        if (d > mx) mx = d;
+                        if (d > 0.05) ++bad;
+                    }
+                    std::fprintf(stderr, "fp16check k=%lld n=%lld rows=%lld max=%.4f bad=%zu/%zu\n",
+                                 (long long) (owner.packed() ? owner.packed()->k : ldx), (long long) n_out,
+                                 (long long) rows, mx, bad, a.size());
+                    std::string cerr;
+                    strata::gpu::copy_async(y, ref, a.size() * sizeof(float), stream);
+                }
+                strata::gpu::free(ref);
+            }
+            return true;
+        }
+        static std::once_flag once;
+        std::call_once(once, [&] {
+            std::fprintf(stderr, "strata: EXL3 prefill FP16 GEMM unavailable (%s); packed products\n",
+                         ferr.c_str());
+        });
+    }
+    return owner.run(x, ldx, y, ldy, rows, stream, options, err);
+}
+bool prefill_dense_run(Exl3Dense& owner, const float* x, int64_t ldx, float* y, int64_t ldy, int64_t rows,
+                       void* stream, std::string& err) {
+    return prefill_dense_run(owner, x, ldx, y, ldy, rows, stream, strata::kernels::exl3::GemvOptions{}, err);
+}
 bool prefill_proj(const WeightRef& w, const float* x_b, int64_t n_in, float* y_b, int64_t n_out, int64_t T,
                   void* stream, std::string& err, const char* what) {
     if (w.exl3 == nullptr) {
         err = std::string("prefill: ") + what + " has no EXL3 owner; the batched path needs EXL3 projections";
         return false;
     }
-    return w.exl3->run(x_b, n_in, y_b, n_out, T, stream, err);
+    return prefill_dense_run(*w.exl3, x_b, n_in, y_b, n_out, T, stream, err);
 }
 }  // namespace
 
@@ -1823,15 +1878,15 @@ bool gr_read_exl3_batched(const WeightRef& norm, const WeightRef& down, const We
             strata::kernels::native_gr_rms_norm_weighted(R_b + (size_t) t * dim, (const float*) norm.data,
                                                          s.xn + (size_t) t * dim, (int) n, (int) hc, RMS_EPS,
                                                          stream);
-        if (!down.exl3->run(s.xn, dim, s.lo, lr, T, stream, err)) return false;
+        if (!prefill_dense_run(*down.exl3, s.xn, dim, s.lo, lr, T, stream, err)) return false;
         for (int64_t t = 0; t < T; ++t)
             strata::kernels::native_gr_down_silu(s.lo + (size_t) t * lr, (int) lr, (int) hc, stream);
-        if (!up.exl3->run(s.lo, lr, s.gated, dim, T, stream, err)) return false;
+        if (!prefill_dense_run(*up.exl3, s.lo, lr, s.gated, dim, T, stream, err)) return false;
         for (int64_t t = 0; t < T; ++t)
             strata::kernels::native_gr_pre_gated(s.xn + (size_t) t * dim, s.gated + (size_t) t * dim,
                                                  mixed_b + (size_t) t * n, (int) n, (int) hc,
                                                  inject != nullptr, stream);
-        if (inject != nullptr && !inject->exl3->run(s.xn, dim, inject_b, hc, T, stream, err)) return false;
+        if (inject != nullptr && !prefill_dense_run(*inject->exl3, s.xn, dim, inject_b, hc, T, stream, err)) return false;
     } catch (const std::exception& error) {
         err = std::string("prefill GR: ") + error.what();
         return false;
@@ -1879,7 +1934,7 @@ bool gdn_layer_prefill(const WeightTable& tables, const ModelGeometry& g, int64_
         exl3::GemvOptions tail_stages{};
         tail_stages.output_hadamard = false;
         tail_stages.add_bias = false;
-        if (!w_gate->exl3->run(mixed_b, g.n_embd, s.z, V, T, stream, tail_stages, err)) return false;
+        if (!prefill_dense_run(*w_gate->exl3, mixed_b, g.n_embd, s.z, V, T, stream, tail_stages, err)) return false;
     } else {
         if (!prefill_proj(*w_gate, mixed_b, g.n_embd, s.z, V, T, stream, err, "attn_gate")) return false;
     }
@@ -1922,7 +1977,7 @@ bool gdn_layer_prefill(const WeightTable& tables, const ModelGeometry& g, int64_
             }
             exl3::GemvOptions out_stages{};
             out_stages.input_hadamard = false;
-            if (!w_out->exl3->run(s.y, V, out_b, g.n_embd, T, stream, out_stages, err)) return false;
+            if (!prefill_dense_run(*w_out->exl3, s.y, V, out_b, g.n_embd, T, stream, out_stages, err)) return false;
             return true;
         }
         for (int64_t t = 0; t < T; ++t) {
@@ -2147,13 +2202,13 @@ bool moe_shared_prefill(const WeightTable& tables, const ModelGeometry& g, int64
                 err = v.name("shared_expert") + ": " + error.what();
                 return false;
             }
-            if (!w_sgate->exl3->run(gate_plane, g.n_embd, s.sh_gate, g.n_ff, T, stream, dot_stages, err) ||
-                !w_sup->exl3->run(up_plane, g.n_embd, s.sh_up, g.n_ff, T, stream, dot_stages, err))
+            if (!prefill_dense_run(*w_sgate->exl3, gate_plane, g.n_embd, s.sh_gate, g.n_ff, T, stream, dot_stages, err) ||
+                !prefill_dense_run(*w_sup->exl3, up_plane, g.n_embd, s.sh_up, g.n_ff, T, stream, dot_stages, err))
                 return false;
         } else {
             err.clear();
-            if (!w_sgate->exl3->run(x_b, g.n_embd, s.sh_gate, g.n_ff, T, stream, tail_stages, err) ||
-                !w_sup->exl3->run(x_b, g.n_embd, s.sh_up, g.n_ff, T, stream, tail_stages, err))
+            if (!prefill_dense_run(*w_sgate->exl3, x_b, g.n_embd, s.sh_gate, g.n_ff, T, stream, tail_stages, err) ||
+                !prefill_dense_run(*w_sup->exl3, x_b, g.n_embd, s.sh_up, g.n_ff, T, stream, tail_stages, err))
                 return false;
         }
         try {
@@ -2165,21 +2220,21 @@ bool moe_shared_prefill(const WeightTable& tables, const ModelGeometry& g, int64
         }
         exl3::GemvOptions down_stages{};
         down_stages.input_hadamard = false;
-        if (!w_sdown->exl3->run(s.sh_gate, g.n_ff, shared_b, g.n_embd, T, stream, down_stages, err) ||
-            !w_ginp->exl3->run(x_b, g.n_embd, s.sh_scalar, 1, T, stream, err))
+        if (!prefill_dense_run(*w_sdown->exl3, s.sh_gate, g.n_ff, shared_b, g.n_embd, T, stream, down_stages, err) ||
+            !prefill_dense_run(*w_ginp->exl3, x_b, g.n_embd, s.sh_scalar, 1, T, stream, err))
             return false;
         for (int64_t t = 0; t < T; ++t)
             shared_expert_sigmoid_scale_fp32(shared_b + (size_t) t * g.n_embd, s.sh_scalar + (size_t) t, g.n_embd,
                                              stream);
         return true;
     }
-    if (!w_sgate->exl3->run(x_b, g.n_embd, s.sh_gate, g.n_ff, T, stream, err) ||
-        !w_sup->exl3->run(x_b, g.n_embd, s.sh_up, g.n_ff, T, stream, err))
+    if (!prefill_dense_run(*w_sgate->exl3, x_b, g.n_embd, s.sh_gate, g.n_ff, T, stream, err) ||
+        !prefill_dense_run(*w_sup->exl3, x_b, g.n_embd, s.sh_up, g.n_ff, T, stream, err))
         return false;
     for (int64_t t = 0; t < T; ++t)
         shared_expert_swiglu_fp32(s.sh_gate + (size_t) t * g.n_ff, s.sh_up + (size_t) t * g.n_ff, g.n_ff, stream);
-    if (!w_sdown->exl3->run(s.sh_gate, g.n_ff, shared_b, g.n_embd, T, stream, err) ||
-        !w_ginp->exl3->run(x_b, g.n_embd, s.sh_scalar, 1, T, stream, err))
+    if (!prefill_dense_run(*w_sdown->exl3, s.sh_gate, g.n_ff, shared_b, g.n_embd, T, stream, err) ||
+        !prefill_dense_run(*w_ginp->exl3, x_b, g.n_embd, s.sh_scalar, 1, T, stream, err))
         return false;
     for (int64_t t = 0; t < T; ++t)
         shared_expert_sigmoid_scale_fp32(shared_b + (size_t) t * g.n_embd, s.sh_scalar + (size_t) t, g.n_embd,
@@ -2224,9 +2279,9 @@ bool block_layer_prefill_pre(const WeightTable& tables, const ModelGeometry& g, 
         // are one row each).  The block runs immediately per token, in order.
         for (int64_t t = 0; t < T; ++t) {
             const float* emb_t = emb_b + (size_t) t * strata::kernels::NG_N_EMBD;
-            if (!ple->key_exl3->run(emb_t, strata::kernels::NG_N_EMBD, ple->pre_key_out,
+            if (!prefill_dense_run(*ple->key_exl3, emb_t, strata::kernels::NG_N_EMBD, ple->pre_key_out,
                                     strata::kernels::NG_HC_DIM, 1, stream, err) ||
-                !ple->value_exl3->run(emb_t, strata::kernels::NG_N_EMBD, ple->pre_value_out,
+                !prefill_dense_run(*ple->value_exl3, emb_t, strata::kernels::NG_N_EMBD, ple->pre_value_out,
                                       strata::kernels::NG_N_EMBD, 1, stream, err))
                 return false;
             strata::kernels::PleWeights pw = ple->w;

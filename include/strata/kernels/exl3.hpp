@@ -73,4 +73,24 @@ sycl::event exl3_gemm_fp32(sycl::queue& queue, const MatrixView& view, const flo
                            GemvOptions options = {}, const std::vector<sycl::event>& deps = {},
                            GemvProfile* profile = nullptr);
 
+/// The input-basis transform of `exl3_gemm_fp32` alone, for callers that run their own product
+/// (the FP16 GEMM prefill path): writes `rows` transformed rows of width `view.k` (tight stride)
+/// from `x` (row stride `ldx`).  Requires `view.suh != nullptr` and `view.k % 128 == 0`.
+sycl::event exl3_input_hadamard_rows(sycl::queue& queue, const MatrixView& view, const float* x, int64_t ldx,
+                                     float* transformed, int64_t rows,
+                                     const std::vector<sycl::event>& deps = {});
+
+/// The output-basis transform of `exl3_gemm_fp32` alone (see above): reads `rows` dot rows of
+/// width `view.n` (tight stride) from `dot`, writes `y` (row stride `ldy`), adding the bias when
+/// `add_bias`.  Requires `view.svh != nullptr` and `view.n % 128 == 0`.
+sycl::event exl3_output_hadamard_rows(sycl::queue& queue, const MatrixView& view, const float* dot, float* y,
+                                      int64_t ldy, int64_t rows, bool add_bias,
+                                      const std::vector<sycl::event>& deps = {});
+
+/// Transposes an FP16 matrix: `out[n, k]` (row-major) from `in[k, n]` (row-major), bits unchanged.
+/// Used once per projection to lay reconstructed weights out as the FP16 GEMM path reads them
+/// (W[N, K], see strata/prefill/gemm.hpp).
+sycl::event exl3_transpose_f16(sycl::queue& queue, const uint16_t* in, uint16_t* out, int64_t k, int64_t n,
+                               const std::vector<sycl::event>& deps = {});
+
 }  // namespace strata::kernels::exl3
