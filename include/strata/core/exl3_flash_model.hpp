@@ -11,9 +11,11 @@
 
 #include <sycl/sycl.hpp>
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -27,6 +29,37 @@ class PleTable;
 }
 
 namespace strata::core {
+
+/// Softmax probability of `draft` under one row of `logits` (the draft
+/// token's confidence).  Non-finite logits carry no probability mass; a
+/// draft outside the row, or whose own logit is non-finite, gets 0.
+inline float exl3_flash_draft_probability(const float* logits, size_t count, int32_t draft) {
+    if (logits == nullptr || draft < 0 || static_cast<size_t>(draft) >= count) return 0.0f;
+    const double draft_logit = static_cast<double>(logits[draft]);
+    if (!std::isfinite(draft_logit)) return 0.0f;
+    double best = -std::numeric_limits<double>::infinity();
+    for (size_t i = 0; i < count; ++i) {
+        const double value = static_cast<double>(logits[i]);
+        if (std::isfinite(value) && value > best) best = value;
+    }
+    if (!std::isfinite(best)) return 0.0f;
+    double sum = 0.0;
+    for (size_t i = 0; i < count; ++i) {
+        const double value = static_cast<double>(logits[i]);
+        if (std::isfinite(value)) sum += std::exp(value - best);
+    }
+    if (!(sum > 0.0) || !std::isfinite(sum)) return 0.0f;
+    return static_cast<float>(std::exp(draft_logit - best) / sum);
+}
+
+/// Whether a draft chain extends past a draft of probability `draft_prob`
+/// under the `--spec-min-p` threshold: at or above it the chain continues,
+/// below it the chain stops and no further draft is proposed.  A threshold
+/// of 0 (or less) never stops the chain, which is the plain `--spec` loop.
+inline bool exl3_flash_spec_extends(float draft_prob, double min_p) {
+    if (!(min_p > 0.0)) return true;
+    return static_cast<double>(draft_prob) >= min_p;
+}
 
 class Exl3Dense;
 class Exl3ExpertRuntime;
@@ -197,8 +230,11 @@ public:
     /// is `trunk_pos + 1`.  Only the MTP session advances; the trunk state is
     /// untouched.  The draft predicts the token after `next_token`; callers
     /// verify it with a trunk forward and rewind with a snapshot on reject.
+    /// With `draft_prob`, it also receives the draft's softmax probability
+    /// (see exl3_flash_draft_probability), the confidence `--spec-min-p`
+    /// thresholds on; null leaves it uncomputed.
     bool mtp_draft(int32_t next_token, int64_t trunk_pos, int32_t& draft, float* host_logits,
-                   std::string& err);
+                   std::string& err, float* draft_prob = nullptr);
     /// Save the full sequence state into the caller-owned snapshot, or restore
     /// it back.  Restoring a snapshot from another model, another stage split,
     /// or another arena size fails closed.  Forward stays valid after either.
