@@ -135,6 +135,7 @@ public:
     const float* tensor_f32(const char* name) const { return f32(name); }
     const uint16_t* tensor_bf16(const char* name) const { return bf16(name); }
     const void* tensor_q8(const char* name) const { return q8(name); }
+    int tensor_q8_type(const char* name) const { return q8_type(name); }   // Q8_0, or kNativeQ8Rows once rewritten
     QsaState& kv_state_rw() { return st_; }
     int64_t first_needed() const { return (window_ > 0 && prompt_len_ > 0) ? prompt_len_ - window_ - 64 : 0; }
     int device() const { return device_; }
@@ -161,6 +162,7 @@ private:
     const float* f32(const char* name) const;
     const uint16_t* bf16(const char* name) const;
     const void* q8(const char* name) const;
+    int q8_type(const char* name) const;   // the GGML type to read a q8 tensor with: Q8_0, or kNativeQ8Rows once rewritten
 
     const ModelGeometry* g_ = nullptr;
     SessionState* ss_ = nullptr;
@@ -199,7 +201,12 @@ private:
     strata::gpu::Event* pf_ev_ = nullptr;
     strata::gpu::Graph* round_exec_[9] = {};
 
-    struct Tensor { std::string name, kind; int64_t rows = 0, cols = 0; uint64_t off = 0, bytes = 0; };
+    struct Tensor {
+        std::string name, kind;
+        int64_t rows = 0, cols = 0;
+        uint64_t off = 0, bytes = 0;
+        bool q8_rows = false;   // a Q8_0 matrix rewritten into kNativeQ8Rows' layout at load (the aligned read)
+    };
     std::vector<Tensor> tensors_;
     uint8_t* dense_ = nullptr;
     // a slot drafter borrows the immutable weights and the draft head; each still owns its state and scratch
