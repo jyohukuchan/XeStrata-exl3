@@ -1065,7 +1065,7 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
 }
 
 bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
-                       float* probs, float min_p, int* n_drafts) {
+                       float* probs, const More& more, int* n_drafts) {
     const OnDevice on_device(device_);
     if (T < 1 || T > max_t_ || a < 0 || a >= T) { err = "mtp: draft arguments out of range"; return false; }
     if (chain_live_) { err = "mtp: a pipelined chain is still in flight"; return false; }
@@ -1138,11 +1138,12 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     if (!wait_step(0)) return false;
     drafts[0] = ((volatile int32_t*) h_out_)[0];
     if (top2_env()) { strata::gpu::stream_sync(cs_); record_top2(0); }
-    float pj = ((volatile float*) h_prob_)[0];
-    if (probs) probs[0] = pj;
+    float pl[strata::kernels::kVerifyMaxT];   // the drafts' probabilities for `more`, where the caller keeps none
+    float* pr = probs != nullptr ? probs : pl;
+    pr[0] = ((volatile float*) h_prob_)[0];
     int n = 1;
-    // the chain continues while the last draft is likely enough to be verified
-    for (int j = 1; j < max_steps && pj >= min_p; ++j) {
+    // the chain continues while the window's rule wants another draft after the ones made
+    for (int j = 1; j < max_steps && (!more || more(j, pr)); ++j) {
         if (!strata::gpu::graph_launch(cp ? step_exec_c_[j] : step_exec_[j], cs_)) {
             err = std::string("mtp draft step: ") + strata::gpu::last_error();
             return false;
@@ -1152,8 +1153,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         if (!wait_step(j)) return false;
         drafts[j] = ((volatile int32_t*) h_out_)[j];
         if (top2_env()) { strata::gpu::stream_sync(cs_); record_top2(j); }
-        pj = ((volatile float*) h_prob_)[j];
-        if (probs) probs[j] = pj;
+        pr[j] = ((volatile float*) h_prob_)[j];
         ++n;
     }
     prefetch_ple(drafts[n - 1]);
@@ -1286,7 +1286,7 @@ int MtpDrafter::chain_poll(std::string& err) {
 }
 
 bool MtpDrafter::draft_first(int T, const float* R_row, int32_t token, int64_t cell, int32_t* drafts, std::string& err,
-                             float* probs, float min_p, int* n_drafts) {
+                             float* probs, const More& more, int* n_drafts) {
     const OnDevice on_device(device_);
     // row 0 is the real pair; rows 1.. repeat it and only write cells the next round overwrites
     const int64_t HCN = g_->hc * g_->n_embd;
@@ -1296,7 +1296,7 @@ bool MtpDrafter::draft_first(int T, const float* R_row, int32_t token, int64_t c
             return false;
         }
     std::vector<int32_t> toks((size_t) T, token);
-    return draft(T, toks.data(), cell, 0, drafts, err, probs, min_p, n_drafts);
+    return draft(T, toks.data(), cell, 0, drafts, err, probs, more, n_drafts);
 }
 
 }  // namespace strata::core

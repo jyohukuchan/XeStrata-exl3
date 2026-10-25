@@ -5,6 +5,7 @@
 
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/exl3_flash_model.hpp"
+#include "strata/spec/draft_policy.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -142,6 +143,10 @@ void usage() {
                  "  --expert-miss M     cpu (default): non-resident experts are computed on the CPU; direct: the GPU\n"
                  "                      reads non-resident experts from pinned host memory over the bus\n"
                  "  --spec 0..6         2..6 run the serial MTP draft loop with up to N-1 drafts per window; 0|1 stay plain AR\n"
+                 "  --spec-window R     auto (default): size each window by expected tokens per ms (DraftPolicy);\n"
+                 "                      min-p: size it by the --spec-min-p floor instead. The rules are alternatives:\n"
+                 "                      min-p wins where selected (also when --spec-min-p is given). The former\n"
+                 "                      always-full window is --spec-window min-p --spec-min-p 0\n"
                  "  --spec-min-p P      stop a window's draft chain after a draft whose softmax probability is below P\n"
                  "                      (0..1, default 0: never stop early; the first draft is always proposed)\n"
                  "  --max-t 1           single-token AR only\n"
@@ -196,6 +201,8 @@ int exl3_flash_main(int argc, char** argv) {
     bool stop_eos = false;
     int spec = 0, pool_workers = 0;
     double spec_min_p = 0.0;
+    bool spec_min_p_given = false;
+    std::string spec_window = "auto";
     int64_t prompt_chunk = 0;
     bool prompt_seen = false, eos_explicit = false;
     for (int i = 1; i < argc; ++i) {
@@ -307,9 +314,18 @@ int exl3_flash_main(int argc, char** argv) {
                 std::fprintf(stderr, "strata exl3-flash: --spec-min-p must be a probability in [0, 1]\n");
                 return 2;
             }
+            spec_min_p_given = true;
         } else if (argument.rfind("--spec-min-p=", 0) == 0) {
             if (!parse_probability(std::string_view(argument).substr(13), spec_min_p)) {
                 std::fprintf(stderr, "strata exl3-flash: --spec-min-p must be a probability in [0, 1]\n");
+                return 2;
+            }
+            spec_min_p_given = true;
+        } else if (argument == "--spec-window") {
+            spec_window = next("--spec-window");
+            if (spec_window != "auto" && spec_window != "min-p") {
+                std::fprintf(stderr, "strata exl3-flash: --spec-window takes auto or min-p, not %s\n",
+                             spec_window.c_str());
                 return 2;
             }
         } else if (argument == "--max-t") {
@@ -421,6 +437,11 @@ int exl3_flash_main(int argc, char** argv) {
     std::vector<int32_t> generated;
     generated.reserve(static_cast<size_t>(max_new));
     const bool use_spec = (spec >= 2);
+    // The window rule (DraftPolicy): auto sizes the window by expected tokens per ms; min-p (selected, or a
+    // --spec-min-p given) sizes it by the probability floor instead. The two are alternatives, never both.
+    const bool minp_rule = (spec_window == "min-p" || spec_min_p_given);
+    strata::spec::DraftPolicy policy(spec > 1 ? spec : 1);
+    policy.set_scale_all(minp_rule);
     strata::core::Exl3FlashSnapshot snap;
     size_t spec_drafted = 0;
     size_t spec_accepted = 0;
@@ -447,15 +468,16 @@ int exl3_flash_main(int argc, char** argv) {
             int attempted = 0;
             int accepted = 0;
             bool window_done = false;
+            std::vector<float> window_probs;
             for (int round = 1; round < spec && !window_done; ++round) {
                 if (static_cast<int64_t>(generated.size()) + 1 >= max_new) break;
                 int32_t draft = -1;
                 float draft_prob = 0.0f;
-                if (!model.mtp_draft(cur, cur_pos - 1, draft, nullptr, err,
-                                     spec_min_p > 0.0 ? &draft_prob : nullptr)) {
+                if (!model.mtp_draft(cur, cur_pos - 1, draft, nullptr, err, &draft_prob)) {
                     std::fprintf(stderr, "strata exl3-flash: draft position %lld: %s\n", (long long) cur_pos, err.c_str());
                     return 1;
                 }
+                window_probs.push_back(draft_prob);
                 ++attempted;
                 ++spec_drafted;
                 int32_t verified = -1;
@@ -476,11 +498,19 @@ int exl3_flash_main(int argc, char** argv) {
                 // window closes as if every draft had been proposed.  The
                 // token stream is unchanged: unproposed drafts would only
                 // have been verified, never emitted unverified.
-                if (!window_done && !strata::core::exl3_flash_spec_extends(draft_prob, spec_min_p)) {
+                if (!window_done && minp_rule &&
+                    !strata::core::exl3_flash_spec_extends(draft_prob, spec_min_p)) {
+                    ++spec_cut;
+                    break;
+                }
+                if (!window_done && !minp_rule &&
+                    !policy.mtp_extend(window_probs.data(), attempted, spec)) {
                     ++spec_cut;
                     break;
                 }
             }
+            if (!minp_rule && attempted > 0)
+                policy.observe_mtp_drafts(window_probs.data(), attempted + 1, accepted);
             if (window_done) break;
             if (attempted > 0 && accepted == attempted) {
                 if (!model.forward(cur, cur_pos, next_token, dump_path.empty() ? nullptr : logits.data(), err)) {
@@ -533,8 +563,10 @@ int exl3_flash_main(int argc, char** argv) {
         std::fprintf(stderr, "strata (qwen4exp-exl3): spec%d drafts %zu accepted %zu (%.1f %%)\n", spec,
                      spec_drafted, spec_accepted,
                      spec_drafted == 0 ? 0.0 : 100.0 * static_cast<double>(spec_accepted) / static_cast<double>(spec_drafted));
-    if (use_spec && spec_min_p > 0.0)
+    if (use_spec && minp_rule && spec_min_p > 0.0)
         std::fprintf(stderr, "strata (qwen4exp-exl3): spec-min-p %.3f cut %zu windows\n", spec_min_p, spec_cut);
+    if (use_spec && !minp_rule)
+        std::fprintf(stderr, "strata (qwen4exp-exl3): spec-window auto cut %zu windows\n", spec_cut);
     {
         const auto cache = model.expert_cache_stats();
         const int64_t routed = cache.hit_entries + cache.cpu_miss_entries + cache.direct_miss_entries;
