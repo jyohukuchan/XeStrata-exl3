@@ -478,9 +478,15 @@ struct Options {
     /// a helper thread instead of one window waiting for a whole round (see the tier in the --serve block).  Not
     /// bit-exact run to run.  -1 (default): on where it applies; 1: asked (said when it cannot run); 0: the blocking tier.
     int adapt_async = -1;
-    /// Plan v0.3 P6: a draft enters the verify window only while every draft before it (and itself) has at least
-    /// this probability under the draft layer; 0 = always --spec-1 drafts.
+    /// --spec-window min-p (plan v0.3 P6): a draft enters the verify window only while every draft before it (and
+    /// itself) has at least this probability under the draft layer; 0 = always --spec-1 drafts.
     double spec_min_p = 0.0;
+    /// How the MTP's window is sized each round: "auto" keeps each draft while the tokens it is expected to add, at
+    /// its calibrated probability, raise the window's expected tokens per ms at the measured window costs
+    /// (DraftPolicy::mtp_window); "min-p" is the floor on the drafts' probabilities, --spec-min-p.  A request's own
+    /// spec_min_p (setup's calibration) takes the min-p rule for that request.
+    std::string spec_window = "auto";
+    bool spec_window_given = false;   ///< --spec-window was given (else the file tier takes min-p, below)
     /// Stop when the model emits an end-of-turn token (<|endoftext|> 248044, <|im_end|> 248046, or --eos-ids).
     bool stop_eos = false;
     std::vector<int64_t> eos_ids = {248044, 248046};
@@ -698,8 +704,12 @@ void usage() {
                  "  --mtp-max-t M        cap the MTP's windows at M tokens (0 = --spec; longer ones come from suffixes)\n"
                  "  --spec N             the MTP drafter's verify window: how many tokens it proposes per check (setup\n"
                  "                       writes 4; --suffix-draft lets it grow by 2, up to 8, where a repeat is likely)\n"
-                 "  --spec-min-p P       how sure the draft layer must be to extend a verify window by another guess\n"
-                 "                       (setup writes 0.5; --calibrate measures it on this PC, see docs/DETAILS.md)\n"
+                 "  --spec-window R      auto (default): each round keeps a draft while the tokens it is expected to\n"
+                 "                       add raise the window's tokens per ms, at the measured window costs; min-p:\n"
+                 "                       the floor below\n"
+                 "  --spec-min-p P       --spec-window min-p: how sure the draft layer must be to extend a verify window\n"
+                 "                       by another guess (setup writes 0.5; --calibrate measures it on this PC, see\n"
+                 "                       docs/DETAILS.md)\n"
                  "  --lookup-chain K     opt-in: after the MTP's drafts, add up to K prompt-lookup drafts that continue\n"
                  "                       them (the window grows to at most 8; default 0 = off)\n"
                  "  --lookup-chain-min M  the shortest context match --lookup-chain extends on (default 3)\n"
@@ -2490,6 +2500,14 @@ int main(int argc, char** argv) {
         else if (a == "--adapt-min-gain") o.adapt_min_gain = std::strtof(next("--adapt-min-gain"), nullptr);
         else if (a == "--adapt-async") o.adapt_async = std::strtol(next("--adapt-async"), nullptr, 10) != 0 ? 1 : 0;
         else if (a == "--spec-min-p") o.spec_min_p = std::strtod(next("--spec-min-p"), nullptr);
+        else if (a == "--spec-window") {
+            o.spec_window = next("--spec-window");
+            o.spec_window_given = true;
+            if (o.spec_window != "auto" && o.spec_window != "min-p") {
+                std::fprintf(stderr, "strata generate: --spec-window takes auto or min-p, not %s\n", o.spec_window.c_str());
+                return 2;
+            }
+        }
         else if (a == "--stop-eos") o.stop_eos = true;
         else if (a == "--spec-split") o.spec_split = true;
         else if (a == "--layer-split") o.layer_split = next("--layer-split");
@@ -6699,6 +6717,16 @@ int main(int argc, char** argv) {
             mem_mark("the resident experts");
         }
     }
+    // The experts the GPU does not hold read from the model files (--mmap-experts, no RAM copy): the window rule is
+    // min-p unless --spec-window was given.  A round's time there swings with how many of its experts the SSD reads,
+    // and the auto rule's measured costs priced the wider windows out: on the RX 9060 XT in a 32 GiB cgroup (IQ3_XXS,
+    // the page cache emptied before each run, 2026-10-24) auto took one-token windows in half the rounds at 32K and
+    // decoded 16.1-16.2 tok/s, min-p 17.0; at 1K 26.0-26.3 against 26.1.
+    if (!o.spec_window_given && o.spec_window == "auto" && srcp == &src && !src.complement_ready()) {
+        o.spec_window = "min-p";
+        std::fprintf(stderr, "strata generate: the verify window takes the min-p rule (the experts are read from the "
+                             "files; --spec-window auto keeps the measured costs)\n");
+    }
     // (the arena mode has no RAM copy to exchange with: its experts are always in RAM, the tier only copies them in)
     if (o.adapt_async && !src.complement_ready() && srcp != &arena_src)
         adapt_async_off("the resident RAM mode is not running");
@@ -9561,6 +9589,7 @@ int main(int argc, char** argv) {
             // tuning keys (setup's calibration measures settings without restarting the engine): the PCIe share of
             // the missed experts and the draft-probability floor, for this request only
             double req_pcie_frac = o.pcie_frac, req_spec_min_p = o.spec_min_p;
+            bool req_minp_rule = o.spec_window == "min-p";   // the window rule: a request's spec_min_p is the floor
             int req_aux_cpus = -1;   // aux_cpus=0|1: --aux-cpus for this request (-1 = the start-up value)
             // #2228: img_keys=<hex>,<hex>,... (GENI): each picture's key from the server (its normalized bytes' hash),
             // in prompt order.  With them the conversation cache matches a picture by its key and grid, not by its
@@ -9598,7 +9627,7 @@ int main(int argc, char** argv) {
                     else if (key == "penalty_present") req_penalty_present = fv;
                     else if (key == "seed") req_seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
                     else if (key == "pcie_frac") { req_pcie_frac = std::clamp((double) fv, 0.0, 1.0); req_pcie_set = true; }
-                    else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
+                    else if (key == "spec_min_p") { req_spec_min_p = std::clamp((double) fv, 0.0, 1.0); req_minp_rule = true; }
                     else if (key == "aux_cpus") req_aux_cpus = std::strtol(tok.c_str() + eq + 1, nullptr, 10) != 0 ? 1 : 0;
                     else if (key == "img_keys") {
                         req_img_keys.clear();
@@ -11413,9 +11442,15 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata pipeline calibration (p_on decile: on/scored):%s\n", cal.c_str());
                 }
             }
+            // the window rule, as the chain drafts: another draft after n when the rule would keep it (--spec-window)
+            const strata::core::MtpDrafter::More draft_more = [&](int n, const float* pr) {
+                return req_minp_rule ? pr[n - 1] >= (float) req_spec_min_p : policy.mtp_extend(pr, n, S_mtp);
+            };
+            policy.set_scale_all(req_minp_rule);
             while (!pl_ran && !cancelled && produced_n < max_new) {
                 int T = use_mtp ? S_mtp : 1;   // no --mtp: one token a round unless a lookup draft fires
-                if (use_mtp && req_spec_min_p > 0.0) {
+                if (use_mtp && !req_minp_rule) T = policy.mtp_window(dprob.data(), S_mtp);
+                else if (use_mtp && req_spec_min_p > 0.0) {
                     T = 1;
                     while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p) ++T;
                 }
@@ -11554,6 +11589,7 @@ int main(int argc, char** argv) {
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
                 if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
                 if (chain_n > 0) { ++chain_windows; chain_drafts += chain_n; chain_ok += std::max(0, a - (T_mtp - 1)); }
+                if (!from_sfx && !first_window) policy.observe_mtp_drafts(dprob.data(), T_mtp, a);   // before the next drafts
                 if (!from_sfx && !first_window)
                     for (int d = 0; d < T_mtp - 1 && d < 8 && d <= a; ++d) { ++dp_tested[d]; dp_ok[d] += d < a; }
                 if (strata::core::MtpDrafter::top2_env() && !from_sfx && !first_window && a < T_mtp - 1 && a < 8) {
@@ -11631,7 +11667,7 @@ int main(int argc, char** argv) {
                 if (use_mtp && hist_n > 0 && mtp.coupled() && !eos && produced_n < max_new)
                     mtp.set_draft_history(consumed.data(), (int64_t) consumed.size(), outv[(size_t) a]);
                 const bool drafted = !use_mtp || eos || produced_n >= max_new ||
-                                     mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p);
+                                     mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), draft_more);
                 {
                     const Clock::time_point tw3 = Clock::now();
                     auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
@@ -12541,8 +12577,17 @@ int main(int argc, char** argv) {
         // plan v0.3 P6: with a native pack the first window is the last prompt token alone (it produces the first
         // generated token and the MTP's first cell); otherwise the token loop already did that.
         bool first_window = native_pack;
+        const int S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec;
+        if (use_mtp && S_mtp < o.spec) mtp.set_max_drafts(S_mtp - 1);
+        strata::spec::DraftPolicy policy(o.spec);   // MTP or lookup window (see draft_policy.hpp)
+        // the window rule, as the chain drafts: another draft after n when the rule would keep it (--spec-window)
+        const bool minp_rule = o.spec_window == "min-p";
+        policy.set_scale_all(minp_rule);
+        const strata::core::MtpDrafter::More draft_more = [&](int n, const float* pr) {
+            return minp_rule ? pr[n - 1] >= (float) o.spec_min_p : policy.mtp_extend(pr, n, S_mtp);
+        };
         if (use_mtp && !first_window &&
-            !mtp.draft_first(o.spec, ss.R, x, p - 1, drafts.data(), err, dprob.data(), (float) o.spec_min_p)) {
+            !mtp.draft_first(o.spec, ss.R, x, p - 1, drafts.data(), err, dprob.data(), draft_more)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
@@ -12557,10 +12602,7 @@ int main(int argc, char** argv) {
         std::vector<float> hash_rows;
         std::vector<int64_t> accepted_hist((size_t) o.spec, 0);
         int64_t rounds = 0, drafts_total = 0, drafts_ok = 0, corrupt_counter = 0;
-        const int S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec;
-        if (use_mtp && S_mtp < o.spec) mtp.set_max_drafts(S_mtp - 1);
         strata::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
-        strata::spec::DraftPolicy policy(o.spec);   // MTP or lookup window (see draft_policy.hpp)
         std::vector<int32_t> sbuf((size_t) o.spec, 0);
         int64_t sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
         int64_t chain_windows = 0, chain_drafts = 0, chain_ok = 0;   // --lookup-chain's own counts
@@ -12593,7 +12635,8 @@ int main(int argc, char** argv) {
         while ((int64_t) produced.size() < max_new) {
             const Clock::time_point t0 = Clock::now();
             int T = S_mtp;
-            if (use_mtp && o.spec_min_p > 0.0) {
+            if (use_mtp && !minp_rule) T = policy.mtp_window(dprob.data(), S_mtp);
+            else if (use_mtp && o.spec_min_p > 0.0) {
                 T = 1;
                 while (T < S_mtp && dprob[(size_t) T - 1] >= (float) o.spec_min_p) ++T;
             }
@@ -12686,6 +12729,7 @@ int main(int argc, char** argv) {
             }
             int a = 0;
             while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+            if (!from_sfx && !first_window) policy.observe_mtp_drafts(dprob.data(), T_mtp, a);   // before the next drafts
             if (first_window) {
                 first_window = false;
                 ttft_ms = std::chrono::duration<double, std::milli>(Clock::now() - t_start).count();
@@ -12741,7 +12785,7 @@ int main(int argc, char** argv) {
                 break;
             }
             const bool drafted = !use_mtp || (int64_t) produced.size() >= max_new ||
-                                 mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) o.spec_min_p);
+                                 mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), draft_more);
             if (adapt_thr.joinable()) adapt_thr.join();
             if (!adapt_ok) return 1;
             if (!drafted) {
@@ -12773,10 +12817,11 @@ int main(int argc, char** argv) {
         if (!follow.empty())
             std::printf("%-24s %lld of %lld emitted tokens differ from the argmax\n", "follow",
                         (long long) follow_differ, (long long) follow_emitted);
-        if (o.spec_min_p > 0.0) {
+        if (use_mtp) {
             std::printf("%-24s", "window sizes");
             for (size_t i = 1; i < window_hist.size(); ++i) std::printf(" T%zu:%lld", i, (long long) window_hist[i]);
-            std::printf("  (min draft probability %.2f)\n", o.spec_min_p);
+            if (minp_rule) std::printf("  (min draft probability %.2f)\n", o.spec_min_p);
+            else std::printf("  (expected tokens per ms at the measured window costs)\n");
         }
         if (o.suffix_draft > 0)
             std::printf("%-24s %lld windows, drafts accepted %lld of %lld\n", "suffix drafts", (long long) sfx_windows,

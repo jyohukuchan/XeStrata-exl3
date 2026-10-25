@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/spec/draft_policy_test.cpp - DraftPolicy: when does a lookup window beat the MTP's?
 //
 // Simulated rounds with the costs measured on the RTX 5070 (window-cost: ~10 ms more per token) check that
@@ -115,6 +116,52 @@ int main() {
         check(probes > 0 && probes <= 3 && spaced,
               "chain: stale full size is re-probed despite a profitable shorter chain");
         check(probes > 0 && confident, "chain: stale re-probes retain the MTP confidence gate");
+    }
+    {
+        // The MTP's own window (mtp_window / mtp_extend / draft_q calibration): likely drafts extend the window,
+        // unlikely ones do not, and overconfident drafts that keep being rejected are calibrated down until the
+        // window shrinks - where a raw probability floor (the min-p rule) would still extend it.  The two rules
+        // are alternatives: a caller uses one or the other for a chain, never both (the min-p rule wins when a
+        // caller selects it; see MtpDrafter::More).
+        check(DraftPolicy::prior_tokens(1) == 1.0 && DraftPolicy::prior_tokens(4) > 3.0 && DraftPolicy::prior_tokens(4) < 3.2,
+              "prior_tokens: a typical acceptance before any window is observed");
+        DraftPolicy p(6);
+        const float sure[5] = {0.99f, 0.99f, 0.99f, 0.99f, 0.99f};
+        check(p.mtp_window(sure, 6) == 6, "mtp_window: sure drafts take the full window");
+        check(p.mtp_window(sure, 4) == 4, "mtp_window: never beyond the caller's cap");
+        const float none[5] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+        check(p.mtp_window(none, 6) == 1, "mtp_window: zero-probability drafts keep the window at one token");
+        check(p.mtp_extend(sure, 1, 6), "mtp_extend: one more draft pays after a sure draft");
+        check(!p.mtp_extend(none, 1, 6), "mtp_extend: no more drafts after an impossible draft");
+        check(!p.mtp_extend(sure, 5, 6), "mtp_extend: no room left in the window");
+        DraftPolicy q(6);
+        const float over[1] = {0.9f};
+        for (int i = 0; i < 60; ++i) q.observe_mtp_drafts(over, 2, 0);   // said 0.9, never accepted
+        check(q.mtp_window(over, 6) == 1, "draft_q calibration: overconfident rejected drafts shrink the window");
+        check(over[0] >= 0.5f, "min-p contrast: the same raw probability still passes a 0.5 floor (rules differ)");
+        DraftPolicy r(6);
+        for (int i = 0; i < 60; ++i) r.observe_mtp_drafts(over, 2, 1);   // said 0.9, always accepted
+        check(r.mtp_window(over, 6) > 1, "draft_q calibration: accepted drafts keep the window open");
+    }
+    {
+        // mtp_step_pays at measured costs: when a wider window costs much more per token, a middling draft stops
+        // paying; at flat costs it pays.  And set_scale_all (the min-p rule's cost scaling) prices an unmeasured
+        // size from every measured size, not only the nearest below.
+        auto flat = [](int t) { return 40.0 + 2.0 * (t - 1); };
+        DraftPolicy p(6);
+        for (int t = 1; t <= 6; ++t) for (int i = 0; i < 5; ++i) p.observe(false, t, t - 1, 0, flat(t));
+        const float mid[5] = {0.6f, 0.6f, 0.6f, 0.6f, 0.6f};
+        check(p.mtp_window(mid, 6) > 1, "mtp_step_pays: flat costs let a middling draft pay");
+        DraftPolicy q(6);
+        for (int t = 1; t <= 6; ++t) for (int i = 0; i < 5; ++i) q.observe(false, t, t - 1, 0, cost(t) * 4.0);
+        check(q.mtp_window(mid, 6) <= p.mtp_window(mid, 6), "mtp_step_pays: dearer windows never grow the window");
+        DraftPolicy s(8);
+        for (int i = 0; i < 5; ++i) { s.observe(false, 1, 0, 0, 10.0); s.observe(false, 8, 0, 0, 100.0); }
+        const double below = s.cost_ms(4);
+        s.set_scale_all(true);
+        check(s.cost_ms(4) > below, "set_scale_all: an unmeasured size is also priced from the sizes above it");
+        s.set_scale_all(false);
+        check(s.cost_ms(4) == below, "set_scale_all off: back to scaling from the nearest size below");
     }
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
     return g_fail ? 1 : 0;
