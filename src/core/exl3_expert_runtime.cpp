@@ -383,8 +383,9 @@ bool Exl3ExpertRuntime::open(Exl3ExpertSource& source, strata::kernels::cpu::Exp
     }
     if (!buckets.empty()) {
         // The arena is one allocation unless the device's largest allocation is smaller than it: then it is
-        // taken in pieces of that size, the way the plain model's tier does it (a cache that does not fit in
-        // one allocation is a cache that does not fit at all).
+        // taken in pieces of that size, the way the plain model's tier does it.  When the one allocation is
+        // refused the cache keeps the prefix the device gives in pieces (ExpertCache's best-effort fallback):
+        // the resident pairs past the prefix are not admitted below and take the CPU miss path instead.
         cache_.set_max_piece(max_alloc_bytes());
         if (!cache_.open_buckets(buckets, n_layers_, n_expert_, err)) { close(); return false; }
         // The fills are QUEUED and waited for once, not one synchronous copy per expert: a cache that holds
@@ -394,16 +395,22 @@ bool Exl3ExpertRuntime::open(Exl3ExpertSource& source, strata::kernels::cpu::Exp
         constexpr size_t kFillRing = 16;
         std::vector<std::vector<uint8_t>> ring(kFillRing);
         size_t next = 0;
+        int64_t skipped = 0;   // resident pairs the best-effort prefix could not hold: CPU misses, not a failure
         for (const ResidentPair& pair : resident) {
             const size_t at = pair_index(pair.first, pair.second);
             const auto& layout = format_table_host_[(size_t) pair_format_index_[at]];
+            const int32_t slot = cache_.admit(pair.first, pair.second, pair_formats_[at]);
+            if (slot < 0) {
+                ++skipped;
+                selected[at] = 0;   // not resident after all: the CPU prewarm below must own this pair
+                continue;
+            }
             std::vector<uint8_t>& blob = ring[next];
             blob.resize(static_cast<size_t>(layout.total_bytes));
             if (!source.copy_blob(pair.first, pair.second, blob.data())) {
                 err = "exl3 runtime: resident source copy failed"; close(); return false;
             }
-            const int32_t slot = cache_.admit(pair.first, pair.second, pair_formats_[at]);
-            if (slot < 0 || !cache_.fill_slot_queued(slot, blob.data(), err, static_cast<int64_t>(blob.size()))) {
+            if (!cache_.fill_slot_queued(slot, blob.data(), err, static_cast<int64_t>(blob.size()))) {
                 if (err.empty()) err = "exl3 runtime: resident cache admission failed";
                 close(); return false;
             }
@@ -416,6 +423,11 @@ bool Exl3ExpertRuntime::open(Exl3ExpertSource& source, strata::kernels::cpu::Exp
         if (next != 0 && !cache_.sync_queued(err)) {
             if (err.empty()) err = "exl3 runtime: resident cache fill did not finish";
             close(); return false;
+        }
+        if (skipped > 0) {
+            all_resident_ = false;
+            std::fprintf(stderr, "Exl3ExpertRuntime: %lld of %zu resident experts did not fit the device cache "
+                                 "and take the CPU miss path\n", (long long) skipped, resident.size());
         }
     }
     cpu_jobs_.resize(static_cast<size_t>(max_entries_));
