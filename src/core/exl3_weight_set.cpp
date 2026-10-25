@@ -32,6 +32,11 @@ bool product_u64(uint64_t a, uint64_t b, uint64_t& result) {
 
 bool dense_kind(ProjectionKind kind) {
     switch (kind) {
+        case ProjectionKind::conv_in:
+        case ProjectionKind::conv_out:
+        case ProjectionKind::dense_gate:
+        case ProjectionKind::dense_up:
+        case ProjectionKind::dense_down:
         case ProjectionKind::gdn_qkv:
         case ProjectionKind::gdn_z:
         case ProjectionKind::gdn_out:

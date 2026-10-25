@@ -354,7 +354,13 @@ const char* projection_kind_name(ProjectionKind kind) {
 }
 
 const char* model_family_name(ModelFamily family) {
-    return family == ModelFamily::qwen35 ? "qwen35" : family == ModelFamily::hyv3 ? "hyv3" : "qwen38";
+    switch (family) {
+        case ModelFamily::qwen35: return "qwen35";
+        case ModelFamily::qwen38: return "qwen38";
+        case ModelFamily::hyv3: return "hyv3";
+        case ModelFamily::lfm2moe: return "lfm2moe";
+    }
+    return "qwen38";
 }
 
 const char* value_transform_name(ValueTransform transform) {
@@ -384,6 +390,7 @@ bool build_model_map(const Archive& archive, ModelMap& result, std::string& err,
         else if (model_type == "qwen3_5_moe" || model_type == "qwen3_5_moe_text" ||
                  model_type == "qwen3_5" || model_type == "qwen3_5_text") result.family = ModelFamily::qwen35;
         else if (model_type == "hy_v3") result.family = ModelFamily::hyv3;
+        else if (model_type == "lfm2_moe") result.family = ModelFamily::lfm2moe;
         else {
             err = "EXL3 model map: unsupported model_type " + model_type;
             return false;
@@ -475,6 +482,95 @@ bool build_model_map(const Archive& archive, ModelMap& result, std::string& err,
                                g.hidden_size, g.moe_intermediate);
                     add_linear(result, archive, ProjectionKind::expert_down, layer, expert, ep + "down_proj", ec + "down_proj",
                                g.moe_intermediate, g.hidden_size);
+                }
+            }
+            return true;
+        }
+        if (result.family == ModelFamily::lfm2moe) {
+            // LFM2 MoE: every projection of the family is mapped here (short-conv, full attention, the
+            // leading dense FFN, routed experts with their bias and router).  Which engine block runs the
+            // map is the engine's call; the map itself is complete for a well-formed archive.
+            auto& g = result.geometry;
+            g.hidden_size = int_value(*text, "hidden_size");
+            g.vocab_size = int_value(*text, "vocab_size", int_value(config, "vocab_size"));
+            g.layers = int_value(*text, "num_hidden_layers");
+            g.experts = int_value(*text, "num_experts");
+            g.experts_per_token = int_value(*text, "num_experts_per_tok");
+            g.moe_intermediate = int_value(*text, "moe_intermediate_size");
+            g.q_heads = int_value(*text, "num_attention_heads");
+            g.kv_heads = int_value(*text, "num_key_value_heads", g.q_heads);
+            g.head_dim = int_value(*text, "head_dim", g.q_heads > 0 ? g.hidden_size / g.q_heads : 0);
+            g.dense_intermediate = int_value(*text, "intermediate_size");
+            g.dense_layers = int_value(*text, "num_dense_layers");
+            g.shortconv_l_cache = int_value(*text, "conv_L_cache", 3);
+            if (g.hidden_size <= 0 || g.layers <= 0 || g.experts <= 0 || g.moe_intermediate <= 0 ||
+                g.shortconv_l_cache <= 1 || (g.dense_layers > 0 && g.dense_intermediate <= 0) ||
+                (g.dense_layers < 0 || g.dense_layers >= g.layers))
+                return (err = "EXL3 model map: config has incomplete LFM2 MoE geometry", false);
+            if (include_mtp) reason(result, "lfm2moe: this family has no MTP layer");
+            result.source_prefix = "model.layers";
+            if (g.vocab_size <= 0)
+                reason(result, "config has no positive vocab_size for embedding/head mapping");
+            else {
+                add_aux(result, archive, -1, "model.embed_tokens", "token_embd.weight",
+                        g.vocab_size * g.hidden_size, ValueTransform::identity, {}, ProjectionKind::embedding, {1, 0});
+                add_linear(result, archive, ProjectionKind::lm_head, -1, -1, "lm_head", "output.weight",
+                           g.hidden_size, g.vocab_size);
+            }
+            add_aux(result, archive, -1, "model.embedding_norm", "output_norm.weight", g.hidden_size,
+                    ValueTransform::identity, {}, ProjectionKind::final_norm);
+            const Json* layer_types = nullptr;
+            const auto lt = text->find("layer_types");
+            if (lt != text->end() && lt->is_array()) layer_types = &*lt;
+            for (int64_t layer = 0; layer < g.layers; ++layer) {
+                const bool conv = layer_types != nullptr && layer < static_cast<int64_t>(layer_types->size())
+                                      ? (*layer_types)[static_cast<size_t>(layer)].get<std::string>() == "conv"
+                                      : (layer + 1) % 4 != 0;
+                const std::string p = result.source_prefix + "." + std::to_string(layer) + ".";
+                const std::string cp = "blk." + std::to_string(layer) + ".";
+                add_aux(result, archive, layer, p + "operator_norm", cp + "attn_norm.weight", g.hidden_size);
+                add_aux(result, archive, layer, p + "ffn_norm", cp + "ffn_norm.weight", g.hidden_size);
+                if (conv) {
+                    add_linear(result, archive, ProjectionKind::conv_in, layer, -1, p + "conv.in_proj",
+                               cp + "shortconv_in_proj.weight", g.hidden_size, 3 * g.hidden_size);
+                    add_aux(result, archive, layer, p + "conv.conv", cp + "shortconv_conv.weight",
+                            g.hidden_size * g.shortconv_l_cache);
+                    add_linear(result, archive, ProjectionKind::conv_out, layer, -1, p + "conv.out_proj",
+                               cp + "shortconv_out_proj.weight", g.hidden_size, g.hidden_size);
+                } else {
+                    add_linear(result, archive, ProjectionKind::qsa_q, layer, -1, p + "self_attn.q_proj",
+                               cp + "attn_q.weight", g.hidden_size, g.q_heads * g.head_dim);
+                    add_linear(result, archive, ProjectionKind::qsa_k, layer, -1, p + "self_attn.k_proj",
+                               cp + "attn_k.weight", g.hidden_size, g.kv_heads * g.head_dim);
+                    add_linear(result, archive, ProjectionKind::qsa_v, layer, -1, p + "self_attn.v_proj",
+                               cp + "attn_v.weight", g.hidden_size, g.kv_heads * g.head_dim);
+                    add_linear(result, archive, ProjectionKind::qsa_out, layer, -1, p + "self_attn.out_proj",
+                               cp + "attn_output.weight", g.q_heads * g.head_dim, g.hidden_size);
+                    add_aux(result, archive, layer, p + "self_attn.q_layernorm", cp + "attn_q_norm.weight", g.head_dim);
+                    add_aux(result, archive, layer, p + "self_attn.k_layernorm", cp + "attn_k_norm.weight", g.head_dim);
+                }
+                if (layer < g.dense_layers) {
+                    add_linear(result, archive, ProjectionKind::dense_gate, layer, -1, p + "feed_forward.w1",
+                               cp + "ffn_gate.weight", g.hidden_size, g.dense_intermediate);
+                    add_linear(result, archive, ProjectionKind::dense_up, layer, -1, p + "feed_forward.w3",
+                               cp + "ffn_up.weight", g.hidden_size, g.dense_intermediate);
+                    add_linear(result, archive, ProjectionKind::dense_down, layer, -1, p + "feed_forward.w2",
+                               cp + "ffn_down.weight", g.dense_intermediate, g.hidden_size);
+                } else {
+                    add_raw(result, archive, ProjectionKind::router, layer, -1, p + "feed_forward.gate",
+                            cp + "ffn_gate_inp.weight", g.hidden_size, g.experts);
+                    add_aux(result, archive, layer, p + "feed_forward.expert_bias", cp + "ffn_exp_probs_b.bias",
+                            g.experts);
+                    for (int64_t expert = 0; expert < g.experts; ++expert) {
+                        const std::string ep = p + "feed_forward.experts." + std::to_string(expert) + ".";
+                        const std::string ec = cp + "experts." + std::to_string(expert) + ".";
+                        add_linear(result, archive, ProjectionKind::expert_gate, layer, expert, ep + "w1",
+                                   ec + "gate_proj", g.hidden_size, g.moe_intermediate);
+                        add_linear(result, archive, ProjectionKind::expert_up, layer, expert, ep + "w3",
+                                   ec + "up_proj", g.hidden_size, g.moe_intermediate);
+                        add_linear(result, archive, ProjectionKind::expert_down, layer, expert, ep + "w2",
+                                   ec + "down_proj", g.moe_intermediate, g.hidden_size);
+                    }
                 }
             }
             return true;

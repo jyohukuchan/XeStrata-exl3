@@ -93,6 +93,23 @@ int main() {
         failures += !check(!strata::artifact::exl3::read_exl3_model_spec(q35_archive, q35, err, true) &&
                                err.find("Qwen3.5 MTP was requested") != std::string::npos,
                            "Qwen3.5 unbound MTP rejection");
+        Json lfm_text = {
+            {"model_type", "lfm2_moe"}, {"hidden_size", 2048}, {"vocab_size", 128000}, {"num_hidden_layers", 4},
+            {"num_attention_heads", 32}, {"num_key_value_heads", 8}, {"max_position_embeddings", 131072},
+            {"norm_eps", 1e-5}, {"conv_L_cache", 3}, {"num_dense_layers", 1}, {"intermediate_size", 11776},
+            {"layer_types", {"conv", "conv", "full_attention", "conv"}},
+            {"num_experts", 64}, {"num_experts_per_tok", 4}, {"moe_intermediate_size", 1536},
+            {"use_expert_bias", true}, {"norm_topk_prob", true}, {"routed_scaling_factor", 1.0},
+            {"rope_parameters", Json{{"rope_theta", 10000000.0}, {"rope_type", "default"}}}};
+        write_archive(root / "lfm2", Json{{"model_type", "lfm2_moe"}, {"text_config", lfm_text}});
+        strata::artifact::exl3::Archive lfm_archive(root / "lfm2");
+        strata::ModelSpec lfm;
+        failures += !check(strata::artifact::exl3::read_exl3_model_spec(lfm_archive, lfm, err), "LFM2 MoE config");
+        failures += !check(lfm.arch == strata::ModelArch::Lfm2Moe && lfm.n_layer == 4 && lfm.key_length == 64 &&
+                               lfm.recurrent[0] && !lfm.recurrent[2] && lfm.n_head_kv[2] == 8 && lfm.n_head_kv[0] == 0 &&
+                               lfm.shortconv_l_cache == 3 && lfm.n_dense_lead == 1 && lfm.n_ff == 11776 &&
+                               lfm.expert_bias && lfm.expert_weights_norm && lfm.gating == strata::ExpertGating::Sigmoid,
+                           "LFM2 MoE typed geometry");
         Json malformed = base_config("qwen3_5_moe_text");
         malformed["text_config"].erase("linear_key_head_dim");
         write_archive(root / "bad", malformed);

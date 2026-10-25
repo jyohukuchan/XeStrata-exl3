@@ -8,6 +8,8 @@
 //      recurrent, the three dense layers do not route and the MoE index starts after them, the per-layer clamp;
 //   3. qwen3moe (llm-jp-4.1's shape): nothing recurrent, no shared expert;
 //   4. refusals, each naming what is wrong: an unknown architecture, a missing required key, an mHC of 3 streams.
+//   5. lfm2moe (LFM2.5-24B-A2B's shape): the short-conv layers are the ones without K/V heads, the leading dense
+//      layers do not route, sigmoid gating with an expert bias, and a missing shortconv.l_cache refused.
 //
 // The fixtures carry only the metadata the reader looks at, and one F32[8] tensor so the file has a data section.
 #include "strata/artifact/model_spec.hpp"
@@ -162,6 +164,18 @@ std::vector<Kv> hyv3() {
             u32s(a + "expert_feed_forward_length", std::vector<uint32_t>(48, 1536)),
             u32(a + "leading_dense_block_count", 1), u32(a + "feed_forward_length", 6912),
             boolean(a + "expert_weights_norm", true), f32(a + "expert_weights_scale", 2.826f)};
+std::vector<Kv> lfm2moe() {
+    const std::string a = "lfm2moe.";
+    // LFM2.5-24B-A2B: 40 layers, full attention at 2, 6, ..., 38 (8 K/V heads), short-conv elsewhere (0)
+    std::vector<uint32_t> kv(40, 0);
+    for (size_t i = 2; i < kv.size(); i += 4) kv[i] = 8;
+    return {str("general.architecture", "lfm2moe"), u32(a + "block_count", 40),
+            u32(a + "embedding_length", 2048), u32(a + "context_length", 131072),
+            u32(a + "attention.head_count", 32), u32s(a + "attention.head_count_kv", kv),
+            f32(a + "attention.layer_norm_rms_epsilon", 1e-5f), f32(a + "rope.freq_base", 1e7f),
+            u32(a + "shortconv.l_cache", 3), u32(a + "leading_dense_block_count", 2),
+            u32(a + "feed_forward_length", 11776), u32(a + "expert_count", 64), u32(a + "expert_used_count", 4),
+            u32(a + "expert_feed_forward_length", 1536), u32(a + "expert_gating_func", 2)};
 }
 
 std::vector<Kv> qwen3moe() {
@@ -233,6 +247,15 @@ static int run() {
               "per-layer expert width array, shared width fallback");
         check(!s.layer_routes(0) && s.moe_index(1) == 0 && s.n_moe_layers() == 47 && s.n_ff == 6912,
               "one leading dense layer, 47 MoE layers");
+    std::printf("lfm2moe (LFM2.5-24B-A2B)\n");
+        const bool ok = read(lfm2moe(), s, err);
+        check(s.arch == strata::ModelArch::Lfm2Moe && s.n_layer == 40 && s.n_nextn == 0, "40 trunk layers, no MTP");
+        check(s.recurrent[0] && s.recurrent[1] && !s.recurrent[2] && s.recurrent[39] && !s.recurrent[38],
+              "short-conv layers are the ones without K/V heads");
+        check(s.key_length == 64 && s.shortconv_l_cache == 3 && s.expert_bias, "64-wide heads, a 3-wide short-conv, an expert bias");
+        check(!s.layer_routes(1) && s.moe_index(2) == 0 && s.n_moe_layers() == 38 && s.n_ff == 11776,
+              "the 2 dense layers do not route; the MoE index starts after them");
+        check(s.gating == strata::ExpertGating::Sigmoid && s.n_expert_shared == 0, "sigmoid gating, no shared expert");
     }
 
     std::printf("refusals\n");
@@ -245,6 +268,9 @@ static int run() {
         kvs.erase(kvs.begin() + 8);   // expert_count
         check(!read(kvs, s, err) && err.find("qwen3moe.expert_count") != std::string::npos, "a missing key, named");
         check(!read(glm5next(3), s, err) && err.find("hyper_connection.count") != std::string::npos, "an mHC of 3 streams");
+        kvs = lfm2moe();
+        kvs.erase(kvs.begin() + 8);   // shortconv.l_cache
+        check(!read(kvs, s, err) && err.find("shortconv.l_cache") != std::string::npos, "a missing short-conv window, named");
     }
 
     std::printf("%s\n", g_fail ? "FAIL" : "PASS");

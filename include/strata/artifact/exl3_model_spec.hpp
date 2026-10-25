@@ -10,7 +10,7 @@
 
 namespace strata::artifact::exl3 {
 
-/// Read the Qwen3.5/Qwen3.8/HyV3 geometry needed by the engine without a
+/// Read the Qwen3.5/Qwen3.8/HyV3/LFM2 MoE geometry needed by the engine without a
 /// GGUF metadata pack. When include_mtp is false, the returned ModelSpec is
 /// explicitly trunk-only. Qwen3.8 MTP is rejected when requested because the
 /// official raw MTP source and its override precedence are a separate loader

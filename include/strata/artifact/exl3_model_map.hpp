@@ -12,9 +12,10 @@
 
 namespace strata::artifact::exl3 {
 
-enum class ModelFamily { qwen35, qwen38, hyv3 };
+enum class ModelFamily { qwen35, qwen38, hyv3, lfm2moe };
 
 enum class ProjectionKind {
+    conv_in, conv_out, dense_gate, dense_up, dense_down,
     gdn_qkv, gdn_z, gdn_out, gdn_alpha, gdn_beta,
     qsa_q, qsa_k, qsa_v, qsa_out, qsa_indexer_q, qsa_indexer_k,
     router, shared_scalar, shared_gate, shared_up, shared_down,
@@ -54,7 +55,9 @@ struct ModelGeometry {
     int64_t indexer_head_dim = 0;
     int64_t full_attention_interval = 0;
     int64_t dense_lead = 0;          ///< hyv3: leading dense-MLP layers
-    int64_t dense_intermediate = 0;  ///< hyv3: the dense MLP's width
+    int64_t dense_intermediate = 0;  ///< hyv3 dense MLP / lfm2moe leading dense FFN width
+    int64_t dense_layers = 0;         ///< lfm2moe: leading dense FFN layers
+    int64_t shortconv_l_cache = 0;    ///< lfm2moe: the short-conv window length
     int64_t hc_count = 0;
     int64_t hc_rank = 0;
 };
@@ -136,7 +139,8 @@ struct ModelMap {
     bool require_supported(std::string& err) const;
 };
 
-/// Discover and validate the explicit Qwen3.5/Qwen3.8 mapping from the
+/// Discover and validate the explicit Qwen3.5/Qwen3.8 mapping (an LFM2 MoE archive is recognized, its
+/// geometry recorded, and the engine pieces it still lacks listed in `unsupported`) from the
 /// archive's config, EXL3 descriptors, and raw tensor headers. This reads no
 /// weight payloads and returns a useful partial map with `unsupported` reasons
 /// for recognized but not yet engine-compatible variants.
