@@ -1396,7 +1396,6 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     const int64_t Nn = g.n_embd, HCN = g.hc * g.n_embd, KV = g.n_head_kv * g.head_dim;
     if (Nn != N || g.hc != HC || g.hc_lr != LR)   // the hyper-connection kernels' fixed shapes
         return decline("the geometry is not the hyper-connection kernels' fixed shapes");
-    constexpr int kQ8_0 = 8;   // GGML_TYPE_Q8_0
     const float* w_ne = mtp.tensor_f32("pre_fc_norm_embedding.weight");
     const void* w_fe = mtp.tensor_q8("fc_embedding.weight");
     const float* w_nh = mtp.tensor_f32("pre_fc_norm_hidden.weight");
@@ -1479,7 +1478,7 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
         }
         rms_rows(emb, w_ne, nb, Nn, Nn, EPS, m.cs);
         to_f16(emb, en16, nb * Nn, m.cs);
-        m.gemm.native(en16, kQ8_0, w_fe, e2, nb, Nn, Nn);
+        m.gemm.native(en16, mtp.tensor_q8_type("fc_embedding.weight"), w_fe, e2, nb, Nn, Nn);
         if (!strata::gpu::copy_async(hn, R_rows + (size_t) b0 * HCN, (size_t) nb * HCN * 4, m.cs)) {
             err = "prefill: the draft rows' copy failed";
             return false;
@@ -1489,7 +1488,7 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
         else
             rms_rows(hn, w_nh, nb, HCN, HCN, EPS, m.cs);
         to_f16(hn, hn16, nb * HCN, m.cs);
-        m.gemm.native(hn16, kQ8_0, w_fh, h2, nb * g.hc, Nn, Nn);   // every stream through fc_hidden
+        m.gemm.native(hn16, mtp.tensor_q8_type("fc_hidden.weight"), w_fh, h2, nb * g.hc, Nn, Nn);   // every stream through fc_hidden
         strata::kernels::add_streams_broadcast(h2, e2, Rm, Nn, (int) g.hc, (int) nb, m.cs);
         // the attention hyper-connection's read (its mixed input only: this pass writes nothing back)
         gr_norm_rs(Rm, w_hn, EPS, rs, xn16, nb, m.cs);
@@ -1498,8 +1497,8 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
         m.gemm.bf16(lo16, w_up, gated, nb, HCN, LR);
         gr_mix_r(Rm, rs, w_hn, gated, mixed, nullptr, nb, m.cs, mixed_h);
         // K and V into the drafter's cache, as the prompt path's QSA layers append theirs
-        m.gemm.native(mixed_h, kQ8_0, w_k, Kc, nb, KV, Nn);
-        m.gemm.native(mixed_h, kQ8_0, w_v, Vc, nb, KV, Nn);
+        m.gemm.native(mixed_h, mtp.tensor_q8_type("self_attn.k_proj.weight"), w_k, Kc, nb, KV, Nn);
+        m.gemm.native(mixed_h, mtp.tensor_q8_type("self_attn.v_proj.weight"), w_v, Vc, nb, KV, Nn);
         rms_rows(Kc, w_kn, nb * g.n_head_kv, g.head_dim, g.head_dim, EPS, m.cs);
         rope(Kc, nb, g.n_head_kv, g.head_dim, KV, c0, strata::kernels::rope_scaling(), m.cs);
         if (st.kv_rot) {   // rotated as the drafter's own pass stores them (mtp.cpp)
