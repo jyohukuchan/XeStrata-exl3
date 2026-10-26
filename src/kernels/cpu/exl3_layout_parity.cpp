@@ -589,6 +589,40 @@ void check_matrix(const Matrix& canonical, const Matrix& cpu, format::TileOrder 
     }
 }
 
+// One routed expert: gate, up, the product and down.  The canonical bytes
+// against the same bytes in the CPU order, through the same `expert` entry
+// the pool calls.
+void check_expert(const Matrix& canonical_gate, const Matrix& canonical_up, const Matrix& canonical_down,
+                  const Matrix& cpu_gate, const Matrix& cpu_up, const Matrix& cpu_down, format::TileOrder order,
+                  int64_t hidden, int64_t ff, const std::vector<float>& hidden_input, const std::string& label,
+                  size_t& compared) {
+    const format::ExpertView canonical_expert{
+        format::ProjectionView(view(canonical_gate, format::TileOrder::canonical)),
+        format::ProjectionView(view(canonical_up, format::TileOrder::canonical)),
+        format::ProjectionView(view(canonical_down, format::TileOrder::canonical))};
+    const format::ExpertView cpu_expert{format::ProjectionView(view(cpu_gate, order)),
+                                        format::ProjectionView(view(cpu_up, order)),
+                                        format::ProjectionView(view(cpu_down, order))};
+    const size_t max_k = static_cast<size_t>(std::max(hidden, ff));
+    std::vector<float> scratch_input(max_k);
+    std::vector<float> gate(static_cast<size_t>(ff));
+    std::vector<float> up(static_cast<size_t>(ff));
+    std::array<uint16_t, 256> tile{};
+    cpu_exl3::ExpertScratch canonical_scratch{{scratch_input.data(), scratch_input.size(), tile.data(), tile.size()},
+                                              gate.data(), gate.size(), up.data(), up.size()};
+    std::vector<float> canonical_y(static_cast<size_t>(hidden));
+    std::vector<float> cpu_y(static_cast<size_t>(hidden));
+    const cpu_exl3::Status canonical_status = cpu_exl3::expert(canonical_expert, hidden_input.data(), hidden,
+                                                               canonical_y.data(), hidden, 1, canonical_scratch);
+    const cpu_exl3::Status cpu_status = cpu_exl3::expert(cpu_expert, hidden_input.data(), hidden, cpu_y.data(),
+                                                         hidden, 1, canonical_scratch);
+    const std::string tag = std::string(" [") + order_name(order) + "]";
+    check(canonical_status == cpu_exl3::Status::ok && cpu_status == cpu_exl3::Status::ok &&
+              same_bits(canonical_y, cpu_y) && all_finite(cpu_y),
+          label + " expert is bit identical" + tag);
+    compared += canonical_y.size();
+}
+
 }  // namespace
 
 int main() {
@@ -632,34 +666,41 @@ int main() {
                     check_matrix(canonical_down, cpu_down, order, ff_input, label + " down" + tag, projections, values);
 
                     // The expert composition: gate, up, the product and down.
-                    const format::ExpertView canonical_expert{
-                        format::ProjectionView(view(canonical_gate, format::TileOrder::canonical)),
-                        format::ProjectionView(view(canonical_up, format::TileOrder::canonical)),
-                        format::ProjectionView(view(canonical_down, format::TileOrder::canonical))};
-                    const format::ExpertView cpu_expert{format::ProjectionView(view(cpu_gate, order)),
-                                                        format::ProjectionView(view(cpu_up, order)),
-                                                        format::ProjectionView(view(cpu_down, order))};
-                    const size_t max_k = static_cast<size_t>(std::max(shape.hidden, shape.ff));
-                    std::vector<float> scratch_input(max_k);
-                    std::vector<float> gate(static_cast<size_t>(shape.ff));
-                    std::vector<float> up(static_cast<size_t>(shape.ff));
-                    std::array<uint16_t, 256> tile{};
-                    cpu_exl3::ExpertScratch canonical_scratch{{scratch_input.data(), scratch_input.size(), tile.data(),
-                                                               tile.size()},
-                                                              gate.data(), gate.size(), up.data(), up.size()};
-                    std::vector<float> canonical_y(static_cast<size_t>(shape.hidden));
-                    std::vector<float> cpu_y(static_cast<size_t>(shape.hidden));
-                    const cpu_exl3::Status canonical_status =
-                        cpu_exl3::expert(canonical_expert, hidden_input.data(), shape.hidden, canonical_y.data(),
-                                         shape.hidden, 1, canonical_scratch);
-                    const cpu_exl3::Status cpu_status = cpu_exl3::expert(cpu_expert, hidden_input.data(), shape.hidden,
-                                                                         cpu_y.data(), shape.hidden, 1,
-                                                                         canonical_scratch);
-                    check(canonical_status == cpu_exl3::Status::ok && cpu_status == cpu_exl3::Status::ok &&
-                              same_bits(canonical_y, cpu_y) && all_finite(cpu_y),
-                          label + " expert is bit identical" + tag);
-                    compared += canonical_y.size();
+                    check_expert(canonical_gate, canonical_up, canonical_down, cpu_gate, cpu_up, cpu_down, order,
+                                 shape.hidden, shape.ff, hidden_input, label, compared);
                 }
+            }
+        }
+    }
+
+    // The production shape of Qwen3.8-Flash-Next (hidden 2560, expert FF
+    // 640): gate and up are 2560x640, down is 640x2560.  Only the MUL1
+    // codebook reaches the integer dot, so only that codebook is swept at
+    // this size.
+    {
+        const int64_t hidden = 2560;
+        const int64_t ff = 640;
+        for (const int bits : {3, 4, 5}) {
+            const int codebook = 2;
+            const Matrix canonical_gate = make_matrix(hidden, ff, bits, codebook, seed);
+            const Matrix canonical_up = make_matrix(hidden, ff, bits, codebook, seed + 1u);
+            const Matrix canonical_down = make_matrix(ff, hidden, bits, codebook, seed + 2u);
+            seed += 3u;
+            const std::vector<float> hidden_input = make_input(hidden, seed);
+            const std::vector<float> ff_input = make_input(ff, seed + 1u);
+            const std::string label = "matrix " + std::to_string(hidden) + "x" + std::to_string(ff) + " bits" +
+                                      std::to_string(bits) + " cb" + std::to_string(codebook);
+            for (const format::TileOrder order : kCpuOrders) {
+                const Matrix cpu_gate = reordered(canonical_gate, order);
+                const Matrix cpu_up = reordered(canonical_up, order);
+                const Matrix cpu_down = reordered(canonical_down, order);
+                const std::string tag = std::string(" [") + order_name(order) + "]";
+                check_matrix(canonical_gate, cpu_gate, order, hidden_input, label + " gate" + tag, projections,
+                             values);
+                check_matrix(canonical_up, cpu_up, order, hidden_input, label + " up" + tag, projections, values);
+                check_matrix(canonical_down, cpu_down, order, ff_input, label + " down" + tag, projections, values);
+                check_expert(canonical_gate, canonical_up, canonical_down, cpu_gate, cpu_up, cpu_down, order,
+                             hidden, ff, hidden_input, label, compared);
             }
         }
     }
