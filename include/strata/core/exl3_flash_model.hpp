@@ -91,6 +91,9 @@ struct Exl3FlashModelOptions {
                                            ///< counts and saves them as a profile for the next run
     bool expert_miss_direct = false;       ///< misses are read by the GPU from pinned host memory over
                                            ///< the bus instead of being computed on the CPU
+    int64_t expert_adapt_every = 0;        ///< tokens between adaptive-tier rounds (0: off, the default;
+                                           ///< the resident set then never changes after open)
+    int64_t expert_adapt_swaps = 32;       ///< the most experts one adaptive round moves into the cache
     std::string embedding_name;            ///< empty: ModelMap's HF embedding prefix
     std::string ple_sidecar;              ///< empty: discover the specialized EXL3 sidecar
 };
@@ -242,6 +245,8 @@ public:
         int64_t cpu_miss_entries = 0;
         int64_t direct_miss_entries = 0;
         int64_t resident_pairs = 0;
+        int64_t adapt_swaps = 0;    ///< experts the adaptive tier moved in since open (0 when off)
+        int64_t adapt_rounds = 0;
     };
     ExpertCacheStats expert_cache_stats() const;
     /// Writes the firing frequencies recorded this run (options.expert_profile_save) as a profile file
@@ -285,6 +290,8 @@ public:
     const std::shared_ptr<const strata::artifact::exl3::Archive>& archive() const;
 
 private:
+    /// One adaptive-tier round on every stage (no-op unless expert_adapt_every > 0).
+    bool adapt_round(std::string& err);
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

@@ -277,6 +277,8 @@ bool Exl3ExpertRuntime::open(Exl3ExpertSource& source, strata::kernels::cpu::Exp
     }
     source_ = &source;
     pool_ = &pool;
+    served_begin_ = prewarm_layer_begin;
+    served_end_ = prewarm_layer_end == -1 ? source.n_layers() : prewarm_layer_end;
     n_layers_ = source.n_layers();
     n_expert_ = source.n_expert();
     max_tokens_ = max_tokens;
@@ -513,6 +515,11 @@ bool Exl3ExpertRuntime::prepare_window(int64_t layer, const float* host_fp32_x, 
         if (expert < 0 || expert >= n_expert_) { err = "exl3 runtime: routed expert is out of range"; return false; }
         const size_t at = pair_index(layer, expert);
         if (record_heat_) ++heat_[at];
+        if (adapt_enabled_) {
+            if (adapt_usage_.size() != static_cast<size_t>(pair_count_))
+                adapt_usage_.assign(static_cast<size_t>(pair_count_), 0.0);
+            adapt_usage_[at] += 1.0;
+        }
         const int32_t slot = cache_.valid() ? cache_.slot_of(layer, expert) : kNotResident;
         if (slot >= 0) {
             ++hit_entries_;
@@ -949,6 +956,113 @@ void Exl3ExpertRuntime::mark_gpu_consumed() {
     prepared_ = false;
     cpu_ready_ = false;
     prepared_layer_ = -1;
+}
+
+// The adaptive tier's one round, mirroring PlainModel::adapt's rule on this runtime's cache: per served
+// layer, a non-resident expert whose decayed usage leads the coldest resident one by 1.5 (and is at
+// least 2) takes that expert's slot; a free slot of its format takes any routed expert.  EXL3 experts
+// differ in format and blob size, so the victim is the coldest resident of the layer whose slot holds
+// the incoming blob (a same-format free slot is preferred when one exists).
+// At most adapt_max_swaps_ experts move, the largest leads first; then every count decays.  The owner
+// calls this only at a token boundary - no window prepared, no GPU plan pending - so the fills below
+// (blocking copies on the legacy stream) cannot race a window that reads the slots, and the device pair
+// table is updated before the next window is prepared.
+bool Exl3ExpertRuntime::adapt_round(std::string& err) {
+    err.clear();
+    if (!adapt_enabled_ || !opened_ || source_ == nullptr) return true;
+    if (!cache_.valid() || all_resident_) return true;
+    if (prepared_ || pending_gpu_) {
+        err = "exl3 runtime: adaptive round while a window is prepared or a GPU plan is pending";
+        return false;
+    }
+    if (adapt_usage_.size() != static_cast<size_t>(pair_count_)) return true;   // nothing routed yet
+    struct Cand { double usage; int64_t layer; int32_t expert; };
+    std::vector<Cand> cands;
+    for (int64_t layer = served_begin_; layer < served_end_; ++layer)
+        for (int32_t e = 0; e < static_cast<int32_t>(n_expert_); ++e) {
+            const size_t at = pair_index(layer, e);
+            if (cache_.slot_of(layer, e) < 0 && adapt_usage_[at] > 0.0)
+                cands.push_back({adapt_usage_[at], layer, e});
+        }
+    std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) { return a.usage > b.usage; });
+    int64_t done = 0;
+    std::vector<uint8_t> blob;
+    for (const Cand& c : cands) {
+        if (done >= adapt_max_swaps_) break;
+        const size_t at = pair_index(c.layer, c.expert);
+        if (cache_.slot_of(c.layer, c.expert) >= 0) continue;
+        const Exl3ExpertFormatID format = pair_formats_[at];
+        const int64_t bytes =
+            static_cast<int64_t>(format_table_host_[static_cast<size_t>(pair_format_index_[at])].total_bytes);
+        int32_t slot = cache_.admit(c.layer, c.expert, format);
+        int32_t victim = -1;
+        if (slot < 0) {
+            // No free slot of this format: evict the layer's coldest resident whose slot holds the
+            // candidate's blob, if the candidate leads it by 1.5 and was routed at least twice.
+            double coldest_usage = std::numeric_limits<double>::max();
+            int32_t victim_slot = kNotResident;
+            for (int32_t e = 0; e < static_cast<int32_t>(n_expert_); ++e) {
+                const int32_t resident_slot = cache_.slot_of(c.layer, e);
+                if (resident_slot < 0 || cache_.slot_bytes(resident_slot) < bytes) continue;
+                const double usage = adapt_usage_[pair_index(c.layer, e)];
+                if (usage < coldest_usage) { coldest_usage = usage; victim = e; victim_slot = resident_slot; }
+            }
+            if (victim < 0 || c.usage < 2.0 || c.usage < coldest_usage + 1.5) continue;
+            if (cache_.evict(c.layer, victim) < 0) continue;
+            if (!cache_.admit_at(c.layer, c.expert, victim_slot)) {
+                cache_.admit_at(c.layer, victim, victim_slot);
+                continue;
+            }
+            slot = victim_slot;
+        }
+        const auto& layout = format_table_host_[static_cast<size_t>(pair_format_index_[at])];
+        blob.resize(static_cast<size_t>(layout.total_bytes));
+        if (!source_->copy_blob(c.layer, c.expert, blob.data()) ||
+            !cache_.fill_slot_blocking(slot, blob.data(), err, static_cast<int64_t>(blob.size()))) {
+            // Leave the cache consistent: drop the incoming pair and restore the victim if there was one.
+            cache_.evict(c.layer, c.expert);
+            if (victim >= 0) {
+                const int32_t back = cache_.admit_at(c.layer, victim, slot) ? slot : kNotResident;
+                if (back >= 0) {
+                    const auto& vlayout =
+                        format_table_host_[static_cast<size_t>(pair_format_index_[pair_index(c.layer, victim)])];
+                    blob.resize(static_cast<size_t>(vlayout.total_bytes));
+                    std::string ignored;
+                    if (source_->copy_blob(c.layer, victim, blob.data()))
+                        cache_.fill_slot_blocking(back, blob.data(), ignored,
+                                                  static_cast<int64_t>(blob.size()));
+                }
+            }
+            if (err.empty()) err = "exl3 runtime: adaptive tier could not read an expert";
+            return false;
+        }
+        // The device pair table (the device-hit plan's residency view) follows the cache before the
+        // next window is prepared.
+        if (d_pair_blob_base_ != nullptr) {
+            const uint64_t in_addr =
+                static_cast<uint64_t>(reinterpret_cast<uintptr_t>(cache_.device_slot(slot)));
+            const int32_t in_format = pair_format_index_[at];
+            const uint64_t out_addr = 0;
+            const int32_t out_format = -1;
+            bool copied = strata::gpu::copy(d_pair_blob_base_ + at, &in_addr, sizeof(in_addr)) &&
+                          strata::gpu::copy(d_pair_format_index_ + at, &in_format, sizeof(in_format));
+            if (copied && victim >= 0) {
+                const size_t vat = pair_index(c.layer, victim);
+                copied = strata::gpu::copy(d_pair_blob_base_ + vat, &out_addr, sizeof(out_addr)) &&
+                         strata::gpu::copy(d_pair_format_index_ + vat, &out_format, sizeof(out_format));
+            }
+            if (!copied) {
+                err = std::string("exl3 runtime: adaptive tier pair table update: ") +
+                      strata::gpu::last_error();
+                return false;
+            }
+        }
+        ++done;
+        ++adapt_swaps_total_;
+    }
+    ++adapt_rounds_;
+    for (double& usage : adapt_usage_) usage *= adapt_decay_;
+    return true;
 }
 
 }  // namespace strata::core

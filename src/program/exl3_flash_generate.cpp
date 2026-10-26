@@ -142,6 +142,11 @@ void usage() {
                  "                      record this run's expert firing frequencies and save them to P as a profile\n"
                  "  --expert-miss M     cpu (default): non-resident experts are computed on the CPU; direct: the GPU\n"
                  "                      reads non-resident experts from pinned host memory over the bus\n"
+                 "  --expert-adapt-every N\n"
+                 "                      tokens between adaptive-tier rounds that swap hot experts into the\n"
+                 "                      device cache (0, the default: the resident set never changes)\n"
+                 "  --expert-adapt-swaps N\n"
+                 "                      the most experts one adaptive round moves (default 32)\n"
                  "  --spec 0..6         2..6 run the serial MTP draft loop with up to N-1 drafts per window; 0|1 stay plain AR\n"
                  "  --spec-window R     auto (default): size each window by expected tokens per ms (DraftPolicy);\n"
                  "                      min-p: size it by the --spec-min-p floor instead. The rules are alternatives:\n"
@@ -197,6 +202,7 @@ int exl3_flash_main(int argc, char** argv) {
     std::string metadata_gguf, dump_path;
     std::string expert_profile, expert_profile_save;
     bool expert_miss_direct = false;
+    int64_t expert_adapt_every = 0, expert_adapt_swaps = 32;
     int64_t max_new = 16, context = 0;
     bool stop_eos = false;
     int spec = 0, pool_workers = 0;
@@ -298,6 +304,18 @@ int exl3_flash_main(int argc, char** argv) {
                 return 2;
             }
         }
+        else if (argument == "--expert-adapt-every") {
+            if (!parse_i64(next("--expert-adapt-every"), expert_adapt_every) || expert_adapt_every < 0) {
+                std::fprintf(stderr, "strata exl3-flash: --expert-adapt-every must be a nonnegative integer\n");
+                return 2;
+            }
+        }
+        else if (argument == "--expert-adapt-swaps") {
+            if (!parse_i64(next("--expert-adapt-swaps"), expert_adapt_swaps) || expert_adapt_swaps < 1) {
+                std::fprintf(stderr, "strata exl3-flash: --expert-adapt-swaps must be a positive integer\n");
+                return 2;
+            }
+        }
         else if (argument == "--dump-logits") dump_path = next("--dump-logits");
         else if (argument == "--spec0") spec = 0;
         else if (argument == "--spec1") spec = 1;
@@ -391,6 +409,8 @@ int exl3_flash_main(int argc, char** argv) {
     options.expert_profile = expert_profile;
     options.expert_profile_save = expert_profile_save;
     options.expert_miss_direct = expert_miss_direct;
+    options.expert_adapt_every = expert_adapt_every;
+    options.expert_adapt_swaps = expert_adapt_swaps;
     options.vision = false;
     std::string err;
     const Clock::time_point load_begin = Clock::now();
@@ -577,6 +597,9 @@ int exl3_flash_main(int argc, char** argv) {
                      routed > 0 ? 100.0 * static_cast<double>(cache.hit_entries) / static_cast<double>(routed) : 0.0,
                      (long long) cache.cpu_miss_entries, (long long) cache.direct_miss_entries,
                      expert_miss_direct ? "direct" : "cpu");
+        if (expert_adapt_every > 0)
+            std::fprintf(stderr, "strata (qwen4exp-exl3): adaptive tier: %lld swaps in %lld rounds\n",
+                         (long long) cache.adapt_swaps, (long long) cache.adapt_rounds);
         if (!expert_profile_save.empty()) {
             std::string save_err;
             if (!model.save_expert_profile(expert_profile_save, save_err)) {

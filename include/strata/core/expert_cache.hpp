@@ -169,6 +169,18 @@ public:
     int32_t admit(int64_t layer, int64_t expert);
     /// Claims a slot from the exact format bucket.  Returns kNotResident for an unknown/full bucket.
     int32_t admit(int64_t layer, int64_t expert, uint64_t format_id);
+    /// Releases `(layer, expert)`'s slot back to its bucket (or layer range), so a later `admit` reuses
+    /// it.  Returns the freed slot, or `kNotResident` when the pair was not resident.  Admission itself
+    /// still never evicts (see `admit`); this exists for the adaptive tier, which evicts explicitly at a
+    /// token boundary when no window reads the cache.  The caller refills the slot before any window
+    /// can route the incoming pair.
+    int32_t evict(int64_t layer, int64_t expert);
+    /// Claims one specific free `slot` for `(layer, expert)` (a slot `evict` just released), whatever
+    /// bucket it came from.  False when the pair is already resident or the slot is not free.  The
+    /// caller checks the slot holds the pair's blob (`slot_bytes`) and refills it before use.
+    bool admit_at(int64_t layer, int64_t expert, int32_t slot);
+    /// The bytes `slot` can hold (its bucket's blob size, or its sized span).
+    int64_t slot_bytes(int32_t slot) const { return (int64_t) slot_capacity(slot); }
     /// Format ID associated with a slot, or zero for legacy/open_sized caches and invalid slots.
     uint64_t slot_format(int32_t slot) const;
 
@@ -277,6 +289,9 @@ private:
     std::vector<int32_t> bucket_slots_;
     std::vector<int32_t> bucket_next_;
     std::vector<int32_t> bucket_layer_next_;
+    std::vector<int32_t> free_slots_;                 ///< non-bucket slots released by evict()
+    std::vector<std::vector<int32_t>> layer_free_;    ///< per-layer slots released by evict() (per-layer admission)
+    std::vector<std::vector<int32_t>> bucket_free_;   ///< [bucket * n_layers + layer] slots released by evict()
 
     int bucket_of(uint64_t format_id) const;
     uint64_t slot_capacity(int32_t slot) const;

@@ -471,6 +471,9 @@ void ExpertCache::start_tables(int64_t n_slots, int64_t n_layers, int64_t n_expe
         layer_slot_range(l, lo, hi);
         layer_next_[(size_t) l] = (int32_t) lo;
     }
+    free_slots_.clear();
+    layer_free_.assign((size_t) (n_layers > 0 ? n_layers : 0), {});
+    bucket_free_.clear();
 }
 
 // set_max_piece: the slots in runs of at most piece_max_ bytes, taken from the end so the last run (the prompt path's
@@ -675,6 +678,7 @@ bool ExpertCache::open_buckets(const std::vector<ExpertCacheBucket>& buckets, in
     bucket_formats_ = std::move(formats);
     bucket_first_ = std::move(first);
     bucket_slots_ = std::move(counts);
+    bucket_free_.assign(bucket_formats_.size() * (size_t) n_layers, {});
     bucket_next_.resize(bucket_formats_.size());
     bucket_layer_next_.assign(bucket_formats_.size() * (size_t) n_layers, 0);
     for (size_t b = 0; b < bucket_formats_.size(); ++b) {
@@ -721,6 +725,9 @@ void ExpertCache::close() {
     bucket_slots_.clear();
     bucket_next_.clear();
     bucket_layer_next_.clear();
+    free_slots_.clear();
+    layer_free_.clear();
+    bucket_free_.clear();
     slot_payload_bytes_.clear();
 }
 
@@ -749,10 +756,23 @@ int32_t ExpertCache::admit(int64_t layer, int64_t expert) {
     // than one counter shared by all 48 - which is what confined the measured hit rate to 2.97%.
     if (per_layer_) {
         if (layer_next_.empty()) return kNotResident;
+        auto& freed = layer_free_[(size_t) layer];
+        if (!freed.empty()) {
+            residency_[at] = freed.back();
+            freed.pop_back();
+            ++admitted_;
+            return residency_[at];
+        }
         int64_t lo = 0, hi = 0;
         layer_slot_range(layer, lo, hi);
         if ((int64_t) layer_next_[(size_t) layer] >= hi) return kNotResident;   // this layer's quota is full
         residency_[at] = layer_next_[(size_t) layer]++;
+        ++admitted_;
+        return residency_[at];
+    }
+    if (!free_slots_.empty()) {
+        residency_[at] = free_slots_.back();
+        free_slots_.pop_back();
         ++admitted_;
         return residency_[at];
     }
@@ -777,6 +797,14 @@ int32_t ExpertCache::admit(int64_t layer, int64_t expert, uint64_t format_id) {
     if (bucket < 0) return kNotResident;
     int32_t slot = kNotResident;
     if (per_layer_) {
+        auto& freed = bucket_free_[(size_t) bucket * (size_t) n_layers_ + (size_t) layer];
+        if (!freed.empty()) {
+            slot = freed.back();
+            freed.pop_back();
+            residency_[at] = slot;
+            ++admitted_;
+            return slot;
+        }
         const int64_t q = bucket_slots_[(size_t) bucket] / n_layers_;
         const int64_t bucket_hi = layer == n_layers_ - 1
                                ? (int64_t) bucket_first_[(size_t) bucket] + bucket_slots_[(size_t) bucket]
@@ -786,6 +814,14 @@ int32_t ExpertCache::admit(int64_t layer, int64_t expert, uint64_t format_id) {
         if ((int64_t) next >= hi) return kNotResident;
         slot = next++;
     } else {
+        auto& freed = bucket_free_[(size_t) bucket * (size_t) n_layers_];
+        if (!freed.empty()) {
+            slot = freed.back();
+            freed.pop_back();
+            residency_[at] = slot;
+            ++admitted_;
+            return slot;
+        }
         int32_t& next = bucket_next_[(size_t) bucket];
         const int32_t end = (int32_t) std::min<int64_t>(
             (int64_t) bucket_first_[(size_t) bucket] + bucket_slots_[(size_t) bucket], live_slots_);
@@ -794,6 +830,49 @@ int32_t ExpertCache::admit(int64_t layer, int64_t expert, uint64_t format_id) {
     }
     residency_[at] = slot;
     ++admitted_;
+    return slot;
+}
+
+bool ExpertCache::admit_at(int64_t layer, int64_t expert, int32_t slot) {
+    if (layer < 0 || layer >= n_layers_ || expert < 0 || expert >= n_expert_) return false;
+    if (slot < 0 || slot >= slots_) return false;
+    const size_t at = (size_t) (layer * n_expert_ + expert);
+    if (residency_[at] != kNotResident) return false;
+    const auto take = [slot](std::vector<int32_t>& free_list) {
+        const auto it = std::find(free_list.begin(), free_list.end(), slot);
+        if (it == free_list.end()) return false;
+        free_list.erase(it);
+        return true;
+    };
+    bool held = take(free_slots_);
+    for (auto& free_list : layer_free_) held = take(free_list) || held;
+    for (auto& free_list : bucket_free_) held = take(free_list) || held;
+    // A slot past every admission counter is free too (never handed out): nothing to take.
+    if (!held) {
+        for (const int32_t owner : residency_)
+            if (owner == slot) return false;
+    }
+    residency_[at] = slot;
+    ++admitted_;
+    return true;
+}
+
+int32_t ExpertCache::evict(int64_t layer, int64_t expert) {
+    if (layer < 0 || layer >= n_layers_ || expert < 0 || expert >= n_expert_) return kNotResident;
+    const size_t at = (size_t) (layer * n_expert_ + expert);
+    const int32_t slot = residency_[at];
+    if (slot == kNotResident) return kNotResident;
+    residency_[at] = kNotResident;
+    --admitted_;
+    if (!bucket_formats_.empty()) {
+        const int bucket = bucket_of(slot_format(slot));
+        if (bucket >= 0)
+            bucket_free_[(size_t) bucket * (size_t) n_layers_ + (size_t) (per_layer_ ? layer : 0)].push_back(slot);
+    } else if (per_layer_) {
+        layer_free_[(size_t) layer].push_back(slot);
+    } else {
+        free_slots_.push_back(slot);
+    }
     return slot;
 }
 

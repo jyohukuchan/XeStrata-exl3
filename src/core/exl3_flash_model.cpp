@@ -283,10 +283,12 @@ DeviceCachePlan plan_device_cache(const Exl3ExpertSource& source, int64_t layer_
 bool open_device_cache(Exl3ExpertSource& source, strata::kernels::cpu::ExpertPool& pool, Exl3ExpertRuntime& runtime,
                        size_t stage_index, int64_t layer_begin, int64_t layer_end, int64_t n_expert,
                        int64_t n_layers, int64_t max_rows, int64_t routed_k, bool allow_cpu_miss,
-                       const std::string& profile_path, bool miss_direct, bool record_heat, std::string& err) {
+                       const std::string& profile_path, bool miss_direct, bool record_heat,
+                       bool adapt, int64_t adapt_swaps, std::string& err) {
     runtime.set_miss_mode(miss_direct ? Exl3ExpertRuntime::MissMode::Direct
                                       : Exl3ExpertRuntime::MissMode::Cpu);
     runtime.set_record_heat(record_heat);
+    runtime.set_adaptive(adapt, adapt_swaps, 0.7);
     const auto no_cache = [&](const char* why) {
         if (!allow_cpu_miss) {
             err = "EXL3 Flash: stage " + std::to_string(stage_index) + " expert runtime: the device cache is " +
@@ -1383,7 +1385,7 @@ bool Exl3FlashModel::open(const std::filesystem::path& directory, const Exl3Flas
                     if (!open_device_cache(*impl_->mtp_source, *impl_->mtp_pool, *impl_->mtp_runtime,
                                            impl_->stages.size(), 0, 1, impl_->geometry.n_expert,
                                            impl_->geometry.n_layers, options.max_rows, routed_k,
-                                           options.allow_cpu_expert_miss, "", false, false, err)) {
+                                           options.allow_cpu_expert_miss, "", false, false, false, 0, err)) {
                         err = "EXL3 Flash MTP expert runtime: " + err;
                         return false;
                     }
@@ -1535,7 +1537,9 @@ bool Exl3FlashModel::open(const std::filesystem::path& directory, const Exl3Flas
                                    stage.layer_begin, stage.layer_end, impl_->geometry.n_expert,
                                    impl_->geometry.n_layers, std::max<int64_t>(options.max_rows, options.prompt_chunk), routed_k,
                                    options.allow_cpu_expert_miss, options.expert_profile,
-                                   options.expert_miss_direct, !options.expert_profile_save.empty(), err)) {
+                                   options.expert_miss_direct, !options.expert_profile_save.empty(),
+                                   options.expert_adapt_every > 0,
+                                   options.expert_adapt_swaps > 0 ? options.expert_adapt_swaps : 32, err)) {
                 return false;
             }
         }
@@ -1978,6 +1982,32 @@ bool Exl3FlashModel::reset(std::string& err) {
     }
 }
 
+/// One adaptive-tier round on every stage, at a token boundary: the previous token's windows are all
+/// consumed (the head's copy back synchronised the last stage, and the stages before it finished when
+/// their residuals crossed), so no window reads a slot the round moves.  Says what it did and the hit
+/// rate so far, which is the tier's learning curve in the run's log.
+bool Exl3FlashModel::adapt_round(std::string& err) {
+    err.clear();
+    int64_t swaps = 0, hits = 0, routed = 0;
+    for (auto& stage : impl_->stages) {
+        if (stage.runtime == nullptr || !stage.runtime->adaptive()) continue;
+        const int64_t before = stage.runtime->adapt_swaps_total();
+        {
+            const OnDevice on(stage.device);
+            if (!stage.runtime->adapt_round(err)) return false;
+        }
+        swaps += stage.runtime->adapt_swaps_total() - before;
+        hits += stage.runtime->total_hit_entries();
+        routed += stage.runtime->total_hit_entries() + stage.runtime->total_cpu_miss_entries() +
+                  stage.runtime->total_direct_miss_entries();
+    }
+    std::fprintf(stderr,
+                 "strata exl3-flash: adaptive round at position %lld: %lld swaps, hit rate %.2f%% so far\n",
+                 (long long) impl_->next_position, (long long) swaps,
+                 routed > 0 ? 100.0 * (double) hits / (double) routed : 0.0);
+    return true;
+}
+
 bool Exl3FlashModel::forward(int32_t token, int64_t pos, int32_t& next_token, float* host_logits,
                              std::string& err) {
     err.clear();
@@ -1996,6 +2026,16 @@ bool Exl3FlashModel::forward(int32_t token, int64_t pos, int32_t& next_token, fl
     if (token < 0 || static_cast<int64_t>(token) >= impl_->map.geometry.vocab_size) {
         err = "EXL3 Flash: token is outside the embedding vocabulary";
         return false;
+    }
+    // The adaptive tier moves at this boundary: every window of the tokens before this one has been
+    // consumed, and this token's windows have not been prepared yet.
+    if (impl_->options.expert_adapt_every > 0 && impl_->next_position > 0 &&
+        impl_->next_position % impl_->options.expert_adapt_every == 0) {
+        std::string adapt_err;
+        if (!adapt_round(adapt_err)) {
+            err = "EXL3 Flash: adaptive tier: " + adapt_err;
+            return false;
+        }
     }
     PleTicketGuard ple_guard;
     try {
@@ -2553,6 +2593,14 @@ bool Exl3FlashModel::forward_prefill(const int32_t* tokens, int64_t n, int64_t p
         if (next_token < 0) { err = "EXL3 Flash prefill: output logits are all non-finite"; return false; }
         if (host_logits != nullptr) std::copy(impl_->logits_host.begin(), impl_->logits_host.end(), host_logits);
         impl_->next_position = pos0 + n;
+        // The prompt's routing is the adaptive tier's first evidence: one round before decode starts.
+        if (impl_->options.expert_adapt_every > 0 && n > 0) {
+            std::string adapt_err;
+            if (!adapt_round(adapt_err)) {
+                err = "EXL3 Flash: adaptive tier: " + adapt_err;
+                return false;
+            }
+        }
         return true;
     } catch (const std::exception& e) {
         err = std::string("EXL3 Flash prefill: ") + e.what();
@@ -2580,6 +2628,8 @@ Exl3FlashModel::ExpertCacheStats Exl3FlashModel::expert_cache_stats() const {
         stats.cpu_miss_entries += stage.runtime->total_cpu_miss_entries();
         stats.direct_miss_entries += stage.runtime->total_direct_miss_entries();
         stats.resident_pairs += stage.runtime->cache().resident();
+        stats.adapt_swaps += stage.runtime->adapt_swaps_total();
+        stats.adapt_rounds += stage.runtime->adapt_rounds();
     }
     return stats;
 }
@@ -2603,7 +2653,18 @@ bool Exl3FlashModel::save_expert_profile(const std::string& path, std::string& e
         err = "EXL3 Flash: no expert firing frequencies were recorded (expert_profile_save was not set)";
         return false;
     }
-    const auto ranked = rank_learned_profile(layers, experts, {}, heat, {});
+    // What the run learned includes where the adaptive tier left the cache: the resident pairs rank
+    // first (rank_learned_profile), so the next start begins from this run's resident set.
+    std::vector<uint8_t> resident(static_cast<size_t>(layers) * static_cast<size_t>(experts), 0);
+    for (const auto& stage : impl_->stages) {
+        if (stage.runtime == nullptr || !stage.runtime->cache().valid()) continue;
+        for (int64_t layer = stage.layer_begin; layer < stage.layer_end; ++layer)
+            for (int64_t expert = 0; expert < experts; ++expert)
+                if (stage.runtime->cache().slot_of(layer, expert) >= 0)
+                    resident[static_cast<size_t>(layer) * static_cast<size_t>(experts) +
+                             static_cast<size_t>(expert)] = 1;
+    }
+    const auto ranked = rank_learned_profile(layers, experts, resident, heat, {});
     return write_expert_profile(path, layers, experts, ranked, err);
 }
 size_t Exl3FlashModel::stage_count() const { return impl_ == nullptr ? 0 : impl_->stages.size(); }

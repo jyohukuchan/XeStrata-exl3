@@ -105,6 +105,24 @@ public:
     /// True when the Direct staging was allocated and the device can read it (set by open()).
     bool direct_ready() const { return direct_ready_; }
 
+    /// The adaptive tier: while enabled (before open()), `prepare_window` also keeps decayed
+    /// per-pair usage counts, and `adapt_round()` - called by the owner at a token boundary, when no
+    /// window is prepared and no GPU plan is pending - swaps hot non-resident experts into the device
+    /// cache in place of the coldest resident ones of the same layer whose slot holds its blob.  `max_swaps` bounds
+    /// one round; the counts are multiplied by `decay` after each round.  Disabled by default.
+    void set_adaptive(bool on, int64_t max_swaps, double decay) {
+        adapt_enabled_ = on;
+        adapt_max_swaps_ = max_swaps;
+        adapt_decay_ = decay;
+    }
+    bool adaptive() const { return adapt_enabled_; }
+    int64_t adapt_swaps_total() const { return adapt_swaps_total_; }
+    int64_t adapt_rounds() const { return adapt_rounds_; }
+    /// One adaptive round over the served layer range.  False with `err` on a failed copy (the cache
+    /// is left consistent: a failed incoming fill restores the evicted expert).  A fully resident
+    /// runtime, or one without a device cache, is a successful no-op.
+    bool adapt_round(std::string& err);
+
     /// Records every routed (layer, expert) entry's count while set (before open()).  The counts are the
     /// firing-frequency profile a later run ranks its resident set with (write_expert_profile's format).
     void set_record_heat(bool on) { record_heat_ = on; }
@@ -182,6 +200,14 @@ private:
     int64_t direct_capacity_ = 0;         ///< distinct miss experts the arena holds
     bool record_heat_ = false;
     std::vector<uint64_t> heat_;
+    bool adapt_enabled_ = false;
+    int64_t adapt_max_swaps_ = 0;
+    double adapt_decay_ = 0.7;
+    std::vector<double> adapt_usage_;   ///< decayed routed-entry counts per pair (adaptive tier)
+    int64_t adapt_swaps_total_ = 0;
+    int64_t adapt_rounds_ = 0;
+    int64_t served_begin_ = 0;          ///< layer range this runtime serves (open's prewarm range)
+    int64_t served_end_ = 0;
     int64_t total_hit_entries_ = 0;
     int64_t total_cpu_miss_entries_ = 0;
     int64_t total_direct_miss_entries_ = 0;

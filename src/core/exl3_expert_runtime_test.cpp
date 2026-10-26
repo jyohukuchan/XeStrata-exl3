@@ -320,6 +320,69 @@ int main() {
             }
         }
 
+        // The adaptive tier: routing layer 1's non-resident expert 0 until it leads the resident
+        // expert 1 swaps it into expert 1's slot at a token boundary (its blob is the smaller one);
+        // the merged rows still match the CPU reference, with the experts on opposite paths.
+        {
+            std::vector<std::vector<uint8_t>> blobs1(2);
+            std::vector<strata::kernels::exl3::ExpertView> views1;
+            for (int expert = 0; expert < 2; ++expert) {
+                const auto* layout = source.exl3_layout(1, expert);
+                blobs1[static_cast<size_t>(expert)].resize(static_cast<size_t>(layout->total_bytes));
+                if (!source.copy_blob(1, expert, blobs1[static_cast<size_t>(expert)].data())) ++failures;
+                views1.push_back(
+                    strata::kernels::exl3::expert_view(*layout, blobs1[static_cast<size_t>(expert)].data()));
+            }
+            std::vector<float> expected1(static_cast<size_t>(max_tokens * k * ldy), 24680.5f);
+            for (int64_t entry = 0; entry < max_tokens * k; ++entry) {
+                if (strata::kernels::cpu::exl3::expert(views1[static_cast<size_t>(ids[entry])],
+                                                       x.data() + (entry / k) * ldx, ldx,
+                                                       expected1.data() + entry * ldy, ldy, 1) !=
+                    strata::kernels::cpu::exl3::Status::ok)
+                    ++failures;
+            }
+            // The incoming expert must fit the evicted one's slot: route whichever of layer 1's
+            // experts is smaller into the larger one's slot.
+            const int32_t hot = source.exl3_layout(1, 0)->total_bytes <= source.exl3_layout(1, 1)->total_bytes
+                                    ? 0 : 1;
+            const int32_t cold = 1 - hot;
+            strata::core::Exl3ExpertRuntime adaptive;
+            adaptive.set_adaptive(true, 4, 0.7);
+            const int32_t hot_ids[] = {hot, hot, hot, hot};
+            std::vector<float> adapt_cpu(expected.size(), 24680.5f), adapt_gpu(expected.size(), 24680.5f);
+            float* d_adapt_gpu = device.upload(adapt_gpu);
+            sycl::event adapt_done;
+            bool adapt_ok = adaptive.open(source, pool, max_tokens, k, {{0, 0}, {1, cold}}, err);
+            for (int round = 0; adapt_ok && round < 2; ++round)
+                adapt_ok = adaptive.prepare_window(1, x.data(), ldx, hot_ids, max_tokens,
+                                                   adapt_cpu.data(), ldy, err) &&
+                           adaptive.enqueue_hit_only(queue, d_x, ldx, d_adapt_gpu, ldy, adapt_done,
+                                                     {}, err) &&
+                           adaptive.run_cpu(err) && adaptive.wait_gpu(adapt_done, err);
+            adapt_ok = adapt_ok && adaptive.adapt_round(err) &&
+                       adaptive.cache().slot_of(1, hot) >= 0 && adaptive.cache().slot_of(1, cold) < 0 &&
+                       adaptive.cache().slot_of(0, 0) >= 0 && adaptive.adapt_swaps_total() == 1 &&
+                       adaptive.adapt_rounds() == 1;
+            if (adapt_ok) {
+                adapt_ok = adaptive.prepare_window(1, x.data(), ldx, ids, max_tokens, adapt_cpu.data(),
+                                                   ldy, err) &&
+                           adaptive.enqueue_hit_only(queue, d_x, ldx, d_adapt_gpu, ldy, adapt_done,
+                                                     {}, err) &&
+                           adaptive.run_cpu(err) && adaptive.wait_gpu(adapt_done, err);
+                if (adapt_ok) {
+                    strata::parity::copy_out(adapt_gpu.data(), d_adapt_gpu, adapt_gpu.size());
+                    adapt_ok = compare_merged(adapt_cpu, adapt_gpu, expected1, max_tokens * k, ldy,
+                                              hidden, "adaptive swap merge");
+                }
+            }
+            if (!adapt_ok) {
+                std::fprintf(stderr, "adaptive tier swap failed: %s\n", err.c_str());
+                ++failures;
+            } else {
+                std::printf("adaptive tier swap: OK\n");
+            }
+        }
+
         // The all-resident graph reads device IDs on every replay, without a host plan update.
         strata::core::Exl3ExpertRuntime resident;
         if (!resident.open(source, pool, max_tokens, k, {{0, 0}, {0, 1}, {1, 0}, {1, 1}}, err) ||
