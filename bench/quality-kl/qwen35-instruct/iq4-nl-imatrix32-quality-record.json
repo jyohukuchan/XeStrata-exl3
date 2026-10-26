@@ -1,0 +1,415 @@
+{
+  "status": "complete",
+  "source_revision": "Qwen/Qwen3.5-35B-A3B@59d61f3ce65a6d9863b86d2e96597125219dc754",
+  "calibration": {
+    "imatrix": "qwen35-imatrix-32x1024.gguf",
+    "rows": 32,
+    "context": 1024,
+    "input_ids": "original_input_ids.xid",
+    "holdout_excluded": true,
+    "same_for_all_candidates": true
+  },
+  "coverage": "same text-only 733-tensor GGUF; MTP/vision omitted",
+  "candidates": {
+    "IQ4_NL": {
+      "file": "<data>/models/quality-instruct/qwen35-instruct-iq4_nl-imatrix32.gguf",
+      "size_bytes": 19779280000,
+      "sha256": "46b40a95940b56d8633a4d27313f2d2a13c206a288fe96d3ceb2b270228beeeb",
+      "tensor_types": {
+        "IQ4_NL": 391,
+        "Q5_K": 40,
+        "Q6_K": 1,
+        "F32": 301
+      },
+      "layer_bpw": 4.515282055280496,
+      "head_bpw": 6.5625,
+      "layer_stored_bytes": 18976194560,
+      "head_stored_bytes": 417177600,
+      "quality": {
+        "ppl": 7.828588333829837,
+        "kld_mean": 0.022971948608756065,
+        "kld_median": 0.013761544600129128,
+        "kld_p90": 0.054137036204338074
+      }
+    },
+    "IQ4_NL_BF16_embedding": {
+      "file": "<data>/models/quality-instruct/qwen35-instruct-iq4_nl-imatrix32-bf16-embed.gguf",
+      "size_bytes": 20510334080,
+      "sha256": "c09e2a39ed4f8b609bfc514f4e9447100647f54595da57f620f9c9b4cb7c30c4",
+      "tensor_types": {
+        "IQ4_NL": 390,
+        "BF16": 1,
+        "Q5_K": 40,
+        "Q6_K": 1,
+        "F32": 301
+      },
+      "layer_bpw": 4.515282055280496,
+      "head_bpw": 6.5625,
+      "layer_stored_bytes": 18976194560,
+      "head_stored_bytes": 417177600,
+      "quality": {
+        "ppl": 7.841946804512506,
+        "kld_mean": 0.022662021219730377,
+        "kld_median": 0.013816219754517078,
+        "kld_p90": 0.05556490272283554
+      }
+    },
+    "IQ4_XS": {
+      "file": "<data>/models/quality-instruct/qwen35-instruct-iq4_xs-imatrix32.gguf",
+      "size_bytes": 18728778880,
+      "sha256": "3dd378a2906e4fc797825b34c86bce4b4de5142cef6a89b5105bd42c6a2372f7",
+      "tensor_types": {
+        "IQ4_XS": 391,
+        "Q5_K": 40,
+        "Q6_K": 1,
+        "F32": 301
+      },
+      "layer_bpw": 4.26910256910062,
+      "head_bpw": 6.5625,
+      "layer_stored_bytes": 17941585920,
+      "head_stored_bytes": 417177600,
+      "quality": {
+        "ppl": 7.802889615454873,
+        "kld_mean": 0.02346225269138813,
+        "kld_median": 0.014186311513185501,
+        "kld_p90": 0.05682244896888733
+      },
+      "per_case_kld": [
+        {
+          "id": "holdout-ja-narrative",
+          "positions": 458,
+          "kld_mean": 0.0289493128657341,
+          "kld_median": 0.020819561555981636,
+          "kld_p90": 0.060921117663383484
+        },
+        {
+          "id": "holdout-ja-observation",
+          "positions": 488,
+          "kld_mean": 0.028606848791241646,
+          "kld_median": 0.020440638065338135,
+          "kld_p90": 0.060312770307064056
+        },
+        {
+          "id": "holdout-ja-conversation",
+          "positions": 493,
+          "kld_mean": 0.031146440654993057,
+          "kld_median": 0.024829287081956863,
+          "kld_p90": 0.06804683059453964
+        },
+        {
+          "id": "holdout-ja-debugging",
+          "positions": 506,
+          "kld_mean": 0.028926316648721695,
+          "kld_median": 0.021334664896130562,
+          "kld_p90": 0.0656975507736206
+        },
+        {
+          "id": "holdout-code-python",
+          "positions": 335,
+          "kld_mean": 0.009675363078713417,
+          "kld_median": 0.0016722164582461119,
+          "kld_p90": 0.025830045342445374
+        },
+        {
+          "id": "holdout-code-typescript",
+          "positions": 449,
+          "kld_mean": 0.007965264841914177,
+          "kld_median": 0.001086035743355751,
+          "kld_p90": 0.025717195123434067
+        }
+      ]
+    },
+    "IQ4_XS_mixed_capacity": {
+      "file": "<data>/models/quality-instruct/qwen35-instruct-iq4_xs-mixed-capacity-imatrix32.gguf",
+      "size_bytes": 20605525120,
+      "sha256": "654b721deeb897e041f3125f72d4dd6027a0e8c246581c5847e8017471b20c91",
+      "tensor_types": {
+        "IQ4_XS": 366,
+        "Q5_K": 64,
+        "Q8_0": 1,
+        "BF16": 1,
+        "F32": 301
+      },
+      "layer_bpw": 4.508625394721453,
+      "head_bpw": 8.5,
+      "layer_stored_bytes": 18948218880,
+      "head_stored_bytes": 540344320,
+      "quality": {
+        "ppl_diagnostic": 7.802467420150591,
+        "kld_mean": 0.022051604464650154,
+        "kld_median": 0.013199500739574432,
+        "kld_p90": 0.05298546329140663
+      },
+      "per_case_kld": [
+        {
+          "id": "holdout-ja-narrative",
+          "positions": 458,
+          "kld_mean": 0.025802871212363243,
+          "kld_median": 0.017998915165662766,
+          "kld_p90": 0.05600043013691902
+        },
+        {
+          "id": "holdout-ja-observation",
+          "positions": 488,
+          "kld_mean": 0.02681007981300354,
+          "kld_median": 0.018111564218997955,
+          "kld_p90": 0.056329596787691116
+        },
+        {
+          "id": "holdout-ja-conversation",
+          "positions": 493,
+          "kld_mean": 0.026633484289050102,
+          "kld_median": 0.02116452343761921,
+          "kld_p90": 0.05574782192707062
+        },
+        {
+          "id": "holdout-ja-debugging",
+          "positions": 506,
+          "kld_mean": 0.028853900730609894,
+          "kld_median": 0.020565256476402283,
+          "kld_p90": 0.06857249140739441
+        },
+        {
+          "id": "holdout-code-python",
+          "positions": 335,
+          "kld_mean": 0.01111513376235962,
+          "kld_median": 0.0015062469756230712,
+          "kld_p90": 0.026660026982426643
+        },
+        {
+          "id": "holdout-code-typescript",
+          "positions": 449,
+          "kld_mean": 0.008516346104443073,
+          "kld_median": 0.0009198103216476738,
+          "kld_p90": 0.024578720331192017
+        }
+      ],
+      "recipe": "<data>/records/quality-instruct/imatrix-token-ids/iq4-xs-mixed-capacity-recipe.json"
+    }
+  },
+  "qbench": {
+    "yaml": "<data>/records/quality-instruct/teacher-v620/qwen35-iq4-nl-qbench.yaml",
+    "results": "<data>/records/quality-instruct/teacher-v620/qwen35-iq4-nl-qbench-results.json",
+    "cache_data_key": "3e97fdf1bc08e9fe",
+    "cache_reference_key": "8695b44c40270bea",
+    "holdout_rows": 6,
+    "kld_positions": 2729,
+    "ppl_scored_response_positions": 2723,
+    "per_case_kld": [
+      {
+        "id": "holdout-ja-narrative",
+        "positions": 458,
+        "iq4_nl": {
+          "kld_mean": 0.028482895344495773,
+          "kld_median": 0.021151667460799217,
+          "kld_p90": 0.059750135987997055
+        },
+        "iq4_nl_bf16_embed": {
+          "kld_mean": 0.029239971190690994,
+          "kld_median": 0.01963532343506813,
+          "kld_p90": 0.06410680711269379
+        }
+      },
+      {
+        "id": "holdout-ja-observation",
+        "positions": 488,
+        "iq4_nl": {
+          "kld_mean": 0.027212919667363167,
+          "kld_median": 0.019063018262386322,
+          "kld_p90": 0.06214962527155876
+        },
+        "iq4_nl_bf16_embed": {
+          "kld_mean": 0.02679629437625408,
+          "kld_median": 0.01881842315196991,
+          "kld_p90": 0.05730457976460457
+        }
+      },
+      {
+        "id": "holdout-ja-conversation",
+        "positions": 493,
+        "iq4_nl": {
+          "kld_mean": 0.031095322221517563,
+          "kld_median": 0.023746196180582047,
+          "kld_p90": 0.06542886793613434
+        },
+        "iq4_nl_bf16_embed": {
+          "kld_mean": 0.029548220336437225,
+          "kld_median": 0.023273088037967682,
+          "kld_p90": 0.06495849043130875
+        }
+      },
+      {
+        "id": "holdout-ja-debugging",
+        "positions": 506,
+        "iq4_nl": {
+          "kld_mean": 0.027989571914076805,
+          "kld_median": 0.02084541507065296,
+          "kld_p90": 0.06064438074827194
+        },
+        "iq4_nl_bf16_embed": {
+          "kld_mean": 0.028319064527750015,
+          "kld_median": 0.020746855065226555,
+          "kld_p90": 0.06322664767503738
+        }
+      },
+      {
+        "id": "holdout-code-python",
+        "positions": 335,
+        "iq4_nl": {
+          "kld_mean": 0.010949322953820229,
+          "kld_median": 0.001902054063975811,
+          "kld_p90": 0.028005370870232582
+        },
+        "iq4_nl_bf16_embed": {
+          "kld_mean": 0.010015018284320831,
+          "kld_median": 0.001945814467035234,
+          "kld_p90": 0.029677145183086395
+        }
+      },
+      {
+        "id": "holdout-code-typescript",
+        "positions": 449,
+        "iq4_nl": {
+          "kld_mean": 0.007137269712984562,
+          "kld_median": 0.0009998108725994825,
+          "kld_p90": 0.021556193009018898
+        },
+        "iq4_nl_bf16_embed": {
+          "kld_mean": 0.006958594545722008,
+          "kld_median": 0.0009284320985898376,
+          "kld_p90": 0.021532118320465088
+        }
+      }
+    ],
+    "backend": "llama-cpp-python ROCm/HIP on V620",
+    "reference_ppl": 7.750772897319353,
+    "iq4_xs_cache_key": "79cc2b51176524cb",
+    "iq4_xs_per_case_kld": [
+      {
+        "id": "holdout-ja-narrative",
+        "positions": 458,
+        "kld_mean": 0.0289493128657341,
+        "kld_median": 0.020819561555981636,
+        "kld_p90": 0.060921117663383484
+      },
+      {
+        "id": "holdout-ja-observation",
+        "positions": 488,
+        "kld_mean": 0.028606848791241646,
+        "kld_median": 0.020440638065338135,
+        "kld_p90": 0.060312770307064056
+      },
+      {
+        "id": "holdout-ja-conversation",
+        "positions": 493,
+        "kld_mean": 0.031146440654993057,
+        "kld_median": 0.024829287081956863,
+        "kld_p90": 0.06804683059453964
+      },
+      {
+        "id": "holdout-ja-debugging",
+        "positions": 506,
+        "kld_mean": 0.028926316648721695,
+        "kld_median": 0.021334664896130562,
+        "kld_p90": 0.0656975507736206
+      },
+      {
+        "id": "holdout-code-python",
+        "positions": 335,
+        "kld_mean": 0.009675363078713417,
+        "kld_median": 0.0016722164582461119,
+        "kld_p90": 0.025830045342445374
+      },
+      {
+        "id": "holdout-code-typescript",
+        "positions": 449,
+        "kld_mean": 0.007965264841914177,
+        "kld_median": 0.001086035743355751,
+        "kld_p90": 0.025717195123434067
+      }
+    ],
+    "mixed_capacity_cache_key": "4ac28666ecac5082",
+    "mixed_capacity_per_case_kld": [
+      {
+        "id": "holdout-ja-narrative",
+        "positions": 458,
+        "kld_mean": 0.025802871212363243,
+        "kld_median": 0.017998915165662766,
+        "kld_p90": 0.05600043013691902
+      },
+      {
+        "id": "holdout-ja-observation",
+        "positions": 488,
+        "kld_mean": 0.02681007981300354,
+        "kld_median": 0.018111564218997955,
+        "kld_p90": 0.056329596787691116
+      },
+      {
+        "id": "holdout-ja-conversation",
+        "positions": 493,
+        "kld_mean": 0.026633484289050102,
+        "kld_median": 0.02116452343761921,
+        "kld_p90": 0.05574782192707062
+      },
+      {
+        "id": "holdout-ja-debugging",
+        "positions": 506,
+        "kld_mean": 0.028853900730609894,
+        "kld_median": 0.020565256476402283,
+        "kld_p90": 0.06857249140739441
+      },
+      {
+        "id": "holdout-code-python",
+        "positions": 335,
+        "kld_mean": 0.01111513376235962,
+        "kld_median": 0.0015062469756230712,
+        "kld_p90": 0.026660026982426643
+      },
+      {
+        "id": "holdout-code-typescript",
+        "positions": 449,
+        "kld_mean": 0.008516346104443073,
+        "kld_median": 0.0009198103216476738,
+        "kld_p90": 0.024578720331192017
+      }
+    ]
+  },
+  "noise_floor": {
+    "file": "<data>/records/quality-instruct/teacher-v620/bf16-gguf-noise-floor-results.json",
+    "rows": [
+      4,
+      5
+    ],
+    "positions": 784,
+    "kld_mean": 0.0014062031405046582,
+    "kld_p90": 0.003321564057841897
+  },
+  "interpretation": "The capacity-matched mixed IQ4_XS measures higher teacher KL than EXL3 4.5, while EXL3 4.5 passes this preliminary six-holdout KL feasibility gate against the matched IQuant baseline. Remaining target-bpw coverage, optimized decode-speed, and end-to-end XeStrata validation are pending. No speed claim.",
+  "quality_metric_policy": "KL only for quality gate (mean/median/p90 over paired teacher positions); PPL is diagnostic only and is not used for acceptance.",
+  "xe_native_full6": {
+    "backend": "XeStrata plain_model_logits on V620 gfx1030",
+    "trace_rows": 6,
+    "positions": 2729,
+    "flags": {
+      "STRATA_NO_XMX": "1",
+      "STRATA_ROUTE_TAIL_SKIP": "0",
+      "STRATA_HC_Q8": "0",
+      "pool_workers": 8,
+      "max_t": 1
+    },
+    "mixed_iq4_xs": {
+      "result_file": "<data>/records/quality-instruct/xe-iq4xs-full6-kl.json",
+      "kld_mean": 0.022284954771423778,
+      "kld_median": 0.01270392604438031,
+      "kld_p90": 0.05269146736944216
+    },
+    "iq4_nl_bf16_embedding": {
+      "result_file": "<data>/records/quality-instruct/xe-iq4nl-full6-kl.json",
+      "kld_mean": 0.02262707380213513,
+      "kld_median": 0.013523478984062143,
+      "kld_p90": 0.05494968708462042
+    },
+    "comparison": "quality KL evidence only; no speed verdict"
+  },
+  "updated_at": "2026-10-19T15:33:38.540532+00:00"
+}

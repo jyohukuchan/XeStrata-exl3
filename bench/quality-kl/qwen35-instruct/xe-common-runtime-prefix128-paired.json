@@ -1,0 +1,43 @@
+{
+  "updated_utc": "2026-10-19T15:28:25.097706+00:00",
+  "commit": "32a688a2",
+  "scope": "Initial two-case frozen prefix check only, not full holdout/all-bpw/optimized speed acceptance",
+  "metric": "KL(P_BF16 || P_candidate)",
+  "positions": 128,
+  "eval_vocab": 248077,
+  "actual_source": "Verified same Qwen3.5 Instruct BF16 source and same 32x1024 calibration token IDs",
+  "common_runtime": "XeStrata PlainModel forced original token IDs, AR T=1, all10240expert pairs resident, route_tail_skip0 and hc_q8=0",
+  "exl3": {
+    "positions": 128,
+    "mean": 0.011019732279693013,
+    "median": 0.002591418459515416,
+    "p90": 0.016442552835945357,
+    "max": 0.524168645954843
+  },
+  "mixed_iq4_xs": {
+    "positions": 128,
+    "mean": 0.015784456373741873,
+    "median": 0.007943514873593259,
+    "p90": 0.040753756956507466,
+    "max": 0.1717213219591201
+  },
+  "mean_kl_reduction_fraction": 0.30186177979339124,
+  "bytes": {
+    "exl3_native_text_charged": 20614977805,
+    "exl3_xe_metadata_bootstrap": 10943535,
+    "exl3_xe_text_charged_including_bootstrap": 20625921340,
+    "mixed_iq4_xs_gguf": 20605525120,
+    "xe_charged_gap_fraction": 0.0009898422816803087
+  },
+  "caveats": [
+    "Only128positions; full6cases and2-5bpw remain",
+    "EXL3 Japanese maximum KL .524 retained; no outlier removal",
+    "Optimized decode speed not yet accepted",
+    "Raw logits reduced in NumPy FP64 for both Xe candidates; original cached native sidecars are supplementary FP32"
+  ],
+  "files": [
+    "xe-exl3-prefix64-kl.json",
+    "xe-iq4xs-prefix64-kl.json"
+  ],
+  "no_gguf_weight_fallback": true
+}

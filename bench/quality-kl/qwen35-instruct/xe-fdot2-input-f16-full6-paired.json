@@ -1,0 +1,24 @@
+{
+  "updated_utc": "2026-10-19T18:11:17.239835+00:00",
+  "scope": "ExperimentalFDOT2inputF16, all6frozenholdouts2729positions, representative4.5bpw; otherbpwandspeedpending",
+  "metric": "KL(P_BF16 || P_candidate)",
+  "exl3": {
+    "positions": 2729,
+    "mean": 0.00898184159805312,
+    "median": 0.004978995491671002,
+    "p90": 0.02184656871777265,
+    "max": 0.15038092588740176
+  },
+  "same_runtime_mixed_iq4_xs": {
+    "positions": 2729,
+    "mean": 0.022284954771423778,
+    "median": 0.01270392604438031,
+    "p90": 0.05269146736944216,
+    "max": 0.6788846682261822
+  },
+  "mean_kl_reduction_fraction": 0.5969549101544229,
+  "input_precision": "ExplicitF16RNE for packed dense/head inputs, F32accumulator; otherruntime precision unchanged",
+  "candidate_provenance": "xe-exl3-fdot2-input-f16-full6/provenance.json",
+  "optimized_speed_acceptance": false,
+  "outliers_removed": false
+}

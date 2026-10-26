@@ -1,0 +1,44 @@
+{
+  "updated_utc": "2026-10-19T16:45:18.949444+00:00",
+  "scope": "Six frozen holdouts,2729positions; text AR;4.5mul1/head6; other bpw and speed pending",
+  "metric": "KL(P_BF16 || P_candidate) only",
+  "source": "Qwen3.5 Instruct59d61f3ce65a6d9863b86d2e96597125219dc754",
+  "same_calibration": "32x1024 exacttokenIDs;holdoutdisjoint",
+  "runtime": "XeStrata PlainModel forced tokenIDs,AR T1,all10240expertpairsresident,route_tail_skip0,hc_q80",
+  "exl3_revision": "52011ca2",
+  "iquant_revision": "32a688a2;native arithmetic paths unchanged by EXL3-only kernel changes",
+  "exl3": {
+    "positions": 2729,
+    "mean": 0.009165013057885685,
+    "median": 0.005049948503808185,
+    "p90": 0.022002907136013584,
+    "max": 0.5241582016655743
+  },
+  "mixed_iq4_xs": {
+    "positions": 2729,
+    "mean": 0.022284954771423778,
+    "median": 0.01270392604438031,
+    "p90": 0.05269146736944216,
+    "max": 0.6788846682261822
+  },
+  "bf16_embed_iq4_nl": {
+    "positions": 2729,
+    "mean": 0.02262707380213513,
+    "median": 0.013523478984062143,
+    "p90": 0.05494968708462042,
+    "max": 0.434253670546644
+  },
+  "mean_kl_reduction_fraction": 0.5887353978551451,
+  "bytes": {
+    "exl3_text_charged": 20614977805,
+    "metadata_bootstrap": 10943584,
+    "exl3_including_bootstrap": 20625921389,
+    "mixed_iq4_xs": 20605525120,
+    "gap_fraction": 0.0009898446596832144
+  },
+  "caveats": [
+    "LargeJapaneseKLposition retained; no outlier removal",
+    "Currentpair/downkernel additions will be rechecked",
+    "Not all-bpw or optimizedspeed acceptance"
+  ]
+}

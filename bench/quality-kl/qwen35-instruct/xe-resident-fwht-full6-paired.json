@@ -1,0 +1,36 @@
+{
+  "updated_utc": "2026-10-19T17:44:00.588538+00:00",
+  "scope": "All6frozenholdouts2729positions,representative4.5bpw; otherbpw/speedpending",
+  "metric": "KL(P_BF16 || P_candidate)",
+  "exl3": {
+    "positions": 2729,
+    "mean": 0.00911597934867914,
+    "median": 0.004971203636657385,
+    "p90": 0.021916902404815416,
+    "max": 0.5241595540796948
+  },
+  "same_runtime_mixed_iq4_xs": {
+    "positions": 2729,
+    "mean": 0.022284954771423778,
+    "median": 0.01270392604438031,
+    "p90": 0.05269146736944216,
+    "max": 0.6788846682261822
+  },
+  "mean_kl_reduction_fraction": 0.5909357033845699,
+  "base_revision": "3700c495",
+  "candidate_provenance": "xe-exl3-resident-fwht-full6/provenance.json",
+  "text_storage_bytes": {
+    "exl3_original": 20614977805,
+    "xe_bootstrap": 10943104,
+    "mixed_iq4_xs": 20605525120
+  },
+  "conditions": {
+    "runtime": "XeStrata PlainModel",
+    "max_t": 1,
+    "all_experts_resident": 10240,
+    "route_tail_skip": 0,
+    "hc_q8": 0
+  },
+  "optimized_speed_acceptance": false,
+  "outliers_removed": false
+}

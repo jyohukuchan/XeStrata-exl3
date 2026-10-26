@@ -1,0 +1,297 @@
+{
+  "status": "complete",
+  "source_revision": "Qwen/Qwen3.5-35B-A3B@59d61f3ce65a6d9863b86d2e96597125219dc754",
+  "scope_policy": "text budget charges all EXL3 safetensor headers/padding plus config/index/tokenizer/quantization metadata to text; MTP/vision remain separate",
+  "exl3_text": {
+    "decoder_payload_bytes": 19121860200,
+    "embedding_payload_bytes": 1017118720,
+    "head_payload_bytes": 381920260,
+    "text_payload_bytes": 20520899180,
+    "charged_overhead_bytes": 94078625,
+    "charged_text_bytes": 20614977805,
+    "decoder_weight_bpw": 4.539733054087918,
+    "source_decoder_numel": 33622516480,
+    "exl3_decoder_numel": 33622343680,
+    "embedding_bpw": 16.0,
+    "head_bpw": 6.007876995912532
+  },
+  "q4_reference": {
+    "file": "<data>/models/quality-instruct/qwen35-instruct-q4_k_m-imatrix32.gguf",
+    "file_bytes": 21166759040,
+    "text_scope_exact_layer_bpw": 4.862352436981338,
+    "text_scope_weight_bytes": 20447559680,
+    "head_bpw": 6.5625,
+    "note": "GGUF is text-only; no MTP/vision"
+  },
+  "budget_comparison": {
+    "q4_file_bytes": 21166759040,
+    "exl3_charged_text_bytes": 20614977805,
+    "margin_bytes": 551781235,
+    "margin_fraction": 0.026068291038664367,
+    "exl3_full_directory_bytes": 21601623741,
+    "full_directory_minus_q4_bytes": 434864701,
+    "separate_mtp_payload_bytes": 427131936,
+    "separate_vision_payload_bytes": 559509904,
+    "pareto_text_scope": "EXL3 text scope is smaller by the charged margin and has lower holdout KLD/PPL; full EXL3 directory includes separate MTP/vision bytes and is not a same-coverage comparison"
+  },
+  "denominator_reconciliation": {
+    "source_hf_decoder_numel": 33622516480,
+    "exl3_inventory_decoder_numel": 33622343680,
+    "source_minus_exl3_numel": 172800,
+    "gguf_q4_accounting_decoder_numel": 33642250240,
+    "gguf_minus_exl3_numel": 19906560,
+    "note": "HF source fused gate_up_proj/down_proj experts are counted once; EXL3 plane denominator is derived from suh\u00d7svh once per module. GGUF engine tensor naming/accounting carries an additional ~19.9M denominator delta; report source/EXL3 and GGUF accounting separately rather than double-counting vectors"
+  },
+  "quality_pareto": {
+    "cache_data_key": "3e97fdf1bc08e9fe",
+    "cache_reference_key": "8695b44c40270bea",
+    "holdout_rows": 6,
+    "ppl_scored_response_positions": 2723,
+    "cached_reference_kld_positions": 2729,
+    "exl3": {
+      "ppl": 7.815902900429383,
+      "kld_mean": 0.009054530411958694,
+      "kld_median": 0.004878466483205557,
+      "kld_p90": 0.022167276591062546
+    },
+    "calibrated_q4_imatrix32": {
+      "ppl": 7.911072421572921,
+      "kld_mean": 0.021190781146287918,
+      "kld_median": 0.011713970452547073,
+      "kld_p90": 0.04985390231013298
+    },
+    "interpretation": "EXL3 4.5 passes the preliminary six-holdout KL feasibility gate against the capacity-matched mixed IQ4_XS baseline at nearly identical text bytes. Target-bpw sweep, optimized decode-speed, and end-to-end XeStrata validation remain pending. PPL is diagnostic only; no speed claim.",
+    "iq4_nl_standard": {
+      "ppl": 7.828588333829837,
+      "kld_mean": 0.022971948608756065,
+      "kld_median": 0.013761544600129128,
+      "kld_p90": 0.054137036204338074
+    },
+    "iq4_nl_bf16_embedding": {
+      "ppl": 7.841946804512506,
+      "kld_mean": 0.022662021219730377,
+      "kld_median": 0.013816219754517078,
+      "kld_p90": 0.05556490272283554
+    },
+    "iq4_xs": {
+      "ppl": 7.802889615454873,
+      "kld_mean": 0.02346225269138813,
+      "kld_median": 0.014186311513185501,
+      "kld_p90": 0.05682244896888733
+    },
+    "iq4_xs_mixed_capacity": {
+      "kld_mean": 0.022051604464650154,
+      "kld_median": 0.013199500739574432,
+      "kld_p90": 0.05298546329140663,
+      "ppl_diagnostic": 7.802467420150591
+    },
+    "iq3_xxs": {
+      "file": "<data>/models/quality-instruct/qwen35-instruct-iq3_xxs-bf16-embed-q6head-imatrix32.gguf",
+      "file_bytes": 14489900160,
+      "layer_bpw": 3.082752621730147,
+      "head_bpw": 6.5625,
+      "text_scope_total_bytes": 14489900160,
+      "versus_exl3_charged_text": {
+        "margin_bytes": -6125077645,
+        "iq3_smaller_fraction_of_exl3": -0.29711783844435724
+      },
+      "quality_kl": {
+        "kld_mean": 0.10172432661056519,
+        "kld_median": 0.058235637843608856,
+        "kld_p90": 0.2474936693906784
+      },
+      "ppl_diagnostic": 8.535960658490051,
+      "recipe": "<data>/records/quality-instruct/imatrix-token-ids/iq3-xxs-bf16embed-q6head-recipe.json"
+    },
+    "iq2_xxs": {
+      "file": "<data>/models/quality-instruct/qwen35-instruct-iq2_xxs-bf16-embed-q6head-imatrix32.gguf",
+      "file_bytes": 10415445120,
+      "layer_bpw": 2.1132582550387897,
+      "head_bpw": 6.5625,
+      "text_scope_total_bytes": 10415445120,
+      "versus_exl3_charged_text": {
+        "margin_bytes": -10199532685,
+        "iq2_smaller_fraction_of_exl3": -0.49476321446856875
+      },
+      "quality_kl": {
+        "kld_mean": 0.40125545859336853,
+        "kld_median": 0.2750623822212219,
+        "kld_p90": 0.9280043244361877
+      },
+      "ppl_diagnostic": 11.513253116007043,
+      "recipe": "<data>/records/quality-instruct/imatrix-token-ids/iq2-xxs-bf16embed-q6head-recipe.json"
+    }
+  },
+  "artifacts": {
+    "inventory": "<data>/records/quality-instruct/exl3-4.5-mul1-h6-inventory.json",
+    "quality": "<data>/records/quality-instruct/exl3-4.5-mul1-h6-quality-record.json",
+    "q4_quality": "<data>/records/quality-instruct/q4-km-imatrix32-quality-record.json",
+    "iq4_quality": "<data>/records/quality-instruct/iq4-nl-imatrix32-quality-record.json",
+    "iq4_mixed_quality": "<data>/records/quality-instruct/iq4-nl-imatrix32-quality-record.json",
+    "iq3_quality": "<data>/records/quality-instruct/iq3-xxs-quality-record.json",
+    "iq2_quality": "<data>/records/quality-instruct/iq2-xxs-quality-record.json",
+    "exl3_3_0_quality": "<data>/records/quality-instruct/exl3-3.0-quality-record.json"
+  },
+  "iq4_references": {
+    "IQ4_NL": {
+      "file": "<data>/models/quality-instruct/qwen35-instruct-iq4_nl-imatrix32.gguf",
+      "file_bytes": 19779280000,
+      "layer_bpw": 4.515282055280496,
+      "head_bpw": 6.5625,
+      "text_scope_total_bytes": 19779280000,
+      "versus_exl3_charged_text": {
+        "margin_bytes": 835697805,
+        "iq4_smaller_fraction_of_exl3": 0.040538380050902025
+      },
+      "quality": {
+        "ppl": 7.828588333829837,
+        "kld_mean": 0.022971948608756065,
+        "kld_median": 0.013761544600129128,
+        "kld_p90": 0.054137036204338074
+      }
+    },
+    "IQ4_NL_BF16_embedding": {
+      "file": "<data>/models/quality-instruct/qwen35-instruct-iq4_nl-imatrix32-bf16-embed.gguf",
+      "file_bytes": 20510334080,
+      "layer_bpw": 4.515282055280496,
+      "head_bpw": 6.5625,
+      "text_scope_total_bytes": 20510334080,
+      "versus_exl3_charged_text": {
+        "margin_bytes": 104643725,
+        "iq4_smaller_fraction_of_exl3": 0.005076101754260414
+      },
+      "quality": {
+        "ppl": 7.841946804512506,
+        "kld_mean": 0.022662021219730377,
+        "kld_median": 0.013816219754517078,
+        "kld_p90": 0.05556490272283554
+      }
+    },
+    "IQ4_XS": {
+      "file": "<data>/models/quality-instruct/qwen35-instruct-iq4_xs-imatrix32.gguf",
+      "file_bytes": 18728778880,
+      "layer_bpw": 4.26910256910062,
+      "head_bpw": 6.5625,
+      "text_scope_total_bytes": 18728778880,
+      "versus_exl3_charged_text": {
+        "margin_bytes": 1886198925,
+        "iq4_smaller_fraction_of_exl3": 0.0914965295059652
+      },
+      "quality": {
+        "ppl": 7.802889615454873,
+        "kld_mean": 0.02346225269138813,
+        "kld_median": 0.014186311513185501,
+        "kld_p90": 0.05682244896888733
+      }
+    },
+    "IQ4_XS_mixed_capacity": {
+      "file": "<data>/models/quality-instruct/qwen35-instruct-iq4_xs-mixed-capacity-imatrix32.gguf",
+      "file_bytes": 20605525120,
+      "layer_bpw": 4.508625394721453,
+      "head_bpw": 8.5,
+      "text_scope_total_bytes": 20605525120,
+      "versus_exl3_charged_text": {
+        "margin_bytes": -9452685,
+        "iq4_delta_fraction_of_exl3": -0.0004585348133485415,
+        "within_preferred_0_1_percent": true
+      },
+      "quality_kl_gate": {
+        "kld_mean": 0.022051604464650154,
+        "kld_median": 0.013199500739574432,
+        "kld_p90": 0.05298546329140663
+      },
+      "ppl_diagnostic": 7.802467420150591,
+      "recipe": "<data>/records/quality-instruct/imatrix-token-ids/iq4-xs-mixed-capacity-recipe.json"
+    }
+  },
+  "updated_at": "2026-10-19T16:42:07.635333+00:00",
+  "quality_metric_policy": "KL only for quality gate; PPL diagnostic only",
+  "iq3_references": {
+    "IQ3_XXS_BF16_embedding_Q6_head": {
+      "file": "<data>/models/quality-instruct/qwen35-instruct-iq3_xxs-bf16-embed-q6head-imatrix32.gguf",
+      "file_bytes": 14489900160,
+      "layer_bpw": 3.082752621730147,
+      "head_bpw": 6.5625,
+      "text_scope_total_bytes": 14489900160,
+      "versus_exl3_charged_text": {
+        "margin_bytes": -6125077645,
+        "iq3_smaller_fraction_of_exl3": -0.29711783844435724
+      },
+      "quality_kl": {
+        "kld_mean": 0.10172432661056519,
+        "kld_median": 0.058235637843608856,
+        "kld_p90": 0.2474936693906784
+      },
+      "ppl_diagnostic": 8.535960658490051,
+      "recipe": "<data>/records/quality-instruct/imatrix-token-ids/iq3-xxs-bf16embed-q6head-recipe.json"
+    }
+  },
+  "iq2_references": {
+    "IQ2_XXS_BF16_embedding_Q6_head": {
+      "file": "<data>/models/quality-instruct/qwen35-instruct-iq2_xxs-bf16-embed-q6head-imatrix32.gguf",
+      "file_bytes": 10415445120,
+      "layer_bpw": 2.1132582550387897,
+      "head_bpw": 6.5625,
+      "text_scope_total_bytes": 10415445120,
+      "versus_exl3_charged_text": {
+        "margin_bytes": -10199532685,
+        "iq2_smaller_fraction_of_exl3": -0.49476321446856875
+      },
+      "quality_kl": {
+        "kld_mean": 0.40125545859336853,
+        "kld_median": 0.2750623822212219,
+        "kld_p90": 0.9280043244361877
+      },
+      "ppl_diagnostic": 11.513253116007043,
+      "recipe": "<data>/records/quality-instruct/imatrix-token-ids/iq2-xxs-bf16embed-q6head-recipe.json"
+    }
+  },
+  "comparison_policy": {
+    "iq2_iq3_vs_exl3_4_5": "not_applicable_as_matched_budget_gate",
+    "iq2_iq3_note": "IQ2/3 artifacts are lower-capacity observations; compare against fresh EXL3 2/3 after conversion, not against EXL3 4.5 solely by KL."
+  },
+  "xe_native_full6_kl": {
+    "mixed_iq4_xs": {
+      "mean": 0.022284954771423778,
+      "median": 0.01270392604438031,
+      "p90": 0.05269146736944216,
+      "result": "<data>/records/quality-instruct/xe-iq4xs-full6-kl.json"
+    },
+    "iq4_nl_bf16_embedding": {
+      "mean": 0.02262707380213513,
+      "median": 0.013523478984062143,
+      "p90": 0.05494968708462042,
+      "result": "<data>/records/quality-instruct/xe-iq4nl-full6-kl.json"
+    },
+    "positions": 2729,
+    "note": "full six-row Xe native KL only; no speed verdict"
+  },
+  "exl3_target_bpw": {
+    "exl3_3_0": {
+      "charged_text_bytes": 14234564720,
+      "text_payload_bytes": 14217650796,
+      "metadata_bytes": 16913924,
+      "quality_kl": {
+        "mean": 0.05159172788262367,
+        "median": 0.030528651550412178,
+        "p90": 0.1264069527387619
+      },
+      "recipe": "<data>/records/quality-instruct/exl3-3.0-quality-record.json"
+    },
+    "exl3_2_0": {
+      "status": "conversion_failed_at_layer0",
+      "failure_record": "<data>/records/quality-instruct/exl3-2.0-conversion-failure.json"
+    }
+  },
+  "target_bpw_pairings": {
+    "exl3_3_0_vs_iq3_xxs": {
+      "exl3_3_0_charged_text_bytes": 14294825314,
+      "iq3_xxs_text_file_bytes": 14489900160,
+      "iq3_delta_bytes": 195074846,
+      "iq3_larger_fraction_of_exl3": 0.013646535841816024,
+      "exl3_3_0_kld_mean": 0.05159172788262367,
+      "iq3_xxs_kld_mean": 0.10172432661056519,
+      "interpretation": "EXL3 3.0 is approximately 1.36% smaller than this BF16-embedding/Q6-head IQ3_XXS artifact and has lower measured teacher KL on six holdouts. This is a preliminary target-bpw feasibility checkpoint; no speed or end-to-end claim."
+    }
+  }
+}

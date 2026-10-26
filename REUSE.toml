@@ -29,6 +29,12 @@ path = ["bench/XeStrataBenchResults/**"]
 SPDX-FileCopyrightText = "2026 MistVVK and the XeStrata contributors"
 SPDX-License-Identifier = "LGPL-3.0-or-later"
 
+# XeStrata's quality (KL) measurement summaries (JSON cannot carry a comment)
+[[annotations]]
+path = ["bench/quality-kl/**/*.json"]
+SPDX-FileCopyrightText = "2026 MistVVK and the XeStrata contributors"
+SPDX-License-Identifier = "LGPL-3.0-or-later"
+
 # setup's --bench prompts: XeStrata's sources at commit 58dbbe5, with code from Strata and ggml (their MIT notices kept)
 [[annotations]]
 path = ["data/bench-corpus.json.xz"]

@@ -1,0 +1,24 @@
+{
+  "scope": "sameactualXe coherentbinary/teacher/frozen6holdouts/GPU03/unrestrictedVRAM, bothAR maxT1. NativeEXLlegacyauxcache is not comparator. Not speedacceptance.",
+  "metric": "KL(P_BF16||P_candidate) only",
+  "positions": 2729,
+  "exl3": {
+    "positions": 2729,
+    "mean": 0.008215846326353997,
+    "median": 0.00444821459689081,
+    "p90": 0.020005720764041494,
+    "max": 0.44664342527947976
+  },
+  "iquant": {
+    "positions": 2729,
+    "mean": 0.02060135198184283,
+    "median": 0.011894012615092125,
+    "p90": 0.05202009217107659,
+    "max": 0.6082084767673497
+  },
+  "storage_exl3_text_bytes": 22638900064,
+  "storage_iq_bytes": 22618791040,
+  "storage_delta_iq_fraction": -0.0008882509284087181,
+  "exl3_lower_kl": true,
+  "recipe": "<data>/records/quality-instruct/imatrix-token-ids/iq4-xs-5.0-matched-24layer-q5-recipe.json"
+}

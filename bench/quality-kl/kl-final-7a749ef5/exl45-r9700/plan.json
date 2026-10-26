@@ -1,0 +1,178 @@
+{
+  "format": "postfix-single-candidate-full6/1",
+  "status": "capture_complete",
+  "created_utc": "2026-10-22T04:10:17.999467+00:00",
+  "capture_key": "49b7c5d787d343e280ad2a8bd3d4a7c3f83f11530cc5ccb235b47a10b4d7cd59",
+  "identity": {
+    "label": "exl45",
+    "revision": "7a749ef5-d400b894-final",
+    "kind": "exl3",
+    "model": "<data>/models/quality-instruct/exl3-4.5-mul1-h6",
+    "identity": {
+      "kind": "exl3",
+      "quantization_sha256": "c0359b3e318771f352ebf1329f06408d9528fd20e8b29a5166ec698c54b83dce",
+      "index_sha256": "2d9d231679eae1115071dcfe31614a10de83752e5db8caaf789b6c401395edbb",
+      "bits": 4.5,
+      "head_bits": 6,
+      "mtp_bits": 4,
+      "indexed_tensors": 128346,
+      "shards": {
+        "model-00001-of-00006.safetensors": {
+          "size_bytes": 4208823815,
+          "mtime_ns": 1792416025895497108
+        },
+        "model-00002-of-00006.safetensors": {
+          "size_bytes": 4278966704,
+          "mtime_ns": 1792416033679923602
+        },
+        "model-00003-of-00006.safetensors": {
+          "size_bytes": 3869701998,
+          "mtime_ns": 1792416039861262295
+        },
+        "model-00004-of-00006.safetensors": {
+          "size_bytes": 4075290300,
+          "mtime_ns": 1792416046026600137
+        },
+        "model-00005-of-00006.safetensors": {
+          "size_bytes": 4108787121,
+          "mtime_ns": 1792416051317890103
+        },
+        "model-00006-of-00006.safetensors": {
+          "size_bytes": 982885245,
+          "mtime_ns": 1792416052683964968
+        }
+      },
+      "text_payload_bytes": 20520903276,
+      "full_weight_hash": false,
+      "weight_payload_read": false,
+      "metadata_bootstrap_bytes": 10943535,
+      "metadata_bootstrap_sha256": "efbe07e5ea1a2a27e3a35dfa16eef9f019fd9bb49b22242a84552d7bd7dd9c9f",
+      "artifact_proof_sha256": "d9d9e945f5cfb99f0dfe3c3bc12213de5606c11583176ff7520db1cd6d7feb8c"
+    },
+    "protocol_sha256": "3532efb1c9b12085808b461b0d2e0d8cf6c6f90702f09e59f8ef2d0bad8952f9",
+    "binary_sha256": "d400b894038ca0f924a6cac1b355276026e2d71070cd5dba89e9be8568d2d7c1",
+    "env": {
+      "STRATA_ROUTE_TAIL_SKIP": "0",
+      "STRATA_HC_Q8": "0",
+      "STRATA_EXL3_GU_SPLIT_K": "8",
+      "STRATA_EXL3_CPU_INTDOT": "1",
+      "STRATA_EXL3_CPU_ROWPARALLEL": "1",
+      "STRATA_VRAM_LIMIT_MIB": "8192",
+      "STRATA_MAX_ALLOC_MIB": "4096",
+      "STRATA_NO_XMX": "1",
+      "STRATA_EXL3_WORD_TILE_PRELOAD": "1",
+      "STRATA_EXL3_DEVICE_HIT_PLAN": "1",
+      "ROCR_VISIBLE_DEVICES": "<gpu-uuid>",
+      "STRATA_GPU_PCI": "<gpu-pci>",
+      "ONEAPI_DEVICE_SELECTOR": "hip:*",
+      "LD_LIBRARY_PATH": "<checkout>/.tools/intel-llvm/install/lib:<rocm>"
+    },
+    "pool_workers": 48,
+    "runner_sha256": "c62019c05442768a80fee13a9d5996c0d0bb63dab06904f5925b012fef15fe2c"
+  },
+  "binary_provenance": {
+    "format": "coordinator-frozen-postfix-binary/1",
+    "frozen_utc": "2026-10-22T04:10:17.031379+00:00",
+    "sha256": "d400b894038ca0f924a6cac1b355276026e2d71070cd5dba89e9be8568d2d7c1",
+    "size_bytes": 80553312,
+    "source_binary": "<checkout>/build/free/plain_model_logits",
+    "source_mtime_ns": 1792638139745613820,
+    "coordinator_provenance_sha256": "d52c27d3232cc84751ba631cdb49d4edfb916d833826655e5a4cf33193964343",
+    "source_provenance": {
+      "source_binary": "<checkout>/build/free/plain_model_logits",
+      "sha256": "d400b894038ca0f924a6cac1b355276026e2d71070cd5dba89e9be8568d2d7c1",
+      "revision": "7a749ef5-d400b894-final",
+      "note": "the coordinator's record of which binary produced this capture"
+    },
+    "source_claim_policy": "The supplied provenance is retained verbatim; current repository HEAD is not inferred to be the binary source."
+  },
+  "protocol": {
+    "data_key": "3e97fdf1bc08e9fe",
+    "reference_key": "8695b44c40270bea",
+    "trace_sha256": "8140f8a90d13533d8e0fc70e12fc52e465b7ac6af34091c844eed29c7d5711e4",
+    "holdout_manifest_sha256": "7e8eafc5ccd8ff7f67adbe3e6394744db536a106592fc03fa4e775af3e0352f4",
+    "eval_vocab": 248077,
+    "model_vocab": 248320,
+    "row_ids": [
+      "holdout-ja-narrative",
+      "holdout-ja-observation",
+      "holdout-ja-conversation",
+      "holdout-ja-debugging",
+      "holdout-code-python",
+      "holdout-code-typescript"
+    ],
+    "row_lengths": [
+      458,
+      488,
+      493,
+      506,
+      335,
+      449
+    ],
+    "positions": 2729,
+    "env": {
+      "STRATA_ROUTE_TAIL_SKIP": "0",
+      "STRATA_HC_Q8": "0",
+      "STRATA_EXL3_GU_SPLIT_K": "8",
+      "STRATA_EXL3_CPU_INTDOT": "1",
+      "STRATA_EXL3_CPU_ROWPARALLEL": "1",
+      "STRATA_VRAM_LIMIT_MIB": "8192",
+      "STRATA_MAX_ALLOC_MIB": "4096",
+      "STRATA_NO_XMX": "1",
+      "STRATA_EXL3_WORD_TILE_PRELOAD": "1",
+      "STRATA_EXL3_DEVICE_HIT_PLAN": "1"
+    },
+    "quality_metric": "KL(P_BF16 || P_candidate) only",
+    "performance_gate": false,
+    "format": "optimized45-frozen-full6-protocol/1",
+    "native_expert_profile_sha256": "3f033e6199c95b1c5145ffa01a36c813d786ab42c130fe2cea20924b3d6b2155"
+  },
+  "command": [
+    "<data>/records/quality-instruct/bundles/7a749ef5-d400b894-final/plain_model_logits",
+    "--exl3",
+    "<data>/models/quality-instruct/exl3-4.5-mul1-h6",
+    "--metadata-gguf",
+    "<data>/models/quality-instruct/qwen35-instruct-metadata-only.gguf",
+    "--trace",
+    "<data>/records/quality-instruct/teacher-v620/holdout-trace.json",
+    "--out-dir",
+    "<data>/records/quality-instruct/kl-final-7a749ef5/exl45-r9700/logits",
+    "--rows",
+    "0,1,2,3,4,5",
+    "--max-t",
+    "1",
+    "--pool-workers",
+    "48",
+    "--prompt-chunk",
+    "0",
+    "--spec",
+    "0",
+    "--adapt-every",
+    "0"
+  ],
+  "command_shell": "<data>/records/quality-instruct/bundles/7a749ef5-d400b894-final/plain_model_logits --exl3 <data>/models/quality-instruct/exl3-4.5-mul1-h6 --metadata-gguf <data>/models/quality-instruct/qwen35-instruct-metadata-only.gguf --trace <data>/records/quality-instruct/teacher-v620/holdout-trace.json --out-dir <data>/records/quality-instruct/kl-final-7a749ef5/exl45-r9700/logits --rows 0,1,2,3,4,5 --max-t 1 --pool-workers 48 --prompt-chunk 0 --spec 0 --adapt-every 0",
+  "env": {
+    "STRATA_ROUTE_TAIL_SKIP": "0",
+    "STRATA_HC_Q8": "0",
+    "STRATA_EXL3_GU_SPLIT_K": "8",
+    "STRATA_EXL3_CPU_INTDOT": "1",
+    "STRATA_EXL3_CPU_ROWPARALLEL": "1",
+    "STRATA_VRAM_LIMIT_MIB": "8192",
+    "STRATA_MAX_ALLOC_MIB": "4096",
+    "STRATA_NO_XMX": "1",
+    "STRATA_EXL3_WORD_TILE_PRELOAD": "1",
+    "STRATA_EXL3_DEVICE_HIT_PLAN": "1",
+    "ROCR_VISIBLE_DEVICES": "<gpu-uuid>",
+    "STRATA_GPU_PCI": "<gpu-pci>",
+    "ONEAPI_DEVICE_SELECTOR": "hip:*",
+    "LD_LIBRARY_PATH": "<checkout>/.tools/intel-llvm/install/lib:<rocm>"
+  },
+  "runner_sha256": "c62019c05442768a80fee13a9d5996c0d0bb63dab06904f5925b012fef15fe2c",
+  "CPU_full_weight_reconstruction": false,
+  "performance_claim": false,
+  "previous43da_or_native_EXL3_cache_used": false,
+  "started_utc": "2026-10-22T04:10:18.000451+00:00",
+  "returncode": 0,
+  "manifest_sha256": "75cfaf85e906a32028e8ebf635a51ded9e062d56bc2f1fdf2dd26dcd27936c49",
+  "finished_utc": "2026-10-22T04:12:20.502085+00:00"
+}
