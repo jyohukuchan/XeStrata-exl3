@@ -204,6 +204,12 @@ private:
     std::vector<strata::kernels::cpu::ExpertJobExl3> cpu_jobs_;
     std::vector<int32_t> miss_ids_;
 
+    // The seven per-window plan arrays live in one contiguous host arena and one contiguous device arena,
+    // carved out in the same order on both sides so one memcpy uploads the whole window plan.  The typed pointers
+    // below are views into those arenas, not separate allocations.
+    void* h_plan_arena_ = nullptr;
+    void* d_plan_arena_ = nullptr;
+    size_t plan_arena_bytes_ = 0;
     uint64_t* h_blob_base_ = nullptr;
     int32_t* h_format_index_ = nullptr;
     strata::kernels::exl3::ExpertBlobLayout* h_format_table_ = nullptr;

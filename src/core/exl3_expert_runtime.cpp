@@ -80,26 +80,16 @@ void Exl3ExpertRuntime::close() {
     total_direct_miss_entries_ = 0;
     direct_entries_ = 0;
     if (d_scratch_ != nullptr) strata::gpu::free(d_scratch_);
-    if (d_blob_base_ != nullptr) strata::gpu::free(d_blob_base_);
-    if (d_format_index_ != nullptr) strata::gpu::free(d_format_index_);
+    // The seven per-window plan arrays are views into the plan arenas, not separate allocations.
+    if (d_plan_arena_ != nullptr) strata::gpu::free(d_plan_arena_);
     if (d_format_table_ != nullptr) strata::gpu::free(d_format_table_);
-    if (d_start_ != nullptr) strata::gpu::free(d_start_);
-    if (d_tok_ != nullptr) strata::gpu::free(d_tok_);
-    if (d_dst_ != nullptr) strata::gpu::free(d_dst_);
-    if (d_ngroups_ != nullptr) strata::gpu::free(d_ngroups_);
-    if (d_nentries_ != nullptr) strata::gpu::free(d_nentries_);
     if (d_entry_plans_ != nullptr) strata::gpu::free(d_entry_plans_);
     if (d_pair_blob_base_ != nullptr) strata::gpu::free(d_pair_blob_base_);
     if (d_pair_format_index_ != nullptr) strata::gpu::free(d_pair_format_index_);
-    if (h_blob_base_ != nullptr) strata::gpu::free(h_blob_base_);
-    if (h_format_index_ != nullptr) strata::gpu::free(h_format_index_);
+    if (h_plan_arena_ != nullptr) strata::gpu::free(h_plan_arena_);
     if (h_format_table_ != nullptr) strata::gpu::free(h_format_table_);
-    if (h_start_ != nullptr) strata::gpu::free(h_start_);
-    if (h_tok_ != nullptr) strata::gpu::free(h_tok_);
-    if (h_dst_ != nullptr) strata::gpu::free(h_dst_);
-    if (h_ngroups_ != nullptr) strata::gpu::free(h_ngroups_);
-    if (h_nentries_ != nullptr) strata::gpu::free(h_nentries_);
     d_scratch_ = nullptr;
+    h_plan_arena_ = nullptr; d_plan_arena_ = nullptr; plan_arena_bytes_ = 0;
     d_blob_base_ = nullptr; d_format_index_ = nullptr; d_format_table_ = nullptr;
     d_start_ = nullptr; d_tok_ = nullptr; d_dst_ = nullptr; d_ngroups_ = nullptr; d_nentries_ = nullptr;
     d_entry_plans_ = nullptr;
@@ -140,26 +130,58 @@ bool Exl3ExpertRuntime::allocate_images(std::string& err) {
         groups > std::numeric_limits<size_t>::max() / sizeof(int32_t) ||
         entries > std::numeric_limits<size_t>::max() / sizeof(int32_t) ||
         entries > std::numeric_limits<size_t>::max() / sizeof(strata::kernels::exl3::GroupedEntryPlan) ||
-        formats > std::numeric_limits<size_t>::max() / sizeof(Exl3ExpertFormatDesc)) {
+        formats > std::numeric_limits<size_t>::max() / sizeof(Exl3ExpertFormatDesc) ||
+        groups + 1 > std::numeric_limits<size_t>::max() / sizeof(int32_t)) {
         err = "exl3 runtime: plan allocation overflows";
         return false;
     }
-    if (!host(reinterpret_cast<void**>(&h_blob_base_), groups * sizeof(uint64_t), "blob plan") ||
-        !host(reinterpret_cast<void**>(&h_format_index_), groups * sizeof(int32_t), "format plan") ||
-        !host(reinterpret_cast<void**>(&h_format_table_), formats * sizeof(Exl3ExpertFormatDesc), "format table") ||
-        !host(reinterpret_cast<void**>(&h_start_), (groups + 1) * sizeof(int32_t), "start plan") ||
-        !host(reinterpret_cast<void**>(&h_tok_), entries * sizeof(int32_t), "token plan") ||
-        !host(reinterpret_cast<void**>(&h_dst_), entries * sizeof(int32_t), "destination plan") ||
-        !host(reinterpret_cast<void**>(&h_ngroups_), sizeof(int32_t), "group count") ||
-        !host(reinterpret_cast<void**>(&h_nentries_), sizeof(int32_t), "entry count") ||
-        !device(reinterpret_cast<void**>(&d_blob_base_), groups * sizeof(uint64_t), "blob plan") ||
-        !device(reinterpret_cast<void**>(&d_format_index_), groups * sizeof(int32_t), "format plan") ||
+    // The per-window plan arena: the seven arrays copy_plan uploads, laid out once here and carved in the same
+    // order on the host and the device.  blob_base (uint64) comes first so the allocation's own alignment covers
+    // it; every later array starts at a multiple of its alignment.  Sizes come from max_entries_ (= max_tokens ×
+    // routed_k), so every window width up to the bound the runtime opened with - one row or many - fits.
+    size_t blob_off = 0, format_off = 0, start_off = 0, tok_off = 0, dst_off = 0, ngroups_off = 0, nentries_off = 0;
+    size_t plan_bytes = 0;
+    auto append = [&](size_t bytes, size_t align, size_t& at) {
+        if (plan_bytes > std::numeric_limits<size_t>::max() - align) return false;
+        const size_t start = (plan_bytes + align - 1) & ~(align - 1);
+        if (bytes > std::numeric_limits<size_t>::max() - start) return false;
+        at = start;
+        plan_bytes = start + bytes;
+        return true;
+    };
+    if (!append(groups * sizeof(uint64_t), alignof(uint64_t), blob_off) ||
+        !append(groups * sizeof(int32_t), alignof(int32_t), format_off) ||
+        !append((groups + 1) * sizeof(int32_t), alignof(int32_t), start_off) ||
+        !append(entries * sizeof(int32_t), alignof(int32_t), tok_off) ||
+        !append(entries * sizeof(int32_t), alignof(int32_t), dst_off) ||
+        !append(sizeof(int32_t), alignof(int32_t), ngroups_off) ||
+        !append(sizeof(int32_t), alignof(int32_t), nentries_off)) {
+        err = "exl3 runtime: plan arena overflows";
+        return false;
+    }
+    h_plan_arena_ = strata::gpu::alloc_host(plan_bytes);
+    if (h_plan_arena_ == nullptr) { err = "exl3 runtime: host plan arena allocation failed"; return false; }
+    d_plan_arena_ = strata::gpu::alloc_device(plan_bytes);
+    if (d_plan_arena_ == nullptr) { err = "exl3 runtime: device plan arena allocation failed"; return false; }
+    plan_arena_bytes_ = plan_bytes;
+    auto* h_base = static_cast<uint8_t*>(h_plan_arena_);
+    auto* d_base = static_cast<uint8_t*>(d_plan_arena_);
+    h_blob_base_ = reinterpret_cast<uint64_t*>(h_base + blob_off);
+    h_format_index_ = reinterpret_cast<int32_t*>(h_base + format_off);
+    h_start_ = reinterpret_cast<int32_t*>(h_base + start_off);
+    h_tok_ = reinterpret_cast<int32_t*>(h_base + tok_off);
+    h_dst_ = reinterpret_cast<int32_t*>(h_base + dst_off);
+    h_ngroups_ = reinterpret_cast<int32_t*>(h_base + ngroups_off);
+    h_nentries_ = reinterpret_cast<int32_t*>(h_base + nentries_off);
+    d_blob_base_ = reinterpret_cast<uint64_t*>(d_base + blob_off);
+    d_format_index_ = reinterpret_cast<int32_t*>(d_base + format_off);
+    d_start_ = reinterpret_cast<int32_t*>(d_base + start_off);
+    d_tok_ = reinterpret_cast<int32_t*>(d_base + tok_off);
+    d_dst_ = reinterpret_cast<int32_t*>(d_base + dst_off);
+    d_ngroups_ = reinterpret_cast<int32_t*>(d_base + ngroups_off);
+    d_nentries_ = reinterpret_cast<int32_t*>(d_base + nentries_off);
+    if (!host(reinterpret_cast<void**>(&h_format_table_), formats * sizeof(Exl3ExpertFormatDesc), "format table") ||
         !device(reinterpret_cast<void**>(&d_format_table_), formats * sizeof(Exl3ExpertFormatDesc), "format table") ||
-        !device(reinterpret_cast<void**>(&d_start_), (groups + 1) * sizeof(int32_t), "start plan") ||
-        !device(reinterpret_cast<void**>(&d_tok_), entries * sizeof(int32_t), "token plan") ||
-        !device(reinterpret_cast<void**>(&d_dst_), entries * sizeof(int32_t), "destination plan") ||
-        !device(reinterpret_cast<void**>(&d_ngroups_), sizeof(int32_t), "group count") ||
-        !device(reinterpret_cast<void**>(&d_nentries_), sizeof(int32_t), "entry count") ||
         !device(reinterpret_cast<void**>(&d_entry_plans_),
                 entries * sizeof(strata::kernels::exl3::GroupedEntryPlan), "entry resolution"))
         return false;
@@ -172,12 +194,8 @@ bool Exl3ExpertRuntime::allocate_images(std::string& err) {
                     "resident pair format table"))
             return false;
     }
-    std::memset(h_blob_base_, 0, groups * sizeof(uint64_t));
-    std::memset(h_format_index_, 0, groups * sizeof(int32_t));
+    std::memset(h_plan_arena_, 0, plan_arena_bytes_);
     std::memset(h_format_table_, 0, formats * sizeof(Exl3ExpertFormatDesc));
-    std::memset(h_start_, 0, (groups + 1) * sizeof(int32_t));
-    std::memset(h_tok_, 0, entries * sizeof(int32_t));
-    std::memset(h_dst_, 0, entries * sizeof(int32_t));
     *h_ngroups_ = 0; *h_nentries_ = 0;
     std::memcpy(h_format_table_, format_table_host_.data(), formats * sizeof(Exl3ExpertFormatDesc));
 
@@ -645,20 +663,14 @@ bool Exl3ExpertRuntime::run_cpu(std::string& err) {
 
 bool Exl3ExpertRuntime::copy_plan(sycl::queue& queue, const std::vector<sycl::event>& deps,
                                   std::vector<sycl::event>& copies, std::string& err) {
+    // One memcpy uploads the whole window plan: the host and device arenas share the layout allocate_images
+    // carved, so the seven arrays travel in a single submit instead of seven.  Events from other streams still
+    // order this copy explicitly; work already on this queue needs no event, in-order or captured.
     try {
-        auto copy = [&](void* dst, const void* src, size_t bytes) {
-            copies.push_back(queue.submit([&](sycl::handler& h) {
-                if (!deps.empty()) h.depends_on(deps);
-                h.memcpy(dst, src, bytes);
-            }));
-        };
-        copy(d_blob_base_, h_blob_base_, static_cast<size_t>(max_entries_) * sizeof(uint64_t));
-        copy(d_format_index_, h_format_index_, static_cast<size_t>(max_entries_) * sizeof(int32_t));
-        copy(d_start_, h_start_, (static_cast<size_t>(max_entries_) + 1) * sizeof(int32_t));
-        copy(d_tok_, h_tok_, static_cast<size_t>(max_entries_) * sizeof(int32_t));
-        copy(d_dst_, h_dst_, static_cast<size_t>(max_entries_) * sizeof(int32_t));
-        copy(d_ngroups_, h_ngroups_, sizeof(int32_t));
-        copy(d_nentries_, h_nentries_, sizeof(int32_t));
+        copies.push_back(queue.submit([&](sycl::handler& h) {
+            if (!deps.empty()) h.depends_on(deps);
+            h.memcpy(d_plan_arena_, h_plan_arena_, plan_arena_bytes_);
+        }));
         return true;
     } catch (const std::exception& e) {
         err = std::string("exl3 runtime: plan copy: ") + e.what();
@@ -716,9 +728,12 @@ bool Exl3ExpertRuntime::enqueue_impl(sycl::queue& queue, const float* device_fp3
         try { queue_runtime->finish(queue); } catch (...) {}
         return false;
     }
+    // No event dependency on the plan copy: this queue is verified in-order above, and copy_plan ordered the copy
+    // after `deps` already, so the grouped kernels submitted next run after it transitively.  That keeps the single
+    // copy submit - not the event edge - as the only added launch on this path.
     try {
         done = strata::kernels::exl3::exl3_grouped_fp32(queue, device_plan_, device_fp32_x, ldx, gpu_output, ldy,
-                                                        d_scratch_, scratch_elements_, {}, copies);
+                                                        d_scratch_, scratch_elements_, {}, {});
     } catch (const std::exception& e) {
         // copy_plan may already have submitted work. Drain this queue before a caller can tear down the cache or
         // return an error to a stage owner; the normal success path remains fully asynchronous.
