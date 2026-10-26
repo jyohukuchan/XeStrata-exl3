@@ -5,6 +5,7 @@
 
 #include "strata/core/gpu.hpp"
 #include "strata/kernels/cpu/exl3_expert.hpp"
+#include "strata/kernels/elementwise.hpp"
 #include "../kernels/parity_device.hpp"
 
 #include <nlohmann/json.hpp>
@@ -235,6 +236,120 @@ int main() {
             if (!compare_merged(overlap_cpu, overlap_gpu, expected, max_tokens * k, ldy, hidden,
                                 "hit-before-CPU merge"))
                 ++failures;
+        }
+
+        // The GPU-side merge: the misses upload from pinned host memory and are added into the hit
+        // rows' buffer on the compute queue, without wait_gpu.  The device-merged rows must equal the
+        // host loop bit for bit, and the next window must prepare cleanly after mark_gpu_consumed.
+        {
+            const size_t tight_count = static_cast<size_t>(max_tokens * k * hidden);
+            std::vector<float> tight_x(static_cast<size_t>(max_tokens * hidden));
+            for (int64_t row = 0; row < max_tokens; ++row)
+                std::copy_n(x.data() + row * ldx, hidden, tight_x.data() + row * hidden);
+            std::vector<float> tight_expected(tight_count, 24680.5f);
+            for (int64_t entry = 0; entry < max_tokens * k; ++entry)
+                if (strata::kernels::cpu::exl3::expert(views[static_cast<size_t>(ids[entry])],
+                                                       tight_x.data() + (entry / k) * hidden, hidden,
+                                                       tight_expected.data() + entry * hidden, hidden,
+                                                       1) != strata::kernels::cpu::exl3::Status::ok)
+                    ++failures;
+            float* d_tight_x = device.upload(tight_x);
+            std::vector<float> tight_zero(tight_count, 0.0f);
+            float* d_parts = device.upload(tight_zero);  // cleared parts, like the model's memset
+            float* d_pre = device.alloc<float>(tight_count);
+            float* d_staging = device.alloc<float>(tight_count);
+            float* pinned =
+                static_cast<float*>(strata::gpu::alloc_host(tight_count * sizeof(float)));
+            strata::gpu::Event* merge_mark = nullptr;
+            bool merge_ok = pinned != nullptr && d_pre != nullptr && d_staging != nullptr &&
+                            strata::gpu::event_create(&merge_mark, false);
+            sycl::event window_done;
+            if (merge_ok &&
+                (!runtime.prepare_window(0, tight_x.data(), hidden, ids, max_tokens, pinned, hidden, err) ||
+                 runtime.miss_entries() != 2 || runtime.hit_entries() != 2 ||
+                 !runtime.enqueue_hit_only(queue, d_tight_x, hidden, d_parts, hidden, window_done, {}, err) ||
+                 !runtime.run_cpu(err))) {
+                std::fprintf(stderr, "runtime GPU-merge window failed: %s\n", err.c_str());
+                merge_ok = false;
+            }
+            if (merge_ok) {
+                // Miss rows of the cleared parts must still read +0.0 (the hit kernels plan hits only),
+                // and hit rows of the CPU buffer must read +0.0: the halves merged below are disjoint.
+                std::vector<float> pre_merge(tight_count, 24680.5f);
+                if (!strata::gpu::copy_async(d_pre, d_parts, tight_count * sizeof(float), nullptr) ||
+                    !strata::gpu::copy_async(d_staging, pinned, tight_count * sizeof(float), nullptr)) {
+                    std::fprintf(stderr, "runtime GPU-merge queue failed: %s\n", strata::gpu::last_error());
+                    merge_ok = false;
+                } else {
+                    strata::kernels::add_inplace(d_parts, d_staging, static_cast<int64_t>(tight_count),
+                                                 strata::parity::stream());
+                    merge_ok = strata::gpu::event_record(merge_mark, nullptr) &&
+                               strata::gpu::stream_sync(nullptr);
+                    if (!merge_ok)
+                        std::fprintf(stderr, "runtime GPU-merge mark failed: %s\n", strata::gpu::last_error());
+                }
+                if (merge_ok) {
+                    if (strata::gpu::event_status(merge_mark) != strata::gpu::Status::Done) {
+                        std::fprintf(stderr, "runtime GPU-merge mark is not done after the queue drained\n");
+                        merge_ok = false;
+                    }
+                    strata::parity::copy_out(pre_merge.data(), d_pre, tight_count);
+                    std::vector<float> device_merged(tight_count, 24680.5f);
+                    strata::parity::copy_out(device_merged.data(), d_parts, tight_count);
+                    size_t bad = 0;
+                    for (int64_t entry = 0; entry < max_tokens * k && bad == 0; ++entry) {
+                        const bool hit = ids[entry] == 0;
+                        for (int64_t col = 0; col < hidden; ++col) {
+                            const size_t at = static_cast<size_t>(entry * hidden + col);
+                            const float want_pre = hit ? pre_merge[at] : 0.0f;
+                            const float want_cpu = hit ? 0.0f : pinned[at];
+                            if (pre_merge[at] != want_pre || pinned[at] != want_cpu ||
+                                device_merged[at] != pre_merge[at] + pinned[at]) {
+                                std::fprintf(stderr,
+                                             "runtime GPU-merge mismatch entry=%lld col=%lld pre=%.9g cpu=%.9g "
+                                             "device=%.9g\n",
+                                             (long long) entry, (long long) col, (double) pre_merge[at],
+                                             (double) pinned[at], (double) device_merged[at]);
+                                bad = 1;
+                                break;
+                            }
+                        }
+                    }
+                    if (bad != 0) merge_ok = false;
+                }
+                // The pending plan is consumed without blocking: the next window must prepare cleanly.
+                runtime.mark_gpu_consumed();
+                const int32_t ids_all_hit[] = {0, 0, 0, 0};
+                std::vector<float> second_expected(tight_count, 24680.5f);
+                for (int64_t entry = 0; entry < max_tokens * k; ++entry)
+                    if (strata::kernels::cpu::exl3::expert(views[0], tight_x.data() + (entry / k) * hidden,
+                                                           hidden, second_expected.data() + entry * hidden,
+                                                           hidden, 1) != strata::kernels::cpu::exl3::Status::ok)
+                        merge_ok = false;
+                std::vector<float> second_cpu(tight_count, 24680.5f);
+                sycl::event second_done;
+                if (!runtime.prepare_window(0, tight_x.data(), hidden, ids_all_hit, max_tokens, second_cpu.data(),
+                                            hidden, err) ||
+                    runtime.miss_entries() != 0 ||
+                    !runtime.enqueue_hit_only(queue, d_tight_x, hidden, d_parts, hidden, second_done, {}, err) ||
+                    !runtime.run_cpu(err) || !runtime.wait_gpu(second_done, err)) {
+                    std::fprintf(stderr, "runtime window after GPU merge failed: %s\n", err.c_str());
+                    merge_ok = false;
+                } else {
+                    std::vector<float> second_gpu(tight_count, 24680.5f);
+                    strata::parity::copy_out(second_gpu.data(), d_parts, tight_count);
+                    if (!compare_merged(second_cpu, second_gpu, second_expected, max_tokens * k, hidden, hidden,
+                                        "window after GPU-merge consume"))
+                        merge_ok = false;
+                }
+            }
+            if (merge_ok) {
+                std::printf("GPU-side merge without wait_gpu: OK\n");
+            } else {
+                ++failures;
+            }
+            if (pinned != nullptr) strata::gpu::free(pinned);
+            if (merge_mark != nullptr) strata::gpu::event_destroy(merge_mark);
         }
 
         // Capture the plan-copy nodes and grouped graph, then replay after prepare_window updates only the persistent

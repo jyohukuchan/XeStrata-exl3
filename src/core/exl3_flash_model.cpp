@@ -16,6 +16,7 @@
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/kernels/elementwise.hpp"
 #include "strata/core/session.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/gdn.hpp"
@@ -180,6 +181,32 @@ int64_t device_cache_budget_mib() {
 std::string device_cache_profile_path() {
     const char* text = std::getenv("STRATA_EXL3_DEVICE_CACHE_PROFILE");
     return text == nullptr ? std::string() : std::string(text);
+}
+
+// Uploads `count` floats from the pinned `host` miss buffer to the device `staging` buffer and adds them
+// into `parts` on the stage's in-order queue, then marks `done`.  The queue already holds the hit kernels,
+// so its order runs the upload and the add after them with no host wait: the host instead waits for `done`
+// before it rewrites `host`.  Bit-identical to the host loop this replaces - every output element is one
+// FP32 add of the same two operands, and the halves are disjoint by construction: prepare_window zeroes
+// the hit rows of the CPU buffer while the grouped kernel writes only its planned hit rows into the
+// cleared parts (and the CPU pool writes only the miss rows the kernel never plans).  A window with no
+// CPU miss skips this entirely: hits and direct reads are already complete in `parts`.
+bool merge_miss_gpu(int device, float* parts, const float* host, void* staging, size_t count,
+                    strata::gpu::Event* done, std::string& err) {
+    const OnDevice on(device);
+    if (!strata::gpu::copy_async(staging, host, count * sizeof(float), nullptr)) {
+        err = std::string("EXL3 Flash: expert miss upload failed: ") + strata::gpu::last_error();
+        return false;
+    }
+    // A null stream would wait for the add; the explicit compute queue keeps it queued behind the upload.
+    sycl::queue& queue = Runtime::at(device).stream(nullptr);
+    strata::kernels::add_inplace(parts, static_cast<const float*>(staging), static_cast<int64_t>(count),
+                                 static_cast<void*>(&queue));
+    if (!strata::gpu::event_record(done, nullptr)) {
+        err = std::string("EXL3 Flash: expert merge mark failed: ") + strata::gpu::last_error();
+        return false;
+    }
+    return true;
 }
 
 /// The reserve the model keeps for everything but the expert cache: the driver's own use, the graph capture's
@@ -700,9 +727,19 @@ struct Exl3FlashModel::Impl {
         size_t session_arena_bytes = 0;
         Doorbell doorbell;
         void* parts_device = nullptr;
-        std::vector<float> miss_output;
-        std::vector<float> merge_output;
-        std::vector<float> merge_upload;
+        // THE GPU-SIDE MERGE'S DOUBLE BUFFERING.  The CPU pool writes a window's misses into one pinned
+        // host slot while the queue may still be reading the other slot's upload, so the two slots alternate
+        // per merged window (`merge_seq`).  `merge_event[s]` marks the upload and add that read
+        // `miss_host[s]`; before a slot is reused the host waits for its mark, so a queue that fell behind
+        // can never see a rewritten buffer.  The hit kernels, the upload and the add all run on the same
+        // in-order queue, so nothing waits between them - only a slot reuse waits, and then only when the
+        // queue has not reached the mark yet.  `merge_used[s]` skips that wait on first use.
+        static constexpr int kMergeSlots = 2;
+        float* miss_host[kMergeSlots] = {nullptr, nullptr};
+        void* merge_staging[kMergeSlots] = {nullptr, nullptr};
+        strata::gpu::Event* merge_event[kMergeSlots] = {nullptr, nullptr};
+        bool merge_used[kMergeSlots] = {false, false};
+        uint64_t merge_seq = 0;
         float* embedding_device = nullptr;
         std::vector<strata::gpu::Graph*> pre_graphs;
         std::vector<strata::gpu::Graph*> post_graphs;
@@ -731,8 +768,13 @@ struct Exl3FlashModel::Impl {
         std::vector<float> pf_host_x;
         std::vector<int32_t> pf_host_ids;
         std::vector<float> pf_host_weights;
-        std::vector<float> pf_miss;
-        std::vector<float> pf_merge;
+        // The prefill merge's double buffering: the same slot/event protocol as the decode merge above,
+        // one window of `prompt_chunk * routed_k * n_embd` floats per slot.
+        float* pf_miss_host[kMergeSlots] = {nullptr, nullptr};
+        void* pf_staging[kMergeSlots] = {nullptr, nullptr};
+        strata::gpu::Event* pf_event[kMergeSlots] = {nullptr, nullptr};
+        bool pf_used[kMergeSlots] = {false, false};
+        uint64_t pf_seq = 0;
     };
 
     Exl3FlashModelOptions options;
@@ -1092,9 +1134,20 @@ bool Exl3FlashModel::open(const std::filesystem::path& directory, const Exl3Flas
                 err = "EXL3 Flash: stage " + std::to_string(stage_index) + " expert parts allocation failed";
                 return false;
             }
-            stage.miss_output.assign(parts_elements, 0.0f);
-            stage.merge_output.assign(parts_elements, 0.0f);
-            stage.merge_upload.assign(parts_elements, 0.0f);
+            // The GPU-side merge's buffers: two pinned host miss slots and two device staging slots per
+            // stage, sized for one window (`max_rows == 1` in decode, so this is one layer's parts).
+            // Pinned, because the queue reads the host slot asynchronously after the pool has filled it.
+            for (int slot = 0; slot < Impl::Stage::kMergeSlots; ++slot) {
+                stage.miss_host[slot] =
+                    static_cast<float*>(strata::gpu::alloc_host(parts_elements * sizeof(float)));
+                stage.merge_staging[slot] = strata::gpu::alloc_device(parts_elements * sizeof(float));
+                if (stage.miss_host[slot] == nullptr || stage.merge_staging[slot] == nullptr ||
+                    !strata::gpu::event_create(&stage.merge_event[slot], false)) {
+                    err = "EXL3 Flash: stage " + std::to_string(stage_index) + " expert merge buffer allocation failed";
+                    return false;
+                }
+                std::fill(stage.miss_host[slot], stage.miss_host[slot] + parts_elements, 0.0f);
+            }
             if (stage_index == 0) {
                 stage.embedding_device = static_cast<float*>(strata::gpu::alloc_device(
                     static_cast<size_t>(impl_->geometry.n_embd) * sizeof(float)));
@@ -1159,8 +1212,20 @@ bool Exl3FlashModel::open(const std::filesystem::path& directory, const Exl3Flas
                 stage.pf_host_x.assign((size_t) Tcap * N, 0.0f);
                 stage.pf_host_ids.assign((size_t) Tcap * routed_k, 0);
                 stage.pf_host_weights.assign((size_t) Tcap * routed_k, 0.0f);
-                stage.pf_miss.assign((size_t) Tcap * routed_k * N, 0.0f);
-                stage.pf_merge.assign((size_t) Tcap * routed_k * N, 0.0f);
+                // The prefill merge's buffers: two pinned host miss slots and two device staging slots per
+                // stage, one chunk window each.
+                const size_t pf_window = (size_t) Tcap * (size_t) routed_k * (size_t) N;
+                for (int slot = 0; slot < Impl::Stage::kMergeSlots; ++slot) {
+                    stage.pf_miss_host[slot] = static_cast<float*>(strata::gpu::alloc_host(pf_window * sizeof(float)));
+                    stage.pf_staging[slot] = strata::gpu::alloc_device(pf_window * sizeof(float));
+                    if (stage.pf_miss_host[slot] == nullptr || stage.pf_staging[slot] == nullptr ||
+                        !strata::gpu::event_create(&stage.pf_event[slot], false)) {
+                        err = "EXL3 Flash: stage " + std::to_string(stage_index) +
+                              " prefill merge buffer allocation failed";
+                        return false;
+                    }
+                    std::fill(stage.pf_miss_host[slot], stage.pf_miss_host[slot] + pf_window, 0.0f);
+                }
             }
         }
         // THE RESIDUAL'S PATH ACROSS EACH BOUNDARY, FROM A REAL COPY.  It is probed with the
@@ -1570,7 +1635,7 @@ bool Exl3FlashModel::open(const std::filesystem::path& directory, const Exl3Flas
                     return false;
                 }
                 if (!strata::gpu::memset_async(stage.parts_device, 0,
-                                               stage.merge_output.size() * sizeof(float), capture_stream) ||
+                                               parts_elements * sizeof(float), capture_stream) ||
                     !stage.runtime->record_device_hit_enqueue(queue, layer,
                                                               static_cast<const float*>(stage.session.block.mixed),
                                                               stage.doorbell.d_ids, 1,
@@ -1633,7 +1698,7 @@ bool Exl3FlashModel::open(const std::filesystem::path& directory, const Exl3Flas
                                                stage.session.block, capture_stream, err, &stage.doorbell,
                                                stage.session.ple.table != nullptr ? &stage.session.ple : nullptr) &&
                                strata::gpu::memset_async(stage.parts_device, 0,
-                                                         stage.merge_output.size() * sizeof(float),
+                                                         parts_elements * sizeof(float),
                                                          capture_stream) &&
                                stage.runtime->record_device_hit_enqueue(
                                    queue, layer, static_cast<const float*>(stage.session.block.mixed),
@@ -1702,6 +1767,24 @@ bool Exl3FlashModel::close(std::string& err) noexcept {
             stage.session.ple.scratch = nullptr;
             if (stage.embedding_device != nullptr) strata::gpu::free(stage.embedding_device);
             if (stage.parts_device != nullptr) strata::gpu::free(stage.parts_device);
+            for (int slot = 0; slot < Impl::Stage::kMergeSlots; ++slot) {
+                if (stage.miss_host[slot] != nullptr) strata::gpu::free(stage.miss_host[slot]);
+                if (stage.merge_staging[slot] != nullptr) strata::gpu::free(stage.merge_staging[slot]);
+                if (stage.merge_event[slot] != nullptr) strata::gpu::event_destroy(stage.merge_event[slot]);
+                if (stage.pf_miss_host[slot] != nullptr) strata::gpu::free(stage.pf_miss_host[slot]);
+                if (stage.pf_staging[slot] != nullptr) strata::gpu::free(stage.pf_staging[slot]);
+                if (stage.pf_event[slot] != nullptr) strata::gpu::event_destroy(stage.pf_event[slot]);
+                stage.miss_host[slot] = nullptr;
+                stage.merge_staging[slot] = nullptr;
+                stage.merge_event[slot] = nullptr;
+                stage.pf_miss_host[slot] = nullptr;
+                stage.pf_staging[slot] = nullptr;
+                stage.pf_event[slot] = nullptr;
+                stage.merge_used[slot] = false;
+                stage.pf_used[slot] = false;
+            }
+            stage.merge_seq = 0;
+            stage.pf_seq = 0;
             if (stage.session_arena != nullptr) strata::gpu::free(stage.session_arena);
             if (stage.prefill_arena != nullptr) strata::gpu::free(stage.prefill_arena);
             stage.prefill_arena = nullptr;
@@ -1951,9 +2034,16 @@ bool Exl3FlashModel::reset(std::string& err) {
                 err = std::string("EXL3 Flash: resetting stage state: ") + strata::gpu::last_error();
                 return false;
             }
-            std::fill(stage.miss_output.begin(), stage.miss_output.end(), 0.0f);
-            std::fill(stage.merge_output.begin(), stage.merge_output.end(), 0.0f);
-            std::fill(stage.merge_upload.begin(), stage.merge_upload.end(), 0.0f);
+            const size_t merge_window =
+                static_cast<size_t>(impl_->options.routed_k) * static_cast<size_t>(impl_->geometry.n_embd);
+            for (int slot = 0; slot < Impl::Stage::kMergeSlots; ++slot) {
+                if (stage.miss_host[slot] != nullptr)
+                    std::fill(stage.miss_host[slot], stage.miss_host[slot] + merge_window, 0.0f);
+                if (stage.pf_miss_host[slot] != nullptr && impl_->options.prompt_chunk > 0)
+                    std::fill(stage.pf_miss_host[slot],
+                              stage.pf_miss_host[slot] + merge_window * static_cast<size_t>(impl_->options.prompt_chunk),
+                              0.0f);
+            }
         }
         if (impl_->has_mtp) {
             const OnDevice on_mtp(impl_->mtp_device);
@@ -2158,8 +2248,11 @@ bool Exl3FlashModel::forward(int32_t token, int64_t pos, int32_t& next_token, fl
                             return false;
                         }
                     } else {
+                        const size_t resident_parts =
+                            static_cast<size_t>(impl_->options.routed_k) *
+                            static_cast<size_t>(impl_->geometry.n_embd);
                         if (!strata::gpu::memset_async(stage.parts_device, 0,
-                                                       stage.merge_output.size() * sizeof(float), nullptr)) {
+                                                       resident_parts * sizeof(float), nullptr)) {
                             err = std::string("EXL3 Flash: clearing expert output: ") + strata::gpu::last_error();
                             return false;
                         }
@@ -2201,44 +2294,50 @@ bool Exl3FlashModel::forward(int32_t token, int64_t pos, int32_t& next_token, fl
                 timing.pre_graph_ms += ms_since(mark);
                 // The expert output is cleared on the queue, ordered before the hit kernels that
                 // fill the entries they compute.
-                if (!strata::gpu::memset_async(stage.parts_device, 0,
-                                               stage.merge_output.size() * sizeof(float), nullptr)) {
+                const size_t parts_count = static_cast<size_t>(impl_->options.routed_k) *
+                                           static_cast<size_t>(impl_->geometry.n_embd);
+                if (!strata::gpu::memset_async(stage.parts_device, 0, parts_count * sizeof(float), nullptr)) {
                     err = std::string("EXL3 Flash: clearing expert output: ") + strata::gpu::last_error();
+                    return false;
+                }
+                // The merge slot for this window: the pool writes the misses into the pinned host slot
+                // while the queue may still be reading the other slot's upload.  A reuse waits for the
+                // slot's mark, so a queue that fell behind never sees a rewritten buffer.
+                const int merge_slot = static_cast<int>(stage.merge_seq % Impl::Stage::kMergeSlots);
+                ++stage.merge_seq;
+                if (stage.merge_used[merge_slot] && !strata::gpu::event_sync(stage.merge_event[merge_slot])) {
+                    err = "EXL3 Flash: expert window layer " + std::to_string(layer) +
+                          ": merge slot wait failed: " + strata::gpu::last_error();
                     return false;
                 }
                 sycl::event expert_done;
                 mark = std::chrono::steady_clock::now();
                 if (!prepare_expert_window(stage_index, layer, stage.doorbell.h_x_f, impl_->geometry.n_embd,
-                                           stage.doorbell.h_ids, 1, stage.miss_output.data(), impl_->geometry.n_embd,
-                                           nullptr, static_cast<const float*>(stage.session.block.mixed),
+                                           stage.doorbell.h_ids, 1, stage.miss_host[merge_slot],
+                                           impl_->geometry.n_embd, nullptr,
+                                           static_cast<const float*>(stage.session.block.mixed),
                                            static_cast<float*>(stage.parts_device), expert_done, err)) {
                     err = "EXL3 Flash: expert window layer " + std::to_string(layer) + ": " + err;
                     return false;
                 }
                 timing.expert_prepare_ms += ms_since(mark);
                 mark = std::chrono::steady_clock::now();
-                if (!wait_expert_window(stage_index, expert_done, err)) {
-                    err = "EXL3 Flash: expert window layer " + std::to_string(layer) + ": " + err;
-                    return false;
+                // THE GPU-SIDE MERGE.  The hit kernels above are still running; the pool has already filled
+                // the pinned miss slot, so its upload and the add into `parts` queue behind the hits on this
+                // same in-order queue: no D2H, no host add, and no wait for the hits.  A window with no CPU
+                // miss (all hits, or direct reads the GPU computed itself) needs no merge at all.  The
+                // runtime's pending plan is consumed without blocking - the queue's order, not a host wait,
+                // carries the hits into the merge and the merge into the post graph.
+                if (stage.runtime->miss_entries() > 0) {
+                    if (!merge_miss_gpu(stage.device, static_cast<float*>(stage.parts_device),
+                                        stage.miss_host[merge_slot], stage.merge_staging[merge_slot], parts_count,
+                                        stage.merge_event[merge_slot], err)) {
+                        err = "EXL3 Flash: expert window layer " + std::to_string(layer) + ": " + err;
+                        return false;
+                    }
+                    stage.merge_used[merge_slot] = true;
                 }
-                timing.expert_wait_ms += ms_since(mark);
-                mark = std::chrono::steady_clock::now();
-                if (!strata::gpu::copy(stage.merge_output.data(), stage.parts_device,
-                                       stage.merge_output.size() * sizeof(float))) {
-                    err = std::string("EXL3 Flash: expert device-to-host merge copy failed: ") + strata::gpu::last_error();
-                    return false;
-                }
-                for (size_t i = 0; i < stage.merge_output.size(); ++i)
-                    stage.merge_output[i] += stage.miss_output[i];
-                // The host swaps in a second buffer and the upload is queued, not waited: the post
-                // graph runs behind the copy on this queue, and the next layer's download fills the
-                // other buffer, so the host never rewrites what a pending upload still reads.
-                std::swap(stage.merge_output, stage.merge_upload);
-                if (!strata::gpu::copy_async(stage.parts_device, stage.merge_upload.data(),
-                                             stage.merge_upload.size() * sizeof(float), nullptr)) {
-                    err = std::string("EXL3 Flash: expert host-to-device merge copy failed: ") + strata::gpu::last_error();
-                    return false;
-                }
+                stage.runtime->mark_gpu_consumed();
                 timing.merge_ms += ms_since(mark);
                 mark = std::chrono::steady_clock::now();
                 // The post graph is issued and not waited: nothing behind it needs the host until
@@ -2463,31 +2562,44 @@ bool Exl3FlashModel::forward_prefill(const int32_t* tokens, int64_t n, int64_t p
                             err = "EXL3 Flash prefill: clearing expert output failed";
                             return false;
                         }
+                        // The merge slot for this window: the pool writes the misses into the pinned host
+                        // slot while the queue may still be reading the other slot's upload.  A reuse waits
+                        // for the slot's mark.  The synchronous readback above already keeps the host behind
+                        // the queue here, so the wait below only guards the slot protocol itself.
+                        const int pf_slot = static_cast<int>(stage.pf_seq % Impl::Stage::kMergeSlots);
+                        ++stage.pf_seq;
+                        if (stage.pf_used[pf_slot] && !strata::gpu::event_sync(stage.pf_event[pf_slot])) {
+                            err = "EXL3 Flash prefill experts layer " + std::to_string(layer) +
+                                  ": merge slot wait failed: " + strata::gpu::last_error();
+                            return false;
+                        }
+                        const size_t pf_count = (size_t) T * (size_t) K * (size_t) N;
                         sycl::event expert_done;
                         {
                             sycl::queue& queue = Runtime::at(stage.device).stream(nullptr);
                             if (!stage.runtime->prepare_window(layer, stage.pf_host_x.data(), N,
-                                                               stage.pf_host_ids.data(), T, stage.pf_miss.data(),
-                                                               N, err) ||
+                                                               stage.pf_host_ids.data(), T,
+                                                               stage.pf_miss_host[pf_slot], N, err) ||
                                 !stage.runtime->enqueue_hit_only(queue, static_cast<const float*>(stage.pf_mixed),
                                                                  N, stage.pf_parts, N, expert_done, {}, err) ||
-                                !stage.runtime->run_cpu(err) ||
-                                !stage.runtime->wait_gpu(expert_done, err)) {
+                                !stage.runtime->run_cpu(err)) {
                                 err = "EXL3 Flash prefill experts layer " + std::to_string(layer) + ": " + err;
                                 return false;
                             }
                         }
-                        if (!strata::gpu::copy(stage.pf_merge.data(), stage.pf_parts,
-                                               (size_t) T * K * N * sizeof(float))) {
-                            err = "EXL3 Flash prefill: expert merge download failed";
-                            return false;
+                        // THE GPU-SIDE MERGE (see the decode path): the upload and the add queue behind the
+                        // still-running hit kernels on the same in-order queue - no D2H, no host add, and no
+                        // wait for the hits.  The pending plan is consumed without blocking; the queue's order
+                        // carries the merge into the post step below.
+                        if (stage.runtime->miss_entries() > 0) {
+                            if (!merge_miss_gpu(stage.device, stage.pf_parts, stage.pf_miss_host[pf_slot],
+                                                stage.pf_staging[pf_slot], pf_count, stage.pf_event[pf_slot], err)) {
+                                err = "EXL3 Flash prefill experts layer " + std::to_string(layer) + ": " + err;
+                                return false;
+                            }
+                            stage.pf_used[pf_slot] = true;
                         }
-                        for (size_t i = 0; i < (size_t) T * K * N; ++i) stage.pf_merge[i] += stage.pf_miss[i];
-                        if (!strata::gpu::copy_async(stage.pf_parts, stage.pf_merge.data(),
-                                                     (size_t) T * K * N * sizeof(float), nullptr)) {
-                            err = "EXL3 Flash prefill: expert merge upload failed";
-                            return false;
-                        }
+                        stage.runtime->mark_gpu_consumed();
                     }
                     // Weights for the combine were downloaded for the host window;
                     // the device combine needs them on device: pf_weights already
