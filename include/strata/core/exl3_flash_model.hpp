@@ -91,6 +91,10 @@ struct Exl3FlashModelOptions {
                                            ///< counts and saves them as a profile for the next run
     bool expert_miss_direct = false;       ///< misses are read by the GPU from pinned host memory over
                                            ///< the bus instead of being computed on the CPU
+    int64_t adapt_every = 4;               ///< tokens between adaptive-tier rounds (0: off)
+    bool adapt_every_given = false;        ///< true: keep adapt_every as set (no automatic period choice)
+    int64_t adapt_swaps = 96;              ///< the most experts one adaptive round moves into VRAM
+    int64_t adapt_mib_per_token = 48;      ///< and at most this many MiB per token read since the last round
     std::string embedding_name;            ///< empty: ModelMap's HF embedding prefix
     std::string ple_sidecar;              ///< empty: discover the specialized EXL3 sidecar
 };
@@ -247,6 +251,18 @@ public:
     /// Writes the firing frequencies recorded this run (options.expert_profile_save) as a profile file
     /// ranking every (layer, expert) pair, hottest first.  False with `err` when nothing was recorded.
     bool save_expert_profile(const std::string& path, std::string& err) const;
+    /// This run's adaptive-tier totals, summed over the stages, for the run report.
+    struct AdaptTotals {
+        int64_t rounds = 0;          ///< rounds that ran (including ones that moved nothing)
+        int64_t swaps = 0;           ///< experts moved into the device cache
+        int64_t skipped = 0;         ///< chosen swaps refused by a slot format mismatch
+        uint64_t bytes = 0;          ///< host-to-device bytes the swaps copied
+        double copy_ms = 0.0;        ///< host time the swaps' copies took
+        double select_ms = 0.0;      ///< host time the rounds' swap choice took
+        int64_t period = 0;          ///< the tokens between rounds now in effect
+        bool auto_lengthened = false;
+    };
+    AdaptTotals adapt_totals() const;
 
     size_t stage_count() const;
     Exl3FlashStageView stage(size_t index) const;

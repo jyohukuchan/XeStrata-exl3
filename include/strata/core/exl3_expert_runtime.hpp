@@ -8,6 +8,7 @@
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/exl3_grouped.hpp"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -113,6 +114,32 @@ public:
     /// recording on.
     const std::vector<uint64_t>& heat() const { return heat_; }
 
+    /// The adaptive tier: while the round period is positive (set before open()), prepare_window() counts
+    /// every routed entry into the decayed usage table, and maybe_adapt() - called with the device idle,
+    /// e.g. at a token boundary - moves hot non-resident experts into cold residents' cache slots.  `every`
+    /// is the tokens between rounds (0: off); `swaps` caps one round's moves; `mib_per_token` caps the
+    /// round's host-to-device copies per token read since the last round (0: no byte bound); `given` says
+    /// the period was set explicitly (no automatic choice below).  The tier is XeStrata's own (see
+    /// exl3_adaptive.hpp): no file from another project is read or copied.
+    void configure_adapt(int64_t every, int64_t swaps, int64_t mib_per_token, bool given);
+    bool adapt_enabled() const { return adapt_every_ > 0; }
+    /// Runs an adaptive round when one is due (a no-op otherwise, and always when the tier is off or the
+    /// cache holds every pair).  The caller waits for the device first: a round rewrites cache slots no
+    /// GPU kernel may be reading.  False with `err` when a round's copies fail.
+    bool maybe_adapt(std::string& err);
+    /// This run's adaptive-tier totals, for the run report.
+    struct AdaptStats {
+        int64_t rounds = 0;          ///< rounds that ran (including ones that moved nothing)
+        int64_t swaps = 0;           ///< experts moved into the device cache
+        int64_t skipped_format = 0;  ///< chosen swaps refused by a slot format or size mismatch
+        uint64_t bytes = 0;          ///< host-to-device bytes the swaps copied
+        double copy_ms = 0.0;        ///< host time the swaps' copies took
+        double select_ms = 0.0;      ///< host time the rounds' swap choice took
+        int64_t period = 0;          ///< the tokens between rounds now in effect
+        bool auto_lengthened = false;  ///< the automatic choice lengthened the period
+    };
+    AdaptStats adapt_stats() const;
+
     /// Cumulative routed-entry counts since open(): resident hits, CPU-computed misses and
     /// direct-read misses.  Their sum is every routed entry prepared.
     int64_t total_hit_entries() const { return total_hit_entries_; }
@@ -152,6 +179,7 @@ public:
     int64_t gpu_entry_capacity() const { return max_entries_; }
 
 private:
+    bool adapt_round(std::string& err);
     bool enqueue_impl(sycl::queue& queue, const float* device_fp32_x, int64_t ldx, float* gpu_output, int64_t ldy,
                       sycl::event& done, const std::vector<sycl::event>& deps, bool require_cpu, std::string& err);
     bool submit_device_hit_plan(sycl::queue& queue, int64_t layer, const int32_t* device_ids, int64_t n_tokens,
@@ -182,6 +210,31 @@ private:
     int64_t direct_capacity_ = 0;         ///< distinct miss experts the arena holds
     bool record_heat_ = false;
     std::vector<uint64_t> heat_;
+    // The adaptive tier's state (configure_adapt).  `adapt_usage_` is the decayed per-pair routing count
+    // the rounds choose swaps from; the served layer range is this runtime's prewarm range.
+    int64_t adapt_every_ = 0;
+    int64_t adapt_swaps_ = 96;
+    int64_t adapt_mib_per_token_ = 48;
+    bool adapt_every_given_ = false;
+    int64_t adapt_period_ = 4;
+    int64_t adapt_layer_begin_ = 0;
+    int64_t adapt_layer_end_ = 0;
+    uint64_t adapt_max_blob_ = 0;
+    std::vector<double> adapt_usage_;
+    int64_t adapt_tokens_since_round_ = 0;
+    int64_t adapt_tokens_total_ = 0;
+    bool adapt_auto_decided_ = false;
+    bool adapt_auto_lengthened_ = false;
+    double adapt_copy_s_per_byte_ = -1.0;   ///< measured host-to-device seconds per byte (< 0: unmeasured)
+    uint8_t* adapt_ring_base_ = nullptr;   ///< persistent pinned staging ring (freed in close())
+    size_t adapt_ring_stride_ = 0;         ///< one ring slot's bytes
+    std::chrono::steady_clock::time_point adapt_last_round_{};
+    int64_t adapt_rounds_ = 0;
+    int64_t adapt_swaps_done_ = 0;
+    int64_t adapt_skipped_format_ = 0;
+    uint64_t adapt_bytes_ = 0;
+    double adapt_copy_ms_ = 0.0;
+    double adapt_select_ms_ = 0.0;
     int64_t total_hit_entries_ = 0;
     int64_t total_cpu_miss_entries_ = 0;
     int64_t total_direct_miss_entries_ = 0;
@@ -227,8 +280,12 @@ private:
     int32_t* d_ngroups_ = nullptr;
     int32_t* d_nentries_ = nullptr;
     strata::kernels::exl3::GroupedEntryPlan* d_entry_plans_ = nullptr;  ///< [max_entries], device plan resolution
-    uint64_t* d_pair_blob_base_ = nullptr;   ///< [n_layers*n_expert], immutable; zero for CPU-only pairs
-    int32_t* d_pair_format_index_ = nullptr; ///< [n_layers*n_expert], immutable; -1 for CPU-only pairs
+    uint64_t* d_pair_blob_base_ = nullptr;   ///< [n_layers*n_expert], zero for CPU-only pairs
+    int32_t* d_pair_format_index_ = nullptr; ///< [n_layers*n_expert], -1 for CPU-only pairs
+    /// The device pair tables' host shadows: allocate_images fills them, adaptive rounds rewrite the
+    /// swapped pairs in them and upload the tables again.
+    std::vector<uint64_t> pair_blob_host_;
+    std::vector<int32_t> pair_format_host_;
     int64_t pair_count_ = 0;
     float* d_scratch_ = nullptr;
     size_t scratch_elements_ = 0;

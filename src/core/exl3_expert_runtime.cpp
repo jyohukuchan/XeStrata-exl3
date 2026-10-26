@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // Bounded EXL3 source/cache/CPU/GPU plan integration.
+#include "strata/core/exl3_adaptive.hpp"
 #include "strata/core/exl3_expert_runtime.hpp"
 #include "strata/core/exl3_prepare_profile.hpp"
 
@@ -68,6 +69,9 @@ Exl3ExpertRuntime::~Exl3ExpertRuntime() { close(); }
 
 void Exl3ExpertRuntime::close() {
     if (opened_) (void) strata::gpu::device_sync();
+    if (adapt_ring_base_ != nullptr) strata::gpu::free(adapt_ring_base_);
+    adapt_ring_base_ = nullptr;
+    adapt_ring_stride_ = 0;
     cache_.close();
     if (direct_staging_ != nullptr) strata::gpu::free(direct_staging_);
     direct_staging_ = nullptr;
@@ -79,6 +83,20 @@ void Exl3ExpertRuntime::close() {
     total_cpu_miss_entries_ = 0;
     total_direct_miss_entries_ = 0;
     direct_entries_ = 0;
+    adapt_usage_.clear();
+    pair_blob_host_.clear();
+    pair_format_host_.clear();
+    adapt_tokens_since_round_ = 0;
+    adapt_tokens_total_ = 0;
+    adapt_auto_decided_ = false;
+    adapt_auto_lengthened_ = false;
+    adapt_copy_s_per_byte_ = -1.0;
+    adapt_rounds_ = 0;
+    adapt_swaps_done_ = 0;
+    adapt_skipped_format_ = 0;
+    adapt_bytes_ = 0;
+    adapt_copy_ms_ = 0.0;
+    adapt_select_ms_ = 0.0;
     if (d_scratch_ != nullptr) strata::gpu::free(d_scratch_);
     // The seven per-window plan arrays are views into the plan arenas, not separate allocations.
     if (d_plan_arena_ != nullptr) strata::gpu::free(d_plan_arena_);
@@ -246,8 +264,10 @@ bool Exl3ExpertRuntime::allocate_images(std::string& err) {
         return false;
     }
     {
-        std::vector<uint64_t> pair_blobs(static_cast<size_t>(pair_count_), 0);
-        std::vector<int32_t> pair_formats(static_cast<size_t>(pair_count_), -1);
+        // The host shadows stay beside the device tables: adaptive rounds rewrite the swapped pairs in
+        // them and upload the tables again.
+        pair_blob_host_.assign(static_cast<size_t>(pair_count_), 0);
+        pair_format_host_.assign(static_cast<size_t>(pair_count_), -1);
         for (int64_t layer = 0; layer < n_layers_; ++layer) {
             for (int64_t expert = 0; expert < n_expert_; ++expert) {
                 const size_t at = pair_index(layer, expert);
@@ -261,12 +281,14 @@ bool Exl3ExpertRuntime::allocate_images(std::string& err) {
                     err = "exl3 runtime: resident pair table has a missing device slot";
                     return false;
                 }
-                pair_blobs[at] = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(blob));
-                if (blob != nullptr) pair_formats[at] = pair_format_index_[at];
+                pair_blob_host_[at] = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(blob));
+                if (blob != nullptr) pair_format_host_[at] = pair_format_index_[at];
             }
         }
-        if (!strata::gpu::copy(d_pair_blob_base_, pair_blobs.data(), pair_blobs.size() * sizeof(uint64_t)) ||
-            !strata::gpu::copy(d_pair_format_index_, pair_formats.data(), pair_formats.size() * sizeof(int32_t))) {
+        if (!strata::gpu::copy(d_pair_blob_base_, pair_blob_host_.data(),
+                               pair_blob_host_.size() * sizeof(uint64_t)) ||
+            !strata::gpu::copy(d_pair_format_index_, pair_format_host_.data(),
+                               pair_format_host_.size() * sizeof(int32_t))) {
             err = std::string("exl3 runtime: copying resident pair tables: ") + strata::gpu::last_error();
             return false;
         }
@@ -494,6 +516,29 @@ bool Exl3ExpertRuntime::open(Exl3ExpertSource& source, strata::kernels::cpu::Exp
                  (unsigned long long) prewarm.requested_experts, (unsigned long long) prewarm.requested_bytes,
                  (unsigned long long) prewarm.admission_bytes, (unsigned long long) prewarm.loaded_experts,
                  (unsigned long long) prewarm.loaded_bytes, prewarm_why.empty() ? "" : ": ", prewarm_why.c_str());
+    // The adaptive tier's range is this runtime's served range; only those layers' slots may move.
+    adapt_layer_begin_ = prewarm_layer_begin;
+    adapt_layer_end_ = prewarm_layer_end;
+    adapt_max_blob_ = 0;
+    for (int64_t layer = prewarm_layer_begin; layer < prewarm_layer_end; ++layer)
+        for (int64_t expert = 0; expert < n_expert_; ++expert) {
+            const auto* layout = source.exl3_layout(layer, expert);
+            if (layout != nullptr) adapt_max_blob_ = std::max(adapt_max_blob_, layout->total_bytes);
+        }
+    adapt_period_ = adapt_every_;
+    adapt_usage_.assign(static_cast<size_t>(pairs), 0.0);
+    adapt_tokens_since_round_ = 0;
+    adapt_tokens_total_ = 0;
+    adapt_auto_decided_ = false;
+    adapt_auto_lengthened_ = false;
+    adapt_copy_s_per_byte_ = -1.0;
+    adapt_last_round_ = std::chrono::steady_clock::now();
+    adapt_rounds_ = 0;
+    adapt_swaps_done_ = 0;
+    adapt_skipped_format_ = 0;
+    adapt_bytes_ = 0;
+    adapt_copy_ms_ = 0.0;
+    adapt_select_ms_ = 0.0;
     opened_ = true;
     return true;
 }
@@ -519,6 +564,11 @@ bool Exl3ExpertRuntime::prepare_window(int64_t layer, const float* host_fp32_x, 
     miss_ids_.clear();
     if (record_heat_ && heat_.size() != static_cast<size_t>(pair_count_))
         heat_.assign(static_cast<size_t>(pair_count_), 0);
+    // The adaptive tier's decayed routing counts: every routed entry, hits and misses alike, so a round
+    // sees what the cache holds against what the text routes.  One add per entry, counted only while the
+    // tier is on; the profile's own counts above stay untouched.
+    const bool adapt_on =
+        adapt_every_ > 0 && adapt_usage_.size() == static_cast<size_t>(pair_count_) && !all_resident_;
     std::vector<uint8_t> miss_seen(static_cast<size_t>(n_expert_), 0);
     std::vector<int32_t> group_slots;
     std::vector<std::vector<int32_t>> group_entries;
@@ -531,6 +581,7 @@ bool Exl3ExpertRuntime::prepare_window(int64_t layer, const float* host_fp32_x, 
         if (expert < 0 || expert >= n_expert_) { err = "exl3 runtime: routed expert is out of range"; return false; }
         const size_t at = pair_index(layer, expert);
         if (record_heat_) ++heat_[at];
+        if (adapt_on) adapt_usage_[at] += 1.0;
         const int32_t slot = cache_.valid() ? cache_.slot_of(layer, expert) : kNotResident;
         if (slot >= 0) {
             ++hit_entries_;
@@ -964,6 +1015,243 @@ void Exl3ExpertRuntime::mark_gpu_consumed() {
     prepared_ = false;
     cpu_ready_ = false;
     prepared_layer_ = -1;
+}
+
+namespace {
+
+// The adaptive tier's fixed policy, in the units its counts use (routed entries).  A non-resident expert
+// pairs with the least-routed resident one only when routed at least this many times since the decay, and
+// only when it leads the victim by at least the gain: the same rule the native path's tier measured with,
+// and the same decay it multiplies the counts by after each round.
+constexpr double kAdaptMinCount = 2.0;
+constexpr double kAdaptMinGain = 1.5;
+constexpr double kAdaptDecay = 0.7;
+// The automatic period choice: after this many generated tokens, a miss share below this lengthens the
+// period (the cache already holds what the text routes, so rounds would only re-scan the tables).
+constexpr int64_t kAdaptDecideAt = 32;
+constexpr double kAdaptLowMissShare = 0.05;
+constexpr int64_t kAdaptLongPeriod = 16;
+// One round's copies are bounded to this share of the decode wall time since the last round, so a slow
+// link cannot make the tier cost more than the misses it removes.  The seconds-per-byte rate is measured
+// from the rounds' own copies, never assumed from a device's name.
+constexpr double kAdaptCopyWallShare = 0.02;
+
+bool adapt_verify_enabled() {
+    const char* text = std::getenv("STRATA_EXL3_ADAPT_VERIFY");
+    return text != nullptr && text[0] != '\0' && std::strcmp(text, "0") != 0;
+}
+
+}  // namespace
+
+void Exl3ExpertRuntime::configure_adapt(int64_t every, int64_t swaps, int64_t mib_per_token, bool given) {
+    adapt_every_ = every > 0 ? every : 0;
+    adapt_swaps_ = swaps > 0 ? swaps : 0;
+    adapt_mib_per_token_ = mib_per_token > 0 ? mib_per_token : 0;
+    adapt_every_given_ = given;
+    adapt_period_ = adapt_every_;
+    // configure_adapt runs after open() on the model path, so the served range and the largest blob are
+    // known; a configure before open() takes effect once the first window is prepared.
+    if (adapt_every_ > 0 && adapt_max_blob_ > 0)
+        std::fprintf(stderr,
+                     "Exl3ExpertRuntime: adaptive tier every %lld tokens, up to %lld swaps a round, "
+                     "%lld MiB per token%s\n",
+                     (long long) adapt_every_, (long long) adapt_swaps_, (long long) adapt_mib_per_token_,
+                     adapt_every_given_ ? "" : " (automatic period: lengthened when the miss share stays low)");
+}
+
+Exl3ExpertRuntime::AdaptStats Exl3ExpertRuntime::adapt_stats() const {
+    AdaptStats stats;
+    stats.rounds = adapt_rounds_;
+    stats.swaps = adapt_swaps_done_;
+    stats.skipped_format = adapt_skipped_format_;
+    stats.bytes = adapt_bytes_;
+    stats.copy_ms = adapt_copy_ms_;
+    stats.select_ms = adapt_select_ms_;
+    stats.period = adapt_period_;
+    stats.auto_lengthened = adapt_auto_lengthened_;
+    return stats;
+}
+
+bool Exl3ExpertRuntime::maybe_adapt(std::string& err) {
+    err.clear();
+    if (!opened_ || adapt_every_ <= 0 || all_resident_) return true;
+    if (adapt_usage_.size() != static_cast<size_t>(pair_count_) || pair_count_ <= 0) return true;
+    ++adapt_tokens_total_;
+    ++adapt_tokens_since_round_;
+    if (!adapt_every_given_ && !adapt_auto_decided_ && adapt_tokens_total_ >= kAdaptDecideAt) {
+        adapt_auto_decided_ = true;
+        const int64_t total = total_hit_entries_ + total_cpu_miss_entries_ + total_direct_miss_entries_;
+        const int64_t miss = total_cpu_miss_entries_ + total_direct_miss_entries_;
+        const double share = total > 0 ? (double) miss / (double) total : 0.0;
+        if (share < kAdaptLowMissShare && adapt_period_ < kAdaptLongPeriod) {
+            adapt_period_ = kAdaptLongPeriod;
+            adapt_auto_lengthened_ = true;
+        }
+        std::fprintf(stderr,
+                     "Exl3ExpertRuntime: adaptive tier every %lld tokens: the miss share is %.1f%%%s\n",
+                     (long long) adapt_period_, 100.0 * share,
+                     adapt_auto_lengthened_
+                         ? " (lengthened: the cache already holds what the text routes; --adapt-every sets it)"
+                         : " (--adapt-every sets it)");
+    }
+    if (adapt_tokens_since_round_ < adapt_period_) return true;
+    return adapt_round(err);
+}
+
+bool Exl3ExpertRuntime::adapt_round(std::string& err) {
+    const HostTimelineScope adapt_timeline("adapt", -1);
+    err.clear();
+    // The choice first, from a snapshot of the residency table: prepare_window() rebuilds its hit plan
+    // from slot_of() every window, so whatever this round commits is what the next window reads.
+    const auto select_t0 = std::chrono::steady_clock::now();
+    std::vector<uint8_t> resident(static_cast<size_t>(pair_count_), 0);
+    for (int64_t layer = adapt_layer_begin_; layer < adapt_layer_end_; ++layer)
+        for (int64_t expert = 0; expert < n_expert_; ++expert)
+            resident[pair_index(layer, expert)] = cache_.slot_of(layer, expert) >= 0 ? 1 : 0;
+    // The round's move budget: the configured cap, the per-token copy budget, and the measured wall-time
+    // bound.  The byte rate comes from the earlier rounds' own copies; the first rounds have only the
+    // first two bounds, which is what bounds them.
+    int64_t cap = adapt_swaps_;
+    if (adapt_mib_per_token_ > 0 && adapt_max_blob_ > 0)
+        cap = std::min<int64_t>(cap, std::max<int64_t>(
+                                         1, (int64_t) (((uint64_t) adapt_mib_per_token_ << 20) *
+                                                       (uint64_t) adapt_tokens_since_round_ / adapt_max_blob_)));
+    const auto copy_t0 = std::chrono::steady_clock::now();
+    const double wall_s =
+        std::chrono::duration<double>(copy_t0 - adapt_last_round_).count();
+    if (adapt_copy_s_per_byte_ >= 0.0 && wall_s > 0.0 && adapt_max_blob_ > 0)
+        cap = std::min<int64_t>(cap, std::max<int64_t>(
+                                         1, (int64_t) (kAdaptCopyWallShare * wall_s /
+                                                       (adapt_copy_s_per_byte_ * (double) adapt_max_blob_))));
+    // A non-positive cap moves nothing this round (a configured --adapt-swaps 0 counts only); the
+    // choice below treats it as unlimited, so it is never called with one.
+    const std::vector<Exl3AdaptSwap> swaps =
+        cap > 0 ? plan_adaptive_swaps(n_layers_, n_expert_, adapt_layer_begin_, adapt_layer_end_,
+                                      adapt_usage_.data(), resident.data(), cap, kAdaptMinCount, kAdaptMinGain)
+                : std::vector<Exl3AdaptSwap>{};
+    const double select_ms =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - select_t0).count() * 1000.0;
+    adapt_select_ms_ += select_ms;
+    struct Done {
+        int64_t layer = -1;
+        int32_t in = -1;
+        int32_t out = -1;
+        int32_t slot = -1;
+        size_t blob = 0;
+        uint64_t format = 0;
+    };
+    // The round's host staging: a ring of pinned buffers the queued copies read from, synced in batches.
+    // A pageable buffer makes the link bounce every copy (measured: ~1-3 GB/s); pinned memory is what the
+    // startup fill's throughput comes from.  The ring is allocated once and reused by every round: pinning
+    // its pages costs ~15 ms, so allocating it per round would be the round's whole cost.  It is sized from
+    // the largest blob this runtime serves, so every swap's bytes fit one slot; a swap larger than the
+    // stride, or a ring that cannot be allocated, falls back to a pageable buffer per swap.
+    if (adapt_ring_base_ == nullptr && adapt_max_blob_ > 0) {
+        const size_t stride = (size_t)(((adapt_max_blob_ + 255u) & ~uint64_t(255u)));
+        constexpr size_t kRingSlots = 16;
+        if (stride > 0 && (size_t) kRingSlots <= std::numeric_limits<size_t>::max() / stride) {
+            adapt_ring_base_ = static_cast<uint8_t*>(strata::gpu::alloc_host(stride * (size_t) kRingSlots));
+            adapt_ring_stride_ = adapt_ring_base_ != nullptr ? stride : 0;
+        }
+    }
+    uint8_t* const ring_base = adapt_ring_base_;
+    const size_t ring_stride = adapt_ring_stride_;
+    std::vector<std::vector<uint8_t>> fallback;   // pageable buffers, held until the round's copies land
+    fallback.reserve(swaps.size());
+    std::vector<Done> done;
+    done.reserve(swaps.size());
+    size_t batch = 0;
+    constexpr size_t kBatchSlots = 16;
+    for (const Exl3AdaptSwap& swap : swaps) {
+        const size_t at = pair_index(swap.layer, swap.in);
+        const auto* layout = source_->exl3_layout(swap.layer, swap.in);
+        if (layout == nullptr || layout->total_bytes == 0) continue;
+        const int32_t slot = cache_.slot_of(swap.layer, swap.out);
+        if (slot < 0) continue;   // the victim holds no slot anymore: choose again next round
+        if (cache_.slot_format(slot) != pair_formats_[at]) { ++adapt_skipped_format_; continue; }
+        const size_t bytes = static_cast<size_t>(layout->total_bytes);
+        uint8_t* staged = nullptr;
+        if (ring_base != nullptr && bytes <= ring_stride) {
+            staged = ring_base + batch * ring_stride;
+        } else {
+            fallback.emplace_back(bytes);
+            staged = fallback.back().data();
+        }
+        if (!source_->copy_blob(swap.layer, swap.in, staged)) {
+            if (ring_base == nullptr || bytes > ring_stride) fallback.pop_back();
+            continue;
+        }
+        if (!cache_.fill_slot_queued(slot, staged, err, (int64_t) bytes)) return false;
+        done.push_back({swap.layer, swap.in, swap.out, slot, bytes, pair_formats_[at]});
+        // A ring slot is reused once its batch has landed; a fallback buffer stays until the round ends.
+        if (ring_base != nullptr && bytes <= ring_stride && ++batch >= kBatchSlots) {
+            if (!cache_.sync_queued(err)) return false;
+            batch = 0;
+        }
+    }
+    if ((batch > 0 || !fallback.empty()) && !cache_.sync_queued(err)) return false;
+    const double copy_ms =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - copy_t0).count() * 1000.0;
+    if (adapt_verify_enabled()) {
+        // Read each swapped slot back and compare it against a fresh source copy: a slot whose bytes
+        // disagree with its new table entry would answer tokens wrongly instead of failing loudly.
+        for (const Done& d : done) {
+            std::vector<uint8_t> canonical(d.blob);
+            if (!source_->copy_blob(d.layer, d.in, canonical.data())) {
+                err = "exl3 runtime: adaptive tier verify: the source copy failed";
+                return false;
+            }
+            if (!cache_.verify_slot(d.slot, canonical.data(), err, (int64_t) d.blob)) {
+                err = std::string("exl3 runtime: adaptive tier verify: ") + err;
+                return false;
+            }
+        }
+    }
+    // Commit: the slots hold the new bytes, so the tables move now, while the device is still idle.
+    // A reassign that fails here fails the run: the bytes and the table would disagree.
+    uint64_t round_bytes = 0;
+    for (const Done& d : done) {
+        int32_t moved = kNotResident;
+        std::string reassign_err;
+        if (!cache_.reassign(d.layer, d.out, d.in, d.format, moved, reassign_err) || moved != d.slot) {
+            err = std::string("exl3 runtime: adaptive tier commit: ") +
+                  (reassign_err.empty() ? "the slot moved under the round" : reassign_err);
+            return false;
+        }
+        const size_t in_at = pair_index(d.layer, d.in);
+        const size_t out_at = pair_index(d.layer, d.out);
+        pair_blob_host_[in_at] = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(cache_.device_slot(moved)));
+        pair_format_host_[in_at] = pair_format_index_[in_at];
+        pair_blob_host_[out_at] = 0;
+        pair_format_host_[out_at] = -1;
+        round_bytes += d.blob;
+    }
+    if (!done.empty() &&
+        (!strata::gpu::copy(d_pair_blob_base_, pair_blob_host_.data(),
+                            pair_blob_host_.size() * sizeof(uint64_t)) ||
+         !strata::gpu::copy(d_pair_format_index_, pair_format_host_.data(),
+                            pair_format_host_.size() * sizeof(int32_t)))) {
+        err = std::string("exl3 runtime: adaptive tier pair tables: ") + strata::gpu::last_error();
+        return false;
+    }
+    if (round_bytes > 0 && copy_ms > 0.0) {
+        const double measured = (copy_ms / 1000.0) / (double) round_bytes;
+        adapt_copy_s_per_byte_ =
+            adapt_copy_s_per_byte_ < 0.0 ? measured : std::max(adapt_copy_s_per_byte_, measured);
+    }
+    adapt_tokens_since_round_ = 0;
+    adapt_last_round_ = std::chrono::steady_clock::now();
+    ++adapt_rounds_;
+    adapt_swaps_done_ += (int64_t) done.size();
+    adapt_bytes_ += round_bytes;
+    adapt_copy_ms_ += copy_ms;
+    for (double& v : adapt_usage_) v *= kAdaptDecay;
+    std::fprintf(stderr,
+                 "Exl3ExpertRuntime: adaptive tier round %lld: %llu of %llu chosen swaps in (%llu MiB, "
+                 "select %.3f ms, copy %.3f ms)\n",
+                 (long long) adapt_rounds_, (unsigned long long) done.size(), (unsigned long long) swaps.size(),
+                 (unsigned long long) (round_bytes >> 20), select_ms, copy_ms);
+    return true;
 }
 
 }  // namespace strata::core

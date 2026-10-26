@@ -169,6 +169,14 @@ public:
     int32_t admit(int64_t layer, int64_t expert);
     /// Claims a slot from the exact format bucket.  Returns kNotResident for an unknown/full bucket.
     int32_t admit(int64_t layer, int64_t expert, uint64_t format_id);
+    /// Reassigns the slot `old_expert` of `layer` holds to `new_expert` of the same layer: the caller has
+    /// copied `new_expert`'s bytes into that slot already (the adaptive tier's swap).  The slot keeps its
+    /// address and no admission is consumed or freed, so every bucket cursor stays as it is.  False with
+    /// `err` when a pair is out of range, `old_expert` holds no slot, `new_expert` already holds one, or
+    /// the slot's format is not `format_id` (a bucket cache refuses a cross-format move; a legacy cache
+    /// takes format 0 only).  `slot` holds the moved slot, or kNotResident on failure.
+    bool reassign(int64_t layer, int64_t old_expert, int64_t new_expert, uint64_t format_id, int32_t& slot,
+                  std::string& err);
     /// Format ID associated with a slot, or zero for legacy/open_sized caches and invalid slots.
     uint64_t slot_format(int32_t slot) const;
 

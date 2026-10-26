@@ -797,6 +797,35 @@ int32_t ExpertCache::admit(int64_t layer, int64_t expert, uint64_t format_id) {
     return slot;
 }
 
+bool ExpertCache::reassign(int64_t layer, int64_t old_expert, int64_t new_expert, uint64_t format_id,
+                           int32_t& slot, std::string& err) {
+    slot = kNotResident;
+    if (layer < 0 || layer >= n_layers_ || old_expert < 0 || old_expert >= n_expert_ || new_expert < 0 ||
+        new_expert >= n_expert_) {
+        err = "ExpertCache::reassign: layer or expert is out of range";
+        return false;
+    }
+    const size_t old_at = (size_t) (layer * n_expert_ + old_expert);
+    const size_t new_at = (size_t) (layer * n_expert_ + new_expert);
+    const int32_t held = residency_[old_at];
+    if (held == kNotResident) {
+        err = "ExpertCache::reassign: the evicted expert holds no slot";
+        return false;
+    }
+    if (residency_[new_at] != kNotResident) {
+        err = "ExpertCache::reassign: the incoming expert already holds a slot";
+        return false;
+    }
+    if (slot_format(held) != format_id) {
+        err = "ExpertCache::reassign: the slot's format is not the incoming expert's";
+        return false;
+    }
+    residency_[old_at] = kNotResident;
+    residency_[new_at] = held;
+    slot = held;
+    return true;
+}
+
 uint64_t ExpertCache::slot_format(int32_t slot) const {
     if (slot < 0 || (size_t) slot >= slot_formats_.size()) return 0;
     return slot_formats_[(size_t) slot];

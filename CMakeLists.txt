@@ -481,6 +481,7 @@ if(STRATA_ENABLE_XE)
                                    src/core/native_dense.cpp src/core/exl3_dense.cpp
                                    src/core/exl3_weight_set.cpp src/core/exl3_ple.cpp
                                    src/core/exl3_flash_model.cpp src/core/verify.cpp
+                                   src/core/exl3_adaptive.cpp
                                    src/core/exl3_expert_source.cpp src/core/exl3_expert_formats.cpp
                                    src/core/exl3_expert_runtime.cpp
                                    src/core/moe_window.cpp
@@ -850,6 +851,10 @@ if(STRATA_ENABLE_XE)
     add_test(NAME exl3_expert_runtime_test COMMAND exl3_expert_runtime_test)
     set_tests_properties(exl3_expert_runtime_test PROPERTIES TIMEOUT 120
       ENVIRONMENT "STRATA_EXL3_CPU_INTDOT=0")
+    add_executable(exl3_adaptive_test src/core/exl3_adaptive_test.cpp)
+    target_link_libraries(exl3_adaptive_test PRIVATE strata_engine)
+    add_test(NAME exl3_adaptive_test COMMAND exl3_adaptive_test)
+    set_tests_properties(exl3_adaptive_test PROPERTIES TIMEOUT 60)
     add_executable(exl3_expert_source_test src/core/exl3_expert_source_test.cpp)
     target_link_libraries(exl3_expert_source_test PRIVATE strata_engine)
     target_include_directories(exl3_expert_source_test SYSTEM PRIVATE

@@ -1603,6 +1603,12 @@ bool Exl3FlashModel::open(const std::filesystem::path& directory, const Exl3Flas
                                    options.expert_miss_direct, !options.expert_profile_save.empty(), err)) {
                 return false;
             }
+            // The adaptive tier counts routed entries from the first window and swaps cache slots at
+            // token boundaries (maybe_adapt, called from forward() with the device idle).  A fully
+            // resident stage's rounds are no-ops: there is no miss to remove, and its captured graphs
+            // replay slot addresses the tier must not move.
+            stage.runtime->configure_adapt(options.adapt_every, options.adapt_swaps,
+                                           options.adapt_mib_per_token, options.adapt_every_given);
         }
 
         // ---- THE RESIDENT EXPERT FLOW, CAPTURED LIKE THE LAYERS ARE ----
@@ -2420,6 +2426,25 @@ bool Exl3FlashModel::forward(int32_t token, int64_t pos, int32_t& next_token, fl
                          timing.expert_prepare_ms, timing.expert_wait_ms, timing.merge_ms, timing.post_graph_ms,
                          timing.bridge_ms, timing.head_ms);
         }
+        // THE ADAPTIVE TIER'S ROUND, AT THE TOKEN BOUNDARY.  The head above waited for this token's
+        // queues, so no kernel is running; each stage is waited for on its own device before its round
+        // rewrites the cache slots the next token's grouped kernels will read.  A fully resident
+        // stage's rounds are no-ops (maybe_adapt), so its captured graphs keep their slot addresses.
+        // The MTP draft runtime is never adapted: its one layer is fully resident where it matters,
+        // and drafts interleave with trunk verifies.
+        for (auto& stage : impl_->stages) {
+            if (stage.runtime == nullptr || !stage.runtime->adapt_enabled() || stage.runtime->fully_resident())
+                continue;
+            const OnDevice on(stage.device);
+            if (!strata::gpu::device_sync()) {
+                err = std::string("EXL3 Flash: adaptive tier sync: ") + strata::gpu::last_error();
+                return false;
+            }
+            if (!stage.runtime->maybe_adapt(err)) {
+                err = "EXL3 Flash: adaptive tier: " + err;
+                return false;
+            }
+        }
         return true;
     } catch (const std::exception& e) {
         err = std::string("EXL3 Flash: forward: ") + e.what();
@@ -2717,6 +2742,24 @@ bool Exl3FlashModel::save_expert_profile(const std::string& path, std::string& e
     }
     const auto ranked = rank_learned_profile(layers, experts, {}, heat, {});
     return write_expert_profile(path, layers, experts, ranked, err);
+}
+
+Exl3FlashModel::AdaptTotals Exl3FlashModel::adapt_totals() const {
+    AdaptTotals totals;
+    if (impl_ == nullptr) return totals;
+    for (const auto& stage : impl_->stages) {
+        if (stage.runtime == nullptr) continue;
+        const auto stats = stage.runtime->adapt_stats();
+        totals.rounds += stats.rounds;
+        totals.swaps += stats.swaps;
+        totals.skipped += stats.skipped_format;
+        totals.bytes += stats.bytes;
+        totals.copy_ms += stats.copy_ms;
+        totals.select_ms += stats.select_ms;
+        totals.period = stats.period;
+        totals.auto_lengthened = totals.auto_lengthened || stats.auto_lengthened;
+    }
+    return totals;
 }
 size_t Exl3FlashModel::stage_count() const { return impl_ == nullptr ? 0 : impl_->stages.size(); }
 
