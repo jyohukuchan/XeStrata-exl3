@@ -310,9 +310,9 @@ DeviceCachePlan plan_device_cache(const Exl3ExpertSource& source, int64_t layer_
 bool open_device_cache(Exl3ExpertSource& source, strata::kernels::cpu::ExpertPool& pool, Exl3ExpertRuntime& runtime,
                        size_t stage_index, int64_t layer_begin, int64_t layer_end, int64_t n_expert,
                        int64_t n_layers, int64_t max_rows, int64_t routed_k, bool allow_cpu_miss,
-                       const std::string& profile_path, bool miss_direct, bool record_heat, std::string& err) {
-    runtime.set_miss_mode(miss_direct ? Exl3ExpertRuntime::MissMode::Direct
-                                      : Exl3ExpertRuntime::MissMode::Cpu);
+                       const std::string& profile_path, Exl3ExpertRuntime::MissMode miss_mode,
+                       bool record_heat, std::string& err) {
+    runtime.set_miss_mode(miss_mode);
     runtime.set_record_heat(record_heat);
     const auto no_cache = [&](const char* why) {
         if (!allow_cpu_miss) {
@@ -877,6 +877,10 @@ bool Exl3FlashModel::open(const std::filesystem::path& directory, const Exl3Flas
         }
         if (options.prompt_chunk < 0) {
             err = "EXL3 Flash: prompt_chunk must be nonnegative (0: token by token)";
+            return false;
+        }
+        if (options.expert_miss_direct && options.expert_miss_split) {
+            err = "EXL3 Flash: expert_miss_direct and expert_miss_split are alternatives, not both";
             return false;
         }
         if (options.stage_devices.empty()) {
@@ -1448,7 +1452,8 @@ bool Exl3FlashModel::open(const std::filesystem::path& directory, const Exl3Flas
                     if (!open_device_cache(*impl_->mtp_source, *impl_->mtp_pool, *impl_->mtp_runtime,
                                            impl_->stages.size(), 0, 1, impl_->geometry.n_expert,
                                            impl_->geometry.n_layers, options.max_rows, routed_k,
-                                           options.allow_cpu_expert_miss, "", false, false, err)) {
+                                           options.allow_cpu_expert_miss, "", Exl3ExpertRuntime::MissMode::Cpu,
+                                           false, err)) {
                         err = "EXL3 Flash MTP expert runtime: " + err;
                         return false;
                     }
@@ -1596,11 +1601,15 @@ bool Exl3FlashModel::open(const std::filesystem::path& directory, const Exl3Flas
         for (size_t stage_index = 0; stage_index < impl_->stages.size(); ++stage_index) {
             auto& stage = impl_->stages[stage_index];
             const OnDevice on(stage.device);
+            const Exl3ExpertRuntime::MissMode miss_mode =
+                options.expert_miss_split ? Exl3ExpertRuntime::MissMode::Split
+                : options.expert_miss_direct ? Exl3ExpertRuntime::MissMode::Direct
+                                             : Exl3ExpertRuntime::MissMode::Cpu;
             if (!open_device_cache(*stage.source, *stage.pool, *stage.runtime, stage_index,
                                    stage.layer_begin, stage.layer_end, impl_->geometry.n_expert,
                                    impl_->geometry.n_layers, std::max<int64_t>(options.max_rows, options.prompt_chunk), routed_k,
                                    options.allow_cpu_expert_miss, options.expert_profile,
-                                   options.expert_miss_direct, !options.expert_profile_save.empty(), err)) {
+                                   miss_mode, !options.expert_profile_save.empty(), err)) {
                 return false;
             }
         }
@@ -2686,13 +2695,30 @@ bool Exl3FlashModel::loaded() const { return impl_ != nullptr && impl_->opened; 
 Exl3FlashModel::ExpertCacheStats Exl3FlashModel::expert_cache_stats() const {
     ExpertCacheStats stats;
     if (!loaded()) return stats;
+    int64_t split_gpu = 0, split_miss = 0, split_weight = 0;
     for (const auto& stage : impl_->stages) {
         if (stage.runtime == nullptr) continue;
         stats.hit_entries += stage.runtime->total_hit_entries();
         stats.cpu_miss_entries += stage.runtime->total_cpu_miss_entries();
         stats.direct_miss_entries += stage.runtime->total_direct_miss_entries();
         stats.resident_pairs += stage.runtime->cache().resident();
+        // The CPU-cost mean weighs each stage by its decided windows, so a stage that ran more
+        // miss windows counts more; single-stage runs report that stage's own numbers.  The PCIe
+        // figure is the fastest stage's: every stage measured the same bus.
+        stats.split_windows += stage.runtime->split_windows();
+        split_gpu += stage.runtime->split_gpu_miss_entries();
+        split_miss += stage.runtime->split_all_miss_entries();
+        stats.split_cache_hits += stage.runtime->split_cache_hits();
+        stats.split_cache_lookups += stage.runtime->split_cache_lookups();
+        split_weight += stage.runtime->split_windows();
+        stats.split_cpu_us_per_entry +=
+            stage.runtime->split_cpu_us_per_entry() * static_cast<double>(stage.runtime->split_windows());
+        stats.split_pcie_gbs =
+            std::max(stats.split_pcie_gbs, stage.runtime->split_pcie_bytes_per_sec() / 1e9);
     }
+    if (split_weight > 0) stats.split_cpu_us_per_entry /= static_cast<double>(split_weight);
+    if (split_miss > 0)
+        stats.split_gpu_share = static_cast<double>(split_gpu) / static_cast<double>(split_miss);
     return stats;
 }
 

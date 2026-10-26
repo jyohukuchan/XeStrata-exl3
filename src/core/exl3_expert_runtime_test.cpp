@@ -140,6 +140,45 @@ bool compare_merged(const std::vector<float>& cpu, const std::vector<float>& gpu
 }  // namespace
 
 int main() {
+    // plan_split_gpu is a pure function of its arguments: exact decisions on synthetic costs,
+    // with no device needed.
+    {
+        using Runtime = strata::core::Exl3ExpertRuntime;
+        using Candidate = Runtime::SplitCandidate;
+        int split_math_failures = 0;
+        const auto expect_split = [&](int64_t got, int64_t want, const char* label) {
+            if (got != want) {
+                std::fprintf(stderr, "plan_split_gpu %s: got %lld want %lld\n", label, (long long) got,
+                             (long long) want);
+                ++split_math_failures;
+            }
+        };
+        const Candidate any[2] = {{0, 1, 1000}, {1, 1, 1000}};
+        expect_split(Runtime::plan_split_gpu(nullptr, 2, 100.0, 10e9, 8), 0, "null");
+        expect_split(Runtime::plan_split_gpu(any, 0, 100.0, 10e9, 8), 0, "empty");
+        expect_split(Runtime::plan_split_gpu(any, 2, 100.0, 10e9, 0), 0, "no capacity");
+        expect_split(Runtime::plan_split_gpu(any, 2, 0.0, 10e9, 8), 0, "no cpu sample");
+        expect_split(Runtime::plan_split_gpu(any, 2, -1.0, 10e9, 8), 0, "negative cpu");
+        expect_split(Runtime::plan_split_gpu(any, 2, 100.0, 0.0, 8), 0, "no bandwidth");
+        // One entry, 1 MB over 10 GB/s: the GPU's 100 us ties the CPU's 100 us, and a tie
+        // keeps the smaller k (the CPU default).
+        const Candidate tie[1] = {{0, 1, 1000000}};
+        expect_split(Runtime::plan_split_gpu(tie, 1, 100.0, 10e9, 8), 0, "tie stays cpu");
+        // Four entries at 100 us each on the CPU against 1 MB over 10 GB/s on the GPU:
+        // k=0 costs 400, k=1 costs max(0, 100) = 100.
+        const Candidate one[1] = {{0, 4, 1000000}};
+        expect_split(Runtime::plan_split_gpu(one, 1, 100.0, 10e9, 8), 1, "gpu wins");
+        // Two experts at 300 us of CPU each against 600 KB over 10 GB/s (60 us) each:
+        // k=0 costs 600, k=1 costs 300, k=2 costs 120.
+        const Candidate two[2] = {{0, 1, 600000}, {1, 1, 600000}};
+        expect_split(Runtime::plan_split_gpu(two, 2, 300.0, 10e9, 8), 2, "both to gpu");
+        // The same pair over 0.1 GB/s (6000 us each): k=1 costs 6000 against k=0's 600.
+        expect_split(Runtime::plan_split_gpu(two, 2, 300.0, 0.1e9, 8), 0, "slow bus stays cpu");
+        // The capacity caps the GPU share even where the bus would take more.
+        expect_split(Runtime::plan_split_gpu(two, 2, 300.0, 10e9, 1), 1, "capacity caps");
+        if (split_math_failures == 0) std::printf("split plan math: OK\n");
+        if (split_math_failures != 0) return 1;
+    }
     const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
     const auto root = std::filesystem::temp_directory_path() /
                       ("xestrata_exl3_runtime_test_" + std::to_string(STRATA_EXL3_RUNTIME_PID) +
@@ -433,6 +472,109 @@ int main() {
                     ++failures;
                 }
             }
+        }
+
+        // Split miss mode: a window's misses divide between the GPU (pinned staging, the same
+        // grouped launch as the hits) and the CPU pool.  Layer 0 routes one distinct miss
+        // (expert 1, two entries), so the two queued windows below each decide one expert.
+        // The first window has no CPU cost sample yet and stays all-CPU; the second divides
+        // from the measured costs.  Both merge to the CPU reference: the hit, CPU and GPU
+        // rows are disjoint by construction.
+        {
+            strata::core::Exl3ExpertRuntime split;
+            split.set_miss_mode(strata::core::Exl3ExpertRuntime::MissMode::Split);
+            std::vector<float> split_cpu(expected.size(), 24680.5f), split_gpu(expected.size(), 24680.5f);
+            float* d_split_gpu = device.upload(split_gpu);
+            sycl::event split_done;
+            bool split_ok =
+                split.open(source, pool, max_tokens, k, {{0, 0}, {1, 0}}, err) && split.direct_ready() &&
+                split.prepare_window(0, x.data(), ldx, ids, max_tokens, split_cpu.data(), ldy, err) &&
+                split.enqueue_hit_only(queue, d_x, ldx, d_split_gpu, ldy, split_done, {}, err) &&
+                split.run_cpu(err) && split.wait_gpu(split_done, err);
+            if (!split_ok) {
+                std::fprintf(stderr, "split miss runtime failed: %s\n", err.c_str());
+                ++failures;
+            } else {
+                strata::parity::copy_out(split_gpu.data(), d_split_gpu, split_gpu.size());
+                if (!compare_merged(split_cpu, split_gpu, expected, max_tokens * k, ldy, hidden,
+                                    "split-read miss merge"))
+                    ++failures;
+                if (split.split_windows() != 1 || split.split_last_gpu_experts() != 0 ||
+                    split.split_last_cpu_experts() != 1) {
+                    std::fprintf(stderr, "split first window did not stay all-CPU: windows=%lld gpu=%lld cpu=%lld\n",
+                                 (long long) split.split_windows(), (long long) split.split_last_gpu_experts(),
+                                 (long long) split.split_last_cpu_experts());
+                    ++failures;
+                }
+            }
+            // The second window divides from the first window's CPU sample and the open-time
+            // bandwidth.  The direction is the machine's own (tiny synthetic experts may land
+            // either way), but the decision is recorded and the halves still merge exactly.
+            std::vector<float> split_cpu2(expected.size(), 24680.5f), split_gpu2(expected.size(), 24680.5f);
+            strata::parity::copy_in(d_split_gpu, split_gpu2.data(), split_gpu2.size());
+            if (split_ok &&
+                (!split.prepare_window(0, x.data(), ldx, ids, max_tokens, split_cpu2.data(), ldy, err) ||
+                 !split.enqueue_hit_only(queue, d_x, ldx, d_split_gpu, ldy, split_done, {}, err) ||
+                 !split.run_cpu(err) || !split.wait_gpu(split_done, err))) {
+                std::fprintf(stderr, "split miss second window failed: %s\n", err.c_str());
+                ++failures;
+            } else if (split_ok) {
+                strata::parity::copy_out(split_gpu2.data(), d_split_gpu, split_gpu2.size());
+                if (!compare_merged(split_cpu2, split_gpu2, expected, max_tokens * k, ldy, hidden,
+                                    "split-read second merge"))
+                    ++failures;
+                if (split.split_windows() != 2 ||
+                    split.split_last_gpu_experts() + split.split_last_cpu_experts() != 1) {
+                    std::fprintf(stderr, "split second window decision is wrong: windows=%lld gpu=%lld cpu=%lld\n",
+                                 (long long) split.split_windows(), (long long) split.split_last_gpu_experts(),
+                                 (long long) split.split_last_cpu_experts());
+                    ++failures;
+                }
+                if (split.split_all_miss_entries() !=
+                    split.total_cpu_miss_entries() + split.total_direct_miss_entries()) {
+                    std::fprintf(stderr, "split entry totals do not match the cpu/direct counters\n");
+                    ++failures;
+                }
+                if (!(split.split_cpu_us_per_entry() > 0.0) || !(split.split_pcie_bytes_per_sec() > 0.0)) {
+                    std::fprintf(stderr, "split controller has no measured costs: cpu=%g us/entry pcie=%g B/s\n",
+                                 split.split_cpu_us_per_entry(), split.split_pcie_bytes_per_sec());
+                    ++failures;
+                }
+            }
+            // A third identical window must reuse the staged expert from the pinned cache:
+            // one more lookup, this time a hit, with the same merged rows.
+            std::vector<float> split_cpu3(expected.size(), 24680.5f), split_gpu3(expected.size(), 24680.5f);
+            strata::parity::copy_in(d_split_gpu, split_gpu3.data(), split_gpu3.size());
+            if (split_ok &&
+                (!split.prepare_window(0, x.data(), ldx, ids, max_tokens, split_cpu3.data(), ldy, err) ||
+                 !split.enqueue_hit_only(queue, d_x, ldx, d_split_gpu, ldy, split_done, {}, err) ||
+                 !split.run_cpu(err) || !split.wait_gpu(split_done, err))) {
+                std::fprintf(stderr, "split miss third window failed: %s\n", err.c_str());
+                ++failures;
+            } else if (split_ok) {
+                strata::parity::copy_out(split_gpu3.data(), d_split_gpu, split_gpu3.size());
+                if (!compare_merged(split_cpu3, split_gpu3, expected, max_tokens * k, ldy, hidden,
+                                    "split-read third merge"))
+                    ++failures;
+                if (split.split_windows() != 3 ||
+                    split.split_last_gpu_experts() + split.split_last_cpu_experts() != 1) {
+                    std::fprintf(stderr, "split third window decision is wrong: windows=%lld gpu=%lld cpu=%lld\n",
+                                 (long long) split.split_windows(), (long long) split.split_last_gpu_experts(),
+                                 (long long) split.split_last_cpu_experts());
+                    ++failures;
+                }
+                if (split.split_cache_slots() == 0 || split.split_cache_lookups() != 2 ||
+                    split.split_cache_hits() != 1) {
+                    std::fprintf(stderr, "split pinned cache did not serve the repeat: slots=%lld lookups=%lld hits=%lld\n",
+                                 (long long) split.split_cache_slots(), (long long) split.split_cache_lookups(),
+                                 (long long) split.split_cache_hits());
+                    ++failures;
+                }
+            }
+            if (split_ok) std::printf("split-read miss merge: OK (windows=%lld share=%.2f cpu=%.1f us/entry cache=%lld/%lld)\n",
+                                      (long long) split.split_windows(), split.split_gpu_share(),
+                                      split.split_cpu_us_per_entry(), (long long) split.split_cache_hits(),
+                                      (long long) split.split_cache_lookups());
         }
 
         // The all-resident graph reads device IDs on every replay, without a host plan update.

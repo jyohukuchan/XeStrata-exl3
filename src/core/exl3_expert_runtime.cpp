@@ -5,6 +5,7 @@
 #include "strata/core/exl3_prepare_profile.hpp"
 
 #include "strata/core/gpu.hpp"
+#include "strata/core/host_memory_probe.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/core/device.hpp"
 
@@ -74,11 +75,28 @@ void Exl3ExpertRuntime::close() {
     direct_stride_ = 0;
     direct_capacity_ = 0;
     direct_ready_ = false;
+    if (split_cache_ != nullptr) strata::gpu::free(split_cache_);
+    split_cache_ = nullptr;
+    split_cache_slots_ = 0;
+    split_cache_index_.clear();
+    split_cache_lru_.clear();
+    split_cache_slot_pos_.clear();
+    split_cache_slot_key_.clear();
+    split_cache_free_.clear();
+    split_cache_hits_ = 0;
+    split_cache_lookups_ = 0;
     heat_.clear();
     total_hit_entries_ = 0;
     total_cpu_miss_entries_ = 0;
     total_direct_miss_entries_ = 0;
     direct_entries_ = 0;
+    cpu_us_per_entry_ = 0.0;
+    pcie_bytes_per_sec_ = 0.0;
+    split_windows_ = 0;
+    split_gpu_entries_ = 0;
+    split_miss_entries_ = 0;
+    split_last_gpu_ = 0;
+    split_last_cpu_ = 0;
     if (d_scratch_ != nullptr) strata::gpu::free(d_scratch_);
     // The seven per-window plan arrays are views into the plan arenas, not separate allocations.
     if (d_plan_arena_ != nullptr) strata::gpu::free(d_plan_arena_);
@@ -110,6 +128,180 @@ void Exl3ExpertRuntime::close() {
     all_resident_ = false;
     prepared_layer_ = -1;
     miss_entries_ = 0;
+}
+
+int64_t Exl3ExpertRuntime::plan_split_gpu(const SplitCandidate* candidates, int64_t n,
+                                               double cpu_us_per_entry, double bytes_per_sec,
+                                               int64_t capacity) {
+    if (candidates == nullptr || n <= 0 || capacity <= 0) return 0;
+    if (!(cpu_us_per_entry > 0.0) || !(bytes_per_sec > 0.0)) return 0;
+    int64_t cap = n < capacity ? n : capacity;
+    int64_t total_entries = 0;
+    for (int64_t i = 0; i < n; ++i)
+        if (candidates[i].entries > 0) total_entries += candidates[i].entries;
+    if (total_entries <= 0) return 0;
+    // k = 0 (every miss on the CPU) is the default: a larger k must strictly beat it.
+    double best = static_cast<double>(total_entries) * cpu_us_per_entry;
+    int64_t best_k = 0;
+    uint64_t gpu_bytes = 0;
+    int64_t gpu_entries = 0;
+    for (int64_t k = 1; k <= cap; ++k) {
+        if (candidates[k - 1].entries > 0) gpu_entries += candidates[k - 1].entries;
+        gpu_bytes += candidates[k - 1].bytes;
+        const double gpu_us = static_cast<double>(gpu_bytes) / bytes_per_sec * 1e6;
+        const double cpu_us = static_cast<double>(total_entries - gpu_entries) * cpu_us_per_entry;
+        const double cost = cpu_us > gpu_us ? cpu_us : gpu_us;
+        if (cost < best) {
+            best = cost;
+            best_k = k;
+        }
+    }
+    return best_k;
+}
+
+namespace {
+
+/// STRATA_EXL3_SPLIT_CACHE_MIB: the pinned canonical-blob cache for Split's GPU share, in MiB.
+/// Negative (the default) sizes it from the host RAM the machine reports at open; 0 keeps the
+/// per-window staging (every window converts its GPU share anew).
+int64_t split_cache_budget_mib() {
+    const char* text = std::getenv("STRATA_EXL3_SPLIT_CACHE_MIB");
+    if (text == nullptr || text[0] == '\0') return -1;
+    char* end = nullptr;
+    const long long value = std::strtoll(text, &end, 10);
+    if (end == text || (end != nullptr && *end != '\0') || value < 0) return -1;
+    return static_cast<int64_t>(value);
+}
+
+}  // namespace
+
+void Exl3ExpertRuntime::measure_pcie_bandwidth() {
+    pcie_bytes_per_sec_ = 0.0;
+    if (direct_staging_ == nullptr || direct_stride_ == 0 || direct_capacity_ <= 0) return;
+    const uint64_t arena = direct_stride_ * static_cast<uint64_t>(direct_capacity_);
+    // The timed copy's own size comes from the staging arena, not a fixed constant: most of the
+    // arena up to 8 MiB, so a small card's staging still measures itself.  A card whose staging
+    // is smaller than one stride measures that stride.
+    size_t n = static_cast<size_t>(arena > (8ull << 20) ? (8ull << 20) : arena);
+    if (n == 0) return;
+    uint8_t* dev = static_cast<uint8_t*>(strata::gpu::alloc_device(n));
+    if (dev == nullptr) return;
+    std::memset(direct_staging_, 0x5a, n);
+    double best_s = 0.0;
+    for (int iter = 0; iter < 3; ++iter) {
+        const auto t0 = std::chrono::steady_clock::now();
+        if (!strata::gpu::copy_async(dev, direct_staging_, n, nullptr) ||
+            !strata::gpu::stream_sync(nullptr)) {
+            strata::gpu::free(dev);
+            return;
+        }
+        const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (s > 0.0 && (best_s == 0.0 || s < best_s)) best_s = s;
+    }
+    strata::gpu::free(dev);
+    if (best_s > 0.0) pcie_bytes_per_sec_ = static_cast<double>(n) / best_s;
+}
+
+void Exl3ExpertRuntime::open_split_cache() {
+    split_cache_ = nullptr;
+    split_cache_slots_ = 0;
+    split_cache_index_.clear();
+    split_cache_lru_.clear();
+    split_cache_slot_pos_.clear();
+    split_cache_slot_key_.clear();
+    split_cache_free_.clear();
+    split_cache_hits_ = 0;
+    split_cache_lookups_ = 0;
+    if (direct_staging_ == nullptr || direct_stride_ == 0) return;
+    // The budget is a share of the host RAM the process can get NOW - after the source's pool
+    // owns its misses, which open() prewarmed just before - between bounds that keep a small
+    // machine's pool intact and cap a large machine's take.  An explicit MiB budget overrides the
+    // share; 0 keeps the per-window staging.  Whatever does not fit in pinned memory is simply
+    // not cached: the per-window staging below stays in charge of it.
+    uint64_t budget = 0;
+    const int64_t asked_mib = split_cache_budget_mib();
+    if (asked_mib >= 0) {
+        budget = static_cast<uint64_t>(asked_mib) << 20;
+    } else {
+        detail::HostMemory memory;
+        if (!detail::host_available_memory(memory)) {
+            std::fprintf(stderr, "Exl3ExpertRuntime: split cache off (host memory unreadable); "
+                                 "windows stage their GPU share anew\n");
+            return;
+        }
+        budget = memory.available / 16;
+        if (budget < (256ull << 20)) budget = 256ull << 20;
+        if (budget > (4ull << 30)) budget = 4ull << 30;
+    }
+    int64_t slots = budget >= direct_stride_ ? static_cast<int64_t>(budget / direct_stride_) : 0;
+    if (slots <= 0) {
+        std::fprintf(stderr, "Exl3ExpertRuntime: split cache off (no room for one blob); "
+                             "windows stage their GPU share anew\n");
+        return;
+    }
+    // A refused arena is halved and tried again, the way the device cache plan is; only slots
+    // the pinning actually granted become GPU candidates' cache.
+    for (; slots > 0; slots /= 2) {
+        const uint64_t bytes = static_cast<uint64_t>(slots) * direct_stride_;
+        if (bytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) continue;
+        split_cache_ = static_cast<uint8_t*>(strata::gpu::alloc_host(static_cast<size_t>(bytes)));
+        if (split_cache_ != nullptr) break;
+    }
+    if (split_cache_ == nullptr) {
+        std::fprintf(stderr, "Exl3ExpertRuntime: split cache off (pinned allocation refused); "
+                             "windows stage their GPU share anew\n");
+        slots = 0;
+        return;
+    }
+    split_cache_slots_ = slots;
+    split_cache_slot_pos_.resize(static_cast<size_t>(slots));
+    split_cache_slot_key_.assign(static_cast<size_t>(slots), -1);
+    split_cache_free_.reserve(static_cast<size_t>(slots));
+    for (int64_t slot = slots - 1; slot >= 0; --slot) split_cache_free_.push_back(slot);
+    std::fprintf(stderr,
+                 "Exl3ExpertRuntime: split cache %lld slots x %llu bytes (%.2f GiB pinned); "
+                 "0 disables it with STRATA_EXL3_SPLIT_CACHE_MIB=0\n",
+                 (long long) slots, (unsigned long long) direct_stride_,
+                 static_cast<double>(static_cast<uint64_t>(slots) * direct_stride_) / 1073741824.0);
+}
+
+int64_t Exl3ExpertRuntime::split_cache_assign(int64_t layer, int32_t expert) {
+    if (split_cache_ == nullptr || split_cache_slots_ <= 0 || source_ == nullptr) return -1;
+    if (layer < 0 || layer >= (int64_t{1} << 31) || expert < 0) return -1;
+    const int64_t key = (layer << 32) | static_cast<uint32_t>(expert);
+    ++split_cache_lookups_;
+    const auto found = split_cache_index_.find(key);
+    if (found != split_cache_index_.end()) {
+        const int64_t slot = found->second;
+        split_cache_lru_.splice(split_cache_lru_.begin(), split_cache_lru_, split_cache_slot_pos_[(size_t) slot]);
+        ++split_cache_hits_;
+        return slot;
+    }
+    int64_t slot = -1;
+    if (!split_cache_free_.empty()) {
+        slot = split_cache_free_.back();
+        split_cache_free_.pop_back();
+    } else if (!split_cache_lru_.empty()) {
+        // Evict the least recently used slot outside the current window: windows run one at a
+        // time and a slot of this window is at the list's front, never its back.
+        const int64_t victim = split_cache_lru_.back();
+        const auto vit = split_cache_index_.find(victim);
+        if (vit == split_cache_index_.end()) return -1;
+        slot = vit->second;
+        split_cache_index_.erase(vit);
+        split_cache_lru_.pop_back();
+    }
+    if (slot < 0 || slot >= split_cache_slots_) return -1;
+    uint8_t* staged = split_cache_ + static_cast<size_t>(slot) * direct_stride_;
+    if (!source_->copy_blob(layer, expert, staged)) {
+        split_cache_free_.push_back(slot);
+        return -1;
+    }
+    split_cache_index_.emplace(key, slot);
+    split_cache_slot_key_[(size_t) slot] = key;
+    split_cache_lru_.push_front(key);
+    split_cache_slot_pos_[(size_t) slot] = split_cache_lru_.begin();
+    return slot;
 }
 
 bool Exl3ExpertRuntime::allocate_images(std::string& err) {
@@ -456,11 +648,15 @@ bool Exl3ExpertRuntime::open(Exl3ExpertSource& source, strata::kernels::cpu::Exp
             for (int64_t expert = 0; expert < n_expert_; ++expert)
                 if (cache_.slot_of(layer, expert) < 0) { all_resident_ = false; break; }
     }
-    // The Direct miss path's pinned staging: one canonical blob per distinct miss of a window, at the
-    // largest format's stride.  The GPU reads these host addresses over the bus; no VRAM is spent on
-    // misses.  A staging that cannot be allocated, or host memory the kernels cannot read, leaves the
-    // CPU miss path in charge and says so once here.
-    if (miss_mode_ == MissMode::Direct) {
+    // The Direct/Split miss path's pinned staging: one canonical blob per distinct miss of a window,
+    // at the largest format's stride.  The GPU reads these host addresses over the bus; no VRAM is
+    // spent on misses.  The arena covers one window only - a few MiB for a decode window - not the
+    // whole model's misses: the source's CPU pool already holds those under its host-memory budget.
+    // A staging that cannot be allocated, or host memory the kernels cannot read, leaves the CPU
+    // miss path in charge and says so once here.  Split additionally times a pinned->device copy
+    // through this arena at open, so its per-window share divides measured PCIe bytes/s, not a
+    // configured number.
+    if (miss_mode_ == MissMode::Direct || miss_mode_ == MissMode::Split) {
         uint64_t stride = 0;
         for (const auto& layout : format_table_host_) stride = std::max(stride, layout.total_bytes);
         direct_stride_ = (stride + 255u) & ~uint64_t(255u);
@@ -475,6 +671,12 @@ bool Exl3ExpertRuntime::open(Exl3ExpertSource& source, strata::kernels::cpu::Exp
             if (direct_staging_ != nullptr) { strata::gpu::free(direct_staging_); direct_staging_ = nullptr; }
             std::fprintf(stderr, "Exl3ExpertRuntime: direct miss read unavailable (pinned staging or host "
                                  "access failed); CPU misses stay in charge\n");
+        } else if (miss_mode_ == MissMode::Split) {
+            measure_pcie_bandwidth();
+            std::fprintf(stderr,
+                         "Exl3ExpertRuntime: split miss staging %lld experts x %llu bytes, PCIe %.2f GB/s\n",
+                         (long long) direct_capacity_, (unsigned long long) direct_stride_,
+                         pcie_bytes_per_sec_ / 1e9);
         }
     }
     if (!allocate_images(err)) { close(); return false; }
@@ -494,6 +696,10 @@ bool Exl3ExpertRuntime::open(Exl3ExpertSource& source, strata::kernels::cpu::Exp
                  (unsigned long long) prewarm.requested_experts, (unsigned long long) prewarm.requested_bytes,
                  (unsigned long long) prewarm.admission_bytes, (unsigned long long) prewarm.loaded_experts,
                  (unsigned long long) prewarm.loaded_bytes, prewarm_why.empty() ? "" : ": ", prewarm_why.c_str());
+    // Split's persistent pinned cache comes last: the pool owns its misses by now, so the host
+    // reading sizes the cache from what is left.  It never fails the open (0 slots keeps the
+    // per-window staging).
+    if (miss_mode_ == MissMode::Split && direct_ready_) open_split_cache();
     opened_ = true;
     return true;
 }
@@ -554,6 +760,77 @@ bool Exl3ExpertRuntime::prepare_window(int64_t layer, const float* host_fp32_x, 
     // staging holds one blob per distinct miss, which the capacity bounds.
     const bool direct_active = miss_mode_ == MissMode::Direct && direct_ready_ &&
                                static_cast<int64_t>(miss_group_experts.size()) <= direct_capacity_;
+    // Split: the GPU takes some distinct misses (staged like Direct, in the same grouped launch as
+    // the hits) and the CPU pool takes the rest, side by side.  Which experts go to the GPU is
+    // decided below from measured costs: experts with the most routed entries first (one bus read
+    // serves every entry that needs the expert, while the CPU pays per entry), ties broken by the
+    // smaller blob (a cheaper bus read).  The count minimizes max(CPU, GPU) through plan_split_gpu;
+    // it is capped to what the pinned staging holds, so a window larger than the staging still
+    // moves the staged prefix instead of falling back whole.
+    bool split_active = false;
+    std::vector<uint8_t> split_is_gpu;
+    std::vector<size_t> split_staged_order;
+    std::vector<uint64_t> split_gpu_addr;
+    int64_t split_gpu_entries = 0;
+    if (!direct_active && miss_mode_ == MissMode::Split && direct_ready_ &&
+        !miss_group_experts.empty()) {
+        std::vector<SplitCandidate> candidates;
+        candidates.reserve(miss_group_experts.size());
+        for (size_t group = 0; group < miss_group_experts.size(); ++group) {
+            const auto* layout = source_->exl3_layout(layer, miss_group_experts[group]);
+            candidates.push_back({miss_group_experts[group],
+                                  static_cast<int64_t>(miss_group_entries[group].size()),
+                                  layout != nullptr ? layout->total_bytes : 0});
+        }
+        std::vector<size_t> order(candidates.size());
+        for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+        std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+            if (candidates[a].entries != candidates[b].entries)
+                return candidates[a].entries > candidates[b].entries;
+            return candidates[a].bytes < candidates[b].bytes;
+        });
+        std::vector<SplitCandidate> sorted;
+        sorted.reserve(candidates.size());
+        for (size_t i : order) sorted.push_back(candidates[i]);
+        // A cached window is capped by the cache's slots (evicting a slot the same window uses
+        // is then impossible: at most `slots` assignments reuse them); an uncached one by the
+        // per-window staging.
+        const int64_t gpu_capacity = split_cache_slots_ > 0 ? split_cache_slots_ : direct_capacity_;
+        const int64_t k =
+            plan_split_gpu(sorted.data(), static_cast<int64_t>(sorted.size()), cpu_us_per_entry_,
+                           pcie_bytes_per_sec_, gpu_capacity);
+        if (k > 0) {
+            split_is_gpu.assign(miss_group_experts.size(), 0);
+            split_staged_order.reserve(static_cast<size_t>(k));
+            split_gpu_addr.reserve(static_cast<size_t>(k));
+            for (int64_t s = 0; s < k; ++s) {
+                const size_t at = order[static_cast<size_t>(s)];
+                const int32_t expert = miss_group_experts[at];
+                uint64_t addr = 0;
+                if (split_cache_slots_ > 0) {
+                    // The persistent cache: a staged expert is reread on later tokens, so this
+                    // window's host conversion is paid only on a cache miss.  A blob that cannot
+                    // be staged stays on the CPU; its CPU read below reports the failure, if any.
+                    const int64_t slot = split_cache_assign(layer, expert);
+                    if (slot < 0) continue;
+                    addr = static_cast<uint64_t>(
+                        reinterpret_cast<uintptr_t>(split_cache_ + static_cast<size_t>(slot) * direct_stride_));
+                } else {
+                    uint8_t* staged = direct_staging_ + split_staged_order.size() * direct_stride_;
+                    if (!source_->copy_blob(layer, expert, staged)) {
+                        err = "exl3 runtime: split miss source copy failed";
+                        return false;
+                    }
+                    addr = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(staged));
+                }
+                split_is_gpu[at] = 1;
+                split_staged_order.push_back(at);
+                split_gpu_addr.push_back(addr);
+                split_gpu_entries += static_cast<int64_t>(miss_group_entries[at].size());
+            }
+            split_active = !split_staged_order.empty();
+        }
+    }
     if (direct_active) {
         for (size_t group = 0; group < miss_group_experts.size(); ++group) {
             uint8_t* staged = direct_staging_ + group * direct_stride_;
@@ -567,15 +844,52 @@ bool Exl3ExpertRuntime::prepare_window(int64_t layer, const float* host_fp32_x, 
                 std::fill(cpu_output + entry * ldy, cpu_output + entry * ldy + ldy, 0.0f);
                 ++direct_entries_;
             }
+    } else if (split_active) {
+        // The CPU reads only its own share below (begin_layer pins that share); the GPU share's
+        // rows are zeroes the grouped kernel overwrites, so the merge's halves stay disjoint.
+        std::vector<int32_t> cpu_ids;
+        cpu_ids.reserve(miss_ids_.size());
+        for (size_t group = 0; group < miss_group_experts.size(); ++group) {
+            if (split_is_gpu[group] != 0) {
+                for (const int32_t entry : miss_group_entries[group]) {
+                    std::fill(cpu_output + entry * ldy, cpu_output + entry * ldy + ldy, 0.0f);
+                    ++direct_entries_;
+                }
+            } else {
+                cpu_ids.push_back(miss_group_experts[group]);
+            }
+        }
+        if (!cpu_ids.empty()) {
+            source_->begin_layer(layer, cpu_ids.data(), static_cast<int64_t>(cpu_ids.size()));
+            if (!source_->last_error().empty()) { err = source_->last_error(); return false; }
+        }
     } else if (!miss_ids_.empty()) {
         source_->begin_layer(layer, miss_ids_.data(), static_cast<int64_t>(miss_ids_.size()));
         if (!source_->last_error().empty()) { err = source_->last_error(); return false; }
     }
     detail_sample.mark(1);   // source begin (guard time is a nested component)
-    if (!direct_active)
+    if (!direct_active && !split_active)
     for (int64_t entry = 0; entry < n_tokens * routed_k_; ++entry) {
         const int32_t expert = routed_ids[entry];
         if (cache_.valid() && cache_.slot_of(layer, expert) >= 0) continue;
+        const uint8_t* blob = source_->blob(layer, expert);
+        const auto* layout = source_->exl3_layout(layer, expert);
+        if (blob == nullptr || layout == nullptr) { err = "exl3 runtime: CPU miss source read failed"; return false; }
+        auto& job = cpu_jobs_[(size_t) miss_entries_++];
+        job.view = strata::kernels::exl3::expert_view(*layout, blob, source_->exl3_tile_order(layer, expert));
+        job.rows = 1;
+        job.x = host_fp32_x + (entry / routed_k_) * ldx;
+        job.ldx = ldx;
+        job.y = cpu_output + entry * ldy;
+        job.ldy = ldy;
+        job.slot = static_cast<int>(entry);
+    }
+    if (split_active)
+    for (int64_t entry = 0; entry < n_tokens * routed_k_; ++entry) {
+        const int32_t expert = routed_ids[entry];
+        if (cache_.valid() && cache_.slot_of(layer, expert) >= 0) continue;
+        auto it = miss_groups_by_expert.find(expert);
+        if (it == miss_groups_by_expert.end() || split_is_gpu[(size_t) it->second] != 0) continue;
         const uint8_t* blob = source_->blob(layer, expert);
         const auto* layout = source_->exl3_layout(layer, expert);
         if (blob == nullptr || layout == nullptr) { err = "exl3 runtime: CPU miss source read failed"; return false; }
@@ -606,15 +920,16 @@ bool Exl3ExpertRuntime::prepare_window(int64_t layer, const float* host_fp32_x, 
         }
         h_start_[group + 1] = static_cast<int32_t>(cursor);
     }
-    if (direct_active) {
+    if (direct_active || split_active) {
         // Miss groups follow the hit groups in the same plan: their blob address is the pinned host
         // staging, which host USM makes the device address too, so the grouped kernel reads the miss
-        // weights over the bus while it reads the hits from VRAM.
-        for (size_t miss = 0; miss < miss_group_experts.size(); ++miss) {
-            const size_t group = group_slots.size() + miss;
+        // weights over the bus while it reads the hits from VRAM.  Direct stages every miss in
+        // routing order; Split stages its chosen share - from the persistent cache when it has one,
+        // else converted anew above - in the staged order.
+        auto append_gpu_group = [&](size_t miss, size_t staged_at, uint64_t blob) {
+            const size_t group = group_slots.size() + staged_at;
             const size_t at = pair_index(layer, miss_group_experts[miss]);
-            h_blob_base_[group] = static_cast<uint64_t>(
-                reinterpret_cast<uintptr_t>(direct_staging_ + miss * direct_stride_));
+            h_blob_base_[group] = blob;
             h_format_index_[group] = pair_format_index_[at];
             for (int32_t entry : miss_group_entries[miss]) {
                 h_tok_[cursor] = entry / static_cast<int32_t>(routed_k_);
@@ -622,13 +937,33 @@ bool Exl3ExpertRuntime::prepare_window(int64_t layer, const float* host_fp32_x, 
                 ++cursor;
             }
             h_start_[group + 1] = static_cast<int32_t>(cursor);
+        };
+        if (direct_active) {
+            for (size_t miss = 0; miss < miss_group_experts.size(); ++miss)
+                append_gpu_group(miss, miss,
+                                 static_cast<uint64_t>(reinterpret_cast<uintptr_t>(
+                                     direct_staging_ + miss * direct_stride_)));
+        } else {
+            for (size_t s = 0; s < split_staged_order.size(); ++s)
+                append_gpu_group(split_staged_order[s], s, split_gpu_addr[s]);
         }
     }
-    *h_ngroups_ = static_cast<int32_t>(group_slots.size() + (direct_active ? miss_group_experts.size() : 0));
+    const size_t gpu_groups = direct_active ? miss_group_experts.size()
+                                            : (split_active ? split_staged_order.size() : 0);
+    *h_ngroups_ = static_cast<int32_t>(group_slots.size() + gpu_groups);
     *h_nentries_ = static_cast<int32_t>(cursor);
     total_hit_entries_ += hit_entries_;
     total_cpu_miss_entries_ += miss_entries_;
     total_direct_miss_entries_ += direct_entries_;
+    if (miss_mode_ == MissMode::Split && !miss_group_experts.empty()) {
+        // A Split window with no miss still records nothing; every miss window tunes the share,
+        // including an all-CPU one (k = 0 while the controller has no costs yet).
+        ++split_windows_;
+        split_last_gpu_ = static_cast<int64_t>(split_staged_order.size());
+        split_last_cpu_ = static_cast<int64_t>(miss_group_experts.size()) - split_last_gpu_;
+        split_gpu_entries_ += split_gpu_entries;
+        split_miss_entries_ += split_gpu_entries + miss_entries_;
+    }
     prepared_layer_ = layer;
     prepared_ = true;
     cpu_ready_ = false;
@@ -643,6 +978,7 @@ bool Exl3ExpertRuntime::run_cpu(std::string& err) {
     if (!prepared_) { err = "exl3 runtime: prepare_window is required"; return false; }
     if (cpu_ready_) return true;
     using CpuStatus = strata::kernels::cpu::exl3::Status;
+    const auto cpu_t0 = std::chrono::steady_clock::now();
     CpuStatus status;
     if (cpu_rowparallel_jobs_ > 0 && miss_entries_ <= cpu_rowparallel_jobs_) {
         status = pool_->run_exl3_rowparallel(cpu_jobs_.data(), static_cast<int>(miss_entries_));
@@ -658,6 +994,14 @@ bool Exl3ExpertRuntime::run_cpu(std::string& err) {
         return false;
     }
     cpu_ready_ = true;
+    if (miss_mode_ == MissMode::Split && miss_entries_ > 0) {
+        // The split controller's CPU cost: this window's pool time per CPU miss entry, folded
+        // into an EWMA so one slow layer does not swing the next window's share.
+        const double us =
+            std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - cpu_t0).count();
+        const double sample = us / static_cast<double>(miss_entries_);
+        cpu_us_per_entry_ = cpu_us_per_entry_ > 0.0 ? 0.75 * cpu_us_per_entry_ + 0.25 * sample : sample;
+    }
     return true;
 }
 
@@ -934,8 +1278,9 @@ bool Exl3ExpertRuntime::publish_window_plan(GpuPlanSink& sink, std::string& err)
     std::atomic_thread_fence(std::memory_order_seq_cst);
     if (sink.before_cpu != nullptr && !sink.before_cpu(sink.ctx, err)) return false;
     if (sink.publish != nullptr) sink.publish(sink.ctx);
-    // This plan contains cache hits and CPU misses only. Publish completion
-    // of the empty PCIe share through the same window protocol as legacy plans.
+    // The grouped kernel computes the published rows (hits plus Direct/Split GPU-read misses);
+    // the CPU share stays in the sink's zeroed rows for the caller's merge.  Publish completion
+    // of the empty DMA share through the same window protocol as legacy plans.
     if (sink.fetch != nullptr) sink.fetch(sink.ctx, nullptr, 0, 0);
     return true;
 }

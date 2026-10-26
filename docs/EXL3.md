@@ -282,6 +282,24 @@ staged in pinned host memory and the GPU's grouped kernel reads it over the bus 
 it, with no copy into VRAM. When the pinned staging cannot be allocated or the device cannot read
 host memory, the CPU miss path takes over. The default `--expert-miss cpu` is the original path.
 
+`--expert-miss split` divides one window's misses between both sides: some go to the GPU over
+pinned memory like `direct`, in the same grouped kernel as the hits, while the CPU pool computes
+the rest beside it. Which experts go where, and in what share, is decided at run time: from the
+pool's per-entry time (an EWMA of `run_cpu`) and the PCIe bandwidth timed at startup, the split
+minimizes the larger of the estimated CPU and GPU times. Experts needed by the most entries go
+to the GPU first (one bus read serves every entry needing the expert, while the CPU pays per
+entry); only what fits the pinned staging is a GPU candidate. Hit, CPU-miss and GPU-miss output
+rows are disjoint, so the result is bit-identical to `direct` (it may differ in bits from `cpu`,
+whose accumulation order differs).
+
+The GPU side's canonical blobs live in a persistent pinned cache (LRU) rather than the per-window
+staging, so a later token rereads a staged expert instead of converting it again. The size is a
+sixteenth of the host RAM left after the pool owns its misses, clamped to 256 MiB–4 GiB, and
+`STRATA_EXL3_SPLIT_CACHE_MIB` (MiB) overrides it; 0 stages every window anew. Whatever the
+pinning granted becomes the cache, and an expert past it still reaches the GPU through the
+per-window staging. At the end of a run the split windows, the GPU share, the CPU per-entry
+time, the PCIe bandwidth and the cache hit rate are reported.
+
 Measured on the V620 at 0000:43:00.0 with the Qwen3.8 EXL3 3.05 bpw checkpoint, `STRATA_EXL3_CPU_INTDOT=1`
 and `STRATA_EXL3_CPU_ROWPARALLEL=1`, context 512, 63 decode tokens, and the engine's own
 `STRATA_EXL3_PREPARE_DETAIL=1` counters:

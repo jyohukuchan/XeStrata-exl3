@@ -91,6 +91,8 @@ struct Exl3FlashModelOptions {
                                            ///< counts and saves them as a profile for the next run
     bool expert_miss_direct = false;       ///< misses are read by the GPU from pinned host memory over
                                            ///< the bus instead of being computed on the CPU
+    bool expert_miss_split = false;        ///< each window's misses are split at run time: some are read
+                                           ///< by the GPU like `direct`, the rest run on the CPU pool
     std::string embedding_name;            ///< empty: ModelMap's HF embedding prefix
     std::string ple_sidecar;              ///< empty: discover the specialized EXL3 sidecar
 };
@@ -242,6 +244,12 @@ public:
         int64_t cpu_miss_entries = 0;
         int64_t direct_miss_entries = 0;
         int64_t resident_pairs = 0;
+        int64_t split_windows = 0;          ///< windows the split controller decided (split mode only)
+        double split_gpu_share = 0.0;       ///< split GPU-read entries over split miss entries
+        double split_cpu_us_per_entry = 0.0;///< split CPU cost in us per miss entry (run EWMA)
+        double split_pcie_gbs = 0.0;        ///< split PCIe bandwidth in GB/s (timed at open)
+        int64_t split_cache_hits = 0;       ///< split GPU-share assignments served from the pinned cache
+        int64_t split_cache_lookups = 0;    ///< every split GPU-share assignment, hit or miss
     };
     ExpertCacheStats expert_cache_stats() const;
     /// Writes the firing frequencies recorded this run (options.expert_profile_save) as a profile file

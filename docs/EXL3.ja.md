@@ -270,6 +270,23 @@ pinned host メモリに置き、GPU の grouped kernel が PCIe 経由で直接
 （VRAM へのコピーはしない）。pinned の確保や device の host 読取ができない場合は
 CPU miss にフォールバックする。既定の `--expert-miss cpu` が従来経路である。
 
+`--expert-miss split` は 1 ウィンドウの miss を両方に分ける: 一部は `direct` と同じ
+pinned 経由で GPU が hit と同じ grouped kernel で計算し、残りは CPU pool が同時に
+計算する。どちらに回すかと何割ずつかは実行時に決める: 層ごとに CPU pool の 1 entry
+あたりの時間（`run_cpu` の移動平均）と起動時に測った PCIe 実効帯域から、CPU 側と
+GPU 側の見積もり時間の大きい方が最小になる分け方を選ぶ。重複の多い expert（1 回の
+bus 読みで複数 entry をまかなえるもの）を GPU に優先する。hit・CPU miss・GPU miss
+の出力行は互いに素なので、結果は `direct` と bit 一致する（CPU 計算分との加算順が
+違うため、`cpu` とは bit 一致しないことがある）。
+
+GPU 側の canonical blob は、ウィンドウごとの staging ではなく pinned メモリの常駐
+キャッシュ（LRU）に置き、後の token で同じ expert を引いたら変換し直さず再利用する。
+容量は起動時のホスト RAM（pool が miss を確保した後に残る分）の 1/16 を 256 MiB〜
+4 GiB に収めたもので、`STRATA_EXL3_SPLIT_CACHE_MIB`（MiB）で上書きできる。0 は毎
+ウィンドウ変換に戻す。pinned に確保できた分だけがキャッシュになり、載らなかった
+expert も毎ウィンドウの staging で GPU 候補になれる。実行終了時に分割窓数・GPU
+比率・CPU 1 entry 時間・PCIe 帯域・キャッシュの hit 率が表示される。
+
 測定（V620 0000:43:00.0、Qwen3.8 EXL3 3.05 bpw、`STRATA_EXL3_CPU_INTDOT=1` と
 `STRATA_EXL3_CPU_ROWPARALLEL=1`、context 512、63 decode token、engine 自身の
 `STRATA_EXL3_PREPARE_DETAIL=1` の counter）:

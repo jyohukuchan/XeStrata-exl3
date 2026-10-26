@@ -10,7 +10,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <list>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -31,8 +33,12 @@ public:
     /// computed by the CPU pool.  `Direct` stages the miss's canonical blob in pinned host memory and lets
     /// the GPU's grouped kernel read it from there over the bus (PCIe), so the GPU - not the CPU -
     /// computes the miss and no VRAM copy is made.  Direct falls back to `Cpu` per window when the pinned
-    /// staging is unavailable or the device cannot read host memory.
-    enum class MissMode { Cpu, Direct };
+    /// staging is unavailable or the device cannot read host memory.  `Split` stages some of a window's
+    /// misses like `Direct` and computes the rest on the CPU pool, in the same grouped launch: the GPU
+    /// and the CPU run beside each other and the per-window share is chosen at run time (see
+    /// plan_split_gpu).  A window whose GPU share does not fit the pinned staging, or a device that
+    /// cannot read host memory, keeps those misses on the CPU.
+    enum class MissMode { Cpu, Direct, Split };
 
     Exl3ExpertRuntime() = default;
     ~Exl3ExpertRuntime();
@@ -91,8 +97,10 @@ public:
     bool enqueue_device_hit(sycl::queue& queue, int64_t layer, const float* device_fp32_x, const int32_t* device_ids,
                             int64_t n_tokens, float* gpu_output, int64_t ldy, sycl::event& done,
                             const std::vector<sycl::event>& deps, std::string& err);
-    /// Publish only the hit entry list through the legacy window sink so its CPU-row merge can reuse the existing
+    /// Publish the planned entry list through the legacy window sink so its CPU-row merge can reuse the existing
     /// mapped plan and flag protocol.  EXL3's own grouped plan remains in the persistent runtime images.
+    /// The list holds every entry the grouped kernel computes (cache hits plus Direct/Split GPU-read
+    /// misses); CPU-computed misses are the sink's zeroed rows, merged by the caller.
     bool publish_window_plan(GpuPlanSink& sink, std::string& err) const;
     bool wait_gpu(sycl::event& done, std::string& err);
     /// Mark a graph replay consumed after stream synchronization, or after observing the next ring from that same
@@ -105,6 +113,49 @@ public:
     /// True when the Direct staging was allocated and the device can read it (set by open()).
     bool direct_ready() const { return direct_ready_; }
 
+    /// One distinct miss expert's cost inputs for the split decision: how many routed entries need
+    /// it and how many bytes the GPU would read for it over the bus.
+    struct SplitCandidate {
+        int32_t expert = -1;
+        int64_t entries = 0;
+        uint64_t bytes = 0;
+    };
+    /// How many of `candidates` (most entries first) the GPU takes.  The k minimizing
+    /// max(cpu, gpu) wins, with cpu = (all_entries - gpu_entries) * cpu_us_per_entry and
+    /// gpu = gpu_bytes / bytes_per_sec; ties keep the smaller k (the CPU default).  `capacity`
+    /// caps k to what the pinned staging holds.  No estimate yet (non-positive cpu_us_per_entry
+    /// or bytes_per_sec) answers 0: every miss stays on the CPU until both sides have measured
+    /// costs.  A pure function of its arguments, so tests call it directly.
+    static int64_t plan_split_gpu(const SplitCandidate* candidates, int64_t n, double cpu_us_per_entry,
+                                  double bytes_per_sec, int64_t capacity);
+    /// The split controller's state: the CPU cost per miss entry (an EWMA of run_cpu, 0 before
+    /// the first CPU sample), the PCIe bandwidth in bytes/s (a timed copy at open, 0 when not
+    /// measured), and the windows decided so far.  All are derived at run time, never configured.
+    double split_cpu_us_per_entry() const { return cpu_us_per_entry_; }
+    double split_pcie_bytes_per_sec() const { return pcie_bytes_per_sec_; }
+    int64_t split_windows() const { return split_windows_; }
+    int64_t split_last_gpu_experts() const { return split_last_gpu_; }
+    int64_t split_last_cpu_experts() const { return split_last_cpu_; }
+    /// The GPU share so far: split GPU-read entries over all split-decided miss entries (0 with none).
+    double split_gpu_share() const {
+        return split_miss_entries_ > 0
+                   ? static_cast<double>(split_gpu_entries_) / static_cast<double>(split_miss_entries_)
+                   : 0.0;
+    }
+    /// Split-decided miss entries so far: the GPU-read ones and every one (GPU + CPU).
+    int64_t split_gpu_miss_entries() const { return split_gpu_entries_; }
+    int64_t split_all_miss_entries() const { return split_miss_entries_; }
+    /// Split's persistent pinned cache: slots, lookups and hits since open (0 slots: every window
+    /// stages its GPU share anew in the per-window staging instead).
+    int64_t split_cache_slots() const { return split_cache_slots_; }
+    int64_t split_cache_hits() const { return split_cache_hits_; }
+    int64_t split_cache_lookups() const { return split_cache_lookups_; }
+    double split_cache_hit_rate() const {
+        return split_cache_lookups_ > 0
+                   ? static_cast<double>(split_cache_hits_) / static_cast<double>(split_cache_lookups_)
+                   : 0.0;
+    }
+
     /// Records every routed (layer, expert) entry's count while set (before open()).  The counts are the
     /// firing-frequency profile a later run ranks its resident set with (write_expert_profile's format).
     void set_record_heat(bool on) { record_heat_ = on; }
@@ -114,7 +165,9 @@ public:
     const std::vector<uint64_t>& heat() const { return heat_; }
 
     /// Cumulative routed-entry counts since open(): resident hits, CPU-computed misses and
-    /// direct-read misses.  Their sum is every routed entry prepared.
+    /// direct-read misses.  Their sum is every routed entry prepared.  A Split window's GPU share
+    /// counts as direct-read misses and its CPU share as CPU-computed misses; the split_*() state
+    /// above tells the two apart per window.
     int64_t total_hit_entries() const { return total_hit_entries_; }
     int64_t total_cpu_miss_entries() const { return total_cpu_miss_entries_; }
     int64_t total_direct_miss_entries() const { return total_direct_miss_entries_; }
@@ -157,6 +210,15 @@ private:
     bool submit_device_hit_plan(sycl::queue& queue, int64_t layer, const int32_t* device_ids, int64_t n_tokens,
                                 const std::vector<sycl::event>& deps, sycl::event& plan, std::string& err);
     bool allocate_images(std::string& err);
+    /// Times a pinned->device copy through the staging arena and records the PCIe bandwidth the
+    /// split controller divides GPU bytes by.  Only for MissMode::Split with a usable staging.
+    void measure_pcie_bandwidth();
+    /// Opens Split's persistent pinned cache from the host RAM the machine reports now (or
+    /// STRATA_EXL3_SPLIT_CACHE_MIB).  Never fails the open: 0 slots keeps the per-window staging.
+    void open_split_cache();
+    /// The cache slot holding (layer, expert)'s canonical blob, staging it on a miss.  -1 when the
+    /// blob could not be staged: the caller keeps that expert on the CPU.
+    int64_t split_cache_assign(int64_t layer, int32_t expert);
     bool copy_plan(sycl::queue& queue, const std::vector<sycl::event>& deps, std::vector<sycl::event>& copies,
                    std::string& err);
     bool valid_layer(int64_t layer) const { return layer >= 0 && layer < n_layers_; }
@@ -177,9 +239,28 @@ private:
     int64_t cpu_rowparallel_jobs_ = 0;
     MissMode miss_mode_ = MissMode::Cpu;
     bool direct_ready_ = false;
-    uint8_t* direct_staging_ = nullptr;   ///< pinned host arena the GPU reads miss blobs from (Direct)
+    uint8_t* direct_staging_ = nullptr;   ///< pinned host arena the GPU reads miss blobs from (Direct/Split)
     uint64_t direct_stride_ = 0;          ///< one staged blob's stride in direct_staging_
     int64_t direct_capacity_ = 0;         ///< distinct miss experts the arena holds
+    double cpu_us_per_entry_ = 0.0;       ///< EWMA of run_cpu per CPU miss entry; 0 before the first sample
+    double pcie_bytes_per_sec_ = 0.0;     ///< timed pinned->device copy at open; 0 when not measured
+    int64_t split_windows_ = 0;           ///< windows the split controller decided
+    int64_t split_gpu_entries_ = 0;       ///< split windows' GPU-read miss entries
+    int64_t split_miss_entries_ = 0;      ///< split windows' every miss entry (GPU + CPU)
+    int64_t split_last_gpu_ = 0;          ///< distinct GPU experts of the last split window
+    int64_t split_last_cpu_ = 0;          ///< distinct CPU experts of the last split window
+    // Split's persistent pinned canonical-blob cache, keyed by (layer, expert): a GPU-share expert
+    // staged once is reread from here on later tokens instead of converted again every window.
+    // Empty (0 slots) keeps the per-window staging above as the only GPU path.
+    uint8_t* split_cache_ = nullptr;     ///< pinned arena: split_cache_slots_ x direct_stride_ bytes
+    int64_t split_cache_slots_ = 0;      ///< canonical-blob slots in the arena
+    std::unordered_map<int64_t, int64_t> split_cache_index_;  ///< (layer, expert) key -> slot
+    std::list<int64_t> split_cache_lru_;                      ///< keys, front = most recently used
+    std::vector<std::list<int64_t>::iterator> split_cache_slot_pos_;  ///< per-slot LRU position
+    std::vector<int64_t> split_cache_slot_key_;               ///< per-slot key, -1 when free
+    std::vector<int64_t> split_cache_free_;                   ///< free slots, a stack
+    int64_t split_cache_hits_ = 0;       ///< GPU-share assignments served from the cache
+    int64_t split_cache_lookups_ = 0;    ///< every GPU-share assignment, hit or miss
     bool record_heat_ = false;
     std::vector<uint64_t> heat_;
     int64_t total_hit_entries_ = 0;
