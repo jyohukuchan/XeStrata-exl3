@@ -1,0 +1,129 @@
+{
+  "status": "complete",
+  "source_revision": "Qwen/Qwen3.5-35B-A3B@59d61f3ce65a6d9863b86d2e96597125219dc754",
+  "quality_metric_policy": "KL only for quality gate; PPL diagnostic only",
+  "calibration": {
+    "rows": 32,
+    "columns": 1024,
+    "input_ids_sha256": "df37d70043e888805cc43c12bfb4f7a9312452195fae5bd45d4273fc1c090a43",
+    "holdout_excluded": true
+  },
+  "conversion": {
+    "bits": 3.0,
+    "codebook": "mul1",
+    "head_bits": 6,
+    "mtp_bits": 4,
+    "vision_bits": 6,
+    "work": "<data>/models/quality-instruct/work-3.0-mul1",
+    "output": "<data>/models/quality-instruct/exl3-3.0-mul1-h6",
+    "log": "<data>/records/quality-instruct/conversion-3.0-mul1.log",
+    "inventory": "<data>/records/quality-instruct/exl3-3.0-mul1-h6-inventory.json",
+    "no_cross_bpw_state_reuse": true
+  },
+  "inventory": {
+    "scopes": {
+      "text_decoder": {
+        "payload_bytes": 12818607720,
+        "tensor_count": 124240,
+        "recognized_effective_bpw": 3.038029519007939,
+        "raw_scope_bpw": null
+      },
+      "embedding_textnorm": {
+        "payload_bytes": 1017122816,
+        "tensor_count": 2,
+        "weight_bpw": 16.0
+      },
+      "head": {
+        "payload_bytes": 381920260,
+        "tensor_count": 4,
+        "weight_bpw": 6.007876995912532
+      },
+      "mtp": {
+        "payload_bytes": 427131936,
+        "tensor_count": 3113,
+        "recognized_effective_bpw": 4.037966141789596
+      },
+      "vision": {
+        "payload_bytes": 559509904,
+        "tensor_count": 987,
+        "recognized_effective_bpw": 6.030290130876068
+      }
+    },
+    "text_payload_bytes": 14217650796,
+    "safetensors_file_bytes": 15221206560,
+    "non_safetensor_metadata_bytes": 16913924,
+    "charged_text_bytes": 14234564720,
+    "full_directory_bytes": 15298375078,
+    "recognized_exl3_effective_bpw": 3.1420860279373795,
+    "recognized_exl3_weight_elements": 35414736896,
+    "recognized_exl3_storage_bytes": 13909518748
+  },
+  "qbench": {
+    "yaml": "<data>/records/quality-instruct/teacher-v620/qwen35-exl3-3.0-qbench.yaml",
+    "results": "<data>/records/quality-instruct/teacher-v620/qwen35-exl3-3.0-qbench-results.json",
+    "data_key": "3e97fdf1bc08e9fe",
+    "reference_key": "8695b44c40270bea",
+    "holdout_rows": 6,
+    "kld_positions": 2729,
+    "ppl_scored_response_positions": 2723,
+    "layer_bpw": 3.047656158686473,
+    "head_bpw": 6.007876995912532,
+    "vram_gib": 12.291784267872572,
+    "kld_mean": 0.05159172788262367,
+    "kld_median": 0.030528651550412178,
+    "kld_p90": 0.1264069527387619,
+    "ppl_diagnostic": 8.27872668564924,
+    "cache_key": "ad0bec41734e51f6",
+    "per_case_kld": [
+      {
+        "id": "holdout-ja-narrative",
+        "positions": 458,
+        "kld_mean": 0.06450054794549942,
+        "kld_median": 0.04761885851621628,
+        "kld_p90": 0.14586417376995087
+      },
+      {
+        "id": "holdout-ja-observation",
+        "positions": 488,
+        "kld_mean": 0.055415552109479904,
+        "kld_median": 0.03830602765083313,
+        "kld_p90": 0.12466234713792801
+      },
+      {
+        "id": "holdout-ja-conversation",
+        "positions": 493,
+        "kld_mean": 0.06911129504442215,
+        "kld_median": 0.05470213294029236,
+        "kld_p90": 0.15299202501773834
+      },
+      {
+        "id": "holdout-ja-debugging",
+        "positions": 506,
+        "kld_mean": 0.07172716408967972,
+        "kld_median": 0.0469619557261467,
+        "kld_p90": 0.16416922211647034
+      },
+      {
+        "id": "holdout-code-python",
+        "positions": 335,
+        "kld_mean": 0.020668936893343925,
+        "kld_median": 0.0038223830051720142,
+        "kld_p90": 0.061482347548007965
+      },
+      {
+        "id": "holdout-code-typescript",
+        "positions": 449,
+        "kld_mean": 0.015411761589348316,
+        "kld_median": 0.0019479761831462383,
+        "kld_p90": 0.04353708028793335
+      }
+    ]
+  },
+  "comparison_policy": {
+    "against_iq2_iq3": "await matched target-budget recipe; current IQ2/3 files are not capacity matched to EXL3 3.0",
+    "against_iq4_5": "not_applicable_as_target_bpw gate",
+    "speed": "not_measured"
+  },
+  "interpretation": "EXL3 3.0 conversion and six-row KL evaluation completed. Its target-bpw comparison against IQ2/3 requires capacity matching; current lower-capacity IQuant artifacts are observations only. No decode-speed or end-to-end XeStrata claim.",
+  "updated_at": "2026-10-19T16:40:48.922209+00:00"
+}

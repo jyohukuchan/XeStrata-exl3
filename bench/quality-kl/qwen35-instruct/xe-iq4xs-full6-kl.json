@@ -1,0 +1,180 @@
+{
+  "scope": "All six frozen holdout rows (2729 KL positions); quality KL only; no speed verdict",
+  "definition": "KL(P_BF16 || P_candidate), eval vocabulary cropped to 248077 and logits clamped to -200; NumPy FP64 reduction for Xe candidate; cached baselines retain qbench reductions",
+  "eval_vocab": 248077,
+  "rows": [
+    {
+      "index": 0,
+      "id": "holdout-ja-narrative",
+      "xe_candidate": {
+        "positions": 458,
+        "mean": 0.025252384225414034,
+        "median": 0.018838173791880665,
+        "p90": 0.05268947713386302,
+        "max": 0.2028403071219521
+      },
+      "native_exl3_4_5_cached": {
+        "positions": 458,
+        "mean": 0.011006384635659118,
+        "median": 0.007207128684967756,
+        "p90": 0.02491559535264969,
+        "max": 0.19515568017959595
+      },
+      "matched_iq4_xs_cached": {
+        "positions": 458,
+        "mean": 0.02580287192456114,
+        "median": 0.01799891423434019,
+        "p90": 0.056000429019331936,
+        "max": 0.23961877822875977
+      }
+    },
+    {
+      "index": 1,
+      "id": "holdout-ja-observation",
+      "xe_candidate": {
+        "positions": 488,
+        "mean": 0.02739732991797545,
+        "median": 0.01777203913847372,
+        "p90": 0.05945670082480311,
+        "max": 0.5626422624244432
+      },
+      "native_exl3_4_5_cached": {
+        "positions": 488,
+        "mean": 0.010890015712186223,
+        "median": 0.007142232730984688,
+        "p90": 0.022708075866103173,
+        "max": 0.1886042058467865
+      },
+      "matched_iq4_xs_cached": {
+        "positions": 488,
+        "mean": 0.02681007822132072,
+        "median": 0.018111564218997955,
+        "p90": 0.05632959567010403,
+        "max": 0.4174720048904419
+      }
+    },
+    {
+      "index": 2,
+      "id": "holdout-ja-conversation",
+      "xe_candidate": {
+        "positions": 493,
+        "mean": 0.02820889976399685,
+        "median": 0.02211761906617892,
+        "p90": 0.05770837146100156,
+        "max": 0.3343840635290417
+      },
+      "native_exl3_4_5_cached": {
+        "positions": 493,
+        "mean": 0.01316871737431149,
+        "median": 0.009127095341682434,
+        "p90": 0.03003553412854672,
+        "max": 0.16492825746536255
+      },
+      "matched_iq4_xs_cached": {
+        "positions": 493,
+        "mean": 0.026633485200869274,
+        "median": 0.02116452343761921,
+        "p90": 0.05574782341718674,
+        "max": 0.2434987872838974
+      }
+    },
+    {
+      "index": 3,
+      "id": "holdout-ja-debugging",
+      "xe_candidate": {
+        "positions": 506,
+        "mean": 0.02825060827725696,
+        "median": 0.019418767025102795,
+        "p90": 0.06606270927017441,
+        "max": 0.26327893798261853
+      },
+      "native_exl3_4_5_cached": {
+        "positions": 506,
+        "mean": 0.01091964983935499,
+        "median": 0.007272363640367985,
+        "p90": 0.02343953400850296,
+        "max": 0.14386987686157227
+      },
+      "matched_iq4_xs_cached": {
+        "positions": 506,
+        "mean": 0.028853901750369147,
+        "median": 0.020565256476402283,
+        "p90": 0.06857248768210411,
+        "max": 0.2319643199443817
+      }
+    },
+    {
+      "index": 4,
+      "id": "holdout-code-python",
+      "xe_candidate": {
+        "positions": 335,
+        "mean": 0.011345641209010505,
+        "median": 0.0018153571220276773,
+        "p90": 0.02412056678831882,
+        "max": 0.6788846682261822
+      },
+      "native_exl3_4_5_cached": {
+        "positions": 335,
+        "mean": 0.0037378364476945165,
+        "median": 0.0004916078178212047,
+        "p90": 0.009299542382359511,
+        "max": 0.16206999123096466
+      },
+      "matched_iq4_xs_cached": {
+        "positions": 335,
+        "mean": 0.011115133351777908,
+        "median": 0.0015062469756230712,
+        "p90": 0.0266600273549557,
+        "max": 0.708517849445343
+      }
+    },
+    {
+      "index": 5,
+      "id": "holdout-code-typescript",
+      "xe_candidate": {
+        "positions": 449,
+        "mean": 0.008636007614794782,
+        "median": 0.0009798057201454353,
+        "p90": 0.02367734317645596,
+        "max": 0.16298936062117925
+      },
+      "native_exl3_4_5_cached": {
+        "positions": 449,
+        "mean": 0.0024161838222838366,
+        "median": 0.0003504849155433476,
+        "p90": 0.006937421672046183,
+        "max": 0.07383553683757782
+      },
+      "matched_iq4_xs_cached": {
+        "positions": 449,
+        "mean": 0.008516346496894341,
+        "median": 0.0009198103216476738,
+        "p90": 0.024578719958662985,
+        "max": 0.18279127776622772
+      }
+    }
+  ],
+  "xe_candidate": {
+    "positions": 2729,
+    "mean": 0.022284954771423778,
+    "median": 0.01270392604438031,
+    "p90": 0.05269146736944216,
+    "max": 0.6788846682261822
+  },
+  "native_exl3_4_5_cached": {
+    "positions": 2729,
+    "mean": 0.009054530619681585,
+    "median": 0.004878466483205557,
+    "p90": 0.02216728180646899,
+    "max": 0.19515568017959595
+  },
+  "matched_iq4_xs_cached": {
+    "positions": 2729,
+    "mean": 0.022051603244089415,
+    "median": 0.013199500739574432,
+    "p90": 0.05298546776175501,
+    "max": 0.708517849445343
+  },
+  "candidate_directory": "<data>/records/quality-instruct/xe-iq4xs-full",
+  "performance_gate": false
+}

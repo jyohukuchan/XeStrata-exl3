@@ -1,0 +1,95 @@
+{
+  "status": "complete",
+  "source_revision": "Qwen/Qwen3.5-35B-A3B@59d61f3ce65a6d9863b86d2e96597125219dc754",
+  "quality_metric_policy": "KL only for quality gate; PPL diagnostic only",
+  "calibration": {
+    "imatrix": "qwen35-imatrix-32x1024.gguf",
+    "rows": 32,
+    "columns": 1024,
+    "input_ids": "original_input_ids.xid",
+    "holdout_excluded": true
+  },
+  "candidate": {
+    "format": "IQ3_XXS BF16 embedding Q6_K head",
+    "file": "<data>/models/quality-instruct/qwen35-instruct-iq3_xxs-bf16-embed-q6head-imatrix32.gguf",
+    "size_bytes": 14489900160,
+    "sha256": "feeeb49c81c47baa7ecbfc4224edd94a073e985f12880057f0ecf3c0c1ed76ff",
+    "tensor_types": {
+      "IQ3_XXS": 360,
+      "Q4_K": 40,
+      "IQ2_S": 20,
+      "IQ3_S": 10,
+      "Q6_K": 1,
+      "BF16": 1,
+      "F32": 301
+    },
+    "layer_bpw": 3.082752621730147,
+    "head_bpw": 6.5625,
+    "layer_stored_bytes": 12955760640,
+    "head_stored_bytes": 417177600
+  },
+  "qbench": {
+    "yaml": "<data>/records/quality-instruct/teacher-v620/qwen35-iq3-xxs-qbench.yaml",
+    "results": "<data>/records/quality-instruct/teacher-v620/qwen35-iq3-xxs-qbench-results.json",
+    "cache_key": "7630f889f4e88e6c",
+    "data_key": "3e97fdf1bc08e9fe",
+    "reference_key": "8695b44c40270bea",
+    "kld_positions": 2729,
+    "ppl_scored_response_positions": 2723,
+    "kld_mean": 0.10172432661056519,
+    "kld_median": 0.058235637843608856,
+    "kld_p90": 0.2474936693906784,
+    "ppl_diagnostic": 8.535960658490051,
+    "per_case_kld": [
+      {
+        "id": "holdout-ja-narrative",
+        "positions": 458,
+        "kld_mean": 0.12002651393413544,
+        "kld_median": 0.08168219774961472,
+        "kld_p90": 0.2686828672885895
+      },
+      {
+        "id": "holdout-ja-observation",
+        "positions": 488,
+        "kld_mean": 0.12069293856620789,
+        "kld_median": 0.08012665808200836,
+        "kld_p90": 0.2881862223148346
+      },
+      {
+        "id": "holdout-ja-conversation",
+        "positions": 493,
+        "kld_mean": 0.1410118192434311,
+        "kld_median": 0.0998530164361,
+        "kld_p90": 0.2973114848136902
+      },
+      {
+        "id": "holdout-ja-debugging",
+        "positions": 506,
+        "kld_mean": 0.1343710571527481,
+        "kld_median": 0.09135113656520844,
+        "kld_p90": 0.2957524359226227
+      },
+      {
+        "id": "holdout-code-python",
+        "positions": 335,
+        "kld_mean": 0.039324428886175156,
+        "kld_median": 0.008385278284549713,
+        "kld_p90": 0.09476996958255768
+      },
+      {
+        "id": "holdout-code-typescript",
+        "positions": 449,
+        "kld_mean": 0.02906705252826214,
+        "kld_median": 0.004287262912839651,
+        "kld_p90": 0.07689832895994186
+      }
+    ]
+  },
+  "interpretation": "IQ3_XXS quality is recorded as a low-bit sweep observation. Its direct comparison with EXL3 4.5 as a matched-budget KL gate is not applicable because storage differs materially; the corresponding EXL3 target-bpw comparison is pending. No speed or end-to-end XeStrata claim.",
+  "comparison_policy": {
+    "against_exl3_4_5_matched_budget": "not_applicable",
+    "reason": "candidate storage is materially smaller than EXL3 4.5 charged text; do not use this as a matched-budget quality gate",
+    "awaiting": "fresh EXL3 same-target-bpw comparison",
+    "quality_data_role": "low-bit sweep observation; KL only when compared at applicable matched scope"
+  }
+}

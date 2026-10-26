@@ -1,0 +1,137 @@
+{
+  "status": "complete",
+  "label": "EXL3 4.5 mul1 head6 full artifact versus calibrated Q4_K_M",
+  "source_repo": "Qwen/Qwen3.5-35B-A3B",
+  "source_revision": "59d61f3ce65a6d9863b86d2e96597125219dc754",
+  "conversion_log": "<data>/records/quality-instruct/conversion-4.5-mul1.log",
+  "conversion_command": "-b 4.5 -hb 6 -mb 4 -cb mul1 -cr 32 -cc 1024 -ss 4096 -d 0 --fast_head_capture --out_scales always",
+  "artifact": {
+    "directory": "<data>/models/quality-instruct/exl3-4.5-mul1-h6",
+    "shard_sha256_file": "<data>/records/quality-instruct/exl3-4.5-mul1-h6-shards.sha256",
+    "shard_sha256_manifest": "07adfe7144aedcf3c8f0c7ff7e6b334b25f2a4128bebcd22509ed0f175b43c8e",
+    "coverage": "language decoder + BF16 embedding + EXL3 head + MTP + vision; no silent scope omission"
+  },
+  "scopes": {
+    "text_decoder": {
+      "payload_bytes": 19121860200,
+      "tensor_count": 124240,
+      "quant_bytes": 19069563880,
+      "quant_numel": 33617346560,
+      "plain_2d_bytes": 9994240,
+      "plain_2d_numel": 4997120,
+      "stored_bpw": 4.53802951900794,
+      "weight_bpw": 4.539733054087918
+    },
+    "embedding": {
+      "payload_bytes": 1017118720,
+      "tensor_count": 1,
+      "quant_bytes": 0,
+      "quant_numel": 0,
+      "plain_2d_bytes": 1017118720,
+      "plain_2d_numel": 508559360,
+      "stored_bpw": null,
+      "weight_bpw": 16.0
+    },
+    "head": {
+      "payload_bytes": 381920260,
+      "tensor_count": 4,
+      "quant_bytes": 381920260,
+      "quant_numel": 508559360,
+      "plain_2d_bytes": 0,
+      "plain_2d_numel": 0,
+      "stored_bpw": 6.007876995912532,
+      "weight_bpw": 6.007876995912532
+    },
+    "mtp": {
+      "payload_bytes": 427131936,
+      "tensor_count": 3113,
+      "quant_bytes": 426057760,
+      "quant_numel": 844103680,
+      "plain_2d_bytes": 4096,
+      "plain_2d_numel": 2048,
+      "stored_bpw": 4.037966141789596,
+      "weight_bpw": 4.0379951645109555
+    },
+    "vision": {
+      "payload_bytes": 559509904,
+      "tensor_count": 987,
+      "quant_bytes": 334669968,
+      "quant_numel": 444727296,
+      "plain_2d_bytes": 223838208,
+      "plain_2d_numel": 111919104,
+      "stored_bpw": 6.02022805454244,
+      "weight_bpw": 8.026757036423842
+    },
+    "other": {
+      "payload_bytes": 4096,
+      "tensor_count": 1,
+      "quant_bytes": 0,
+      "quant_numel": 0,
+      "plain_2d_bytes": 0,
+      "plain_2d_numel": 0,
+      "stored_bpw": null,
+      "weight_bpw": null
+    }
+  },
+  "text_decoder_exact": {
+    "layer_payload_bytes": 19121860200,
+    "layer_weight_bpw": 4.539733054087918,
+    "layer_stored_bpw": 4.53802951900794,
+    "embedding_payload_bytes": 1017118720,
+    "embedding_bpw": 16.0,
+    "head_payload_bytes": 381920260,
+    "head_bpw": 6.007876995912532,
+    "mtp_payload_bytes": 427131936,
+    "mtp_bpw": 4.0379951645109555,
+    "vision_payload_bytes": 559509904,
+    "vision_weight_bpw": 8.026757036423842
+  },
+  "whole_artifact": {
+    "safetensor_payload_bytes": 21507545116,
+    "safetensor_payload_gib": 20.03046229109168,
+    "all_weight_scope_bpw": 4.774121441322848,
+    "note": "whole-weight denominator includes embedding/head/MTP/vision; compare text decoder separately for Q4_K_M text-only baseline"
+  },
+  "qbench": {
+    "container": "<container>",
+    "gpu": "V620 gfx1030",
+    "project": "<data>/records/quality-instruct/teacher-v620/qwen35-exl3-qbench.yaml",
+    "cache_data_key": "3e97fdf1bc08e9fe",
+    "cache_reference_key": "8695b44c40270bea",
+    "candidate_key": "ac0cd469ac0aae91",
+    "holdout_rows": 6,
+    "scored_positions": 2729,
+    "reference_ppl": 7.750772897319353,
+    "exl3": {
+      "ppl": 7.815902900429383,
+      "kld_mean": 0.009054530411958694,
+      "kld_median": 0.004878466483205557,
+      "kld_p90": 0.022167276591062546,
+      "qbench_layer_bpw": 4.546542133659262,
+      "qbench_head_bpw": 6.007876995912532,
+      "qbench_vram_gb": 18.162145595997572
+    },
+    "calibrated_q4": {
+      "ppl": 7.911072421572921,
+      "kld_mean": 0.021190781146287918,
+      "kld_median": 0.011713970452547073,
+      "kld_p90": 0.04985390231013298,
+      "exact_layer_bpw": 4.862352436981338
+    },
+    "old_q4": {
+      "ppl": 7.924693937571325,
+      "kld_mean": 0.034014053642749786
+    },
+    "relative_improvement_vs_calibrated_q4": {
+      "kld_mean_fraction": 0.5727137027440437,
+      "ppl_delta": -0.09516952114353838
+    },
+    "interpretation": "EXL3 has lower text-decoder storage than calibrated Q4_K_M and also lower holdout KLD/PPL in this pilot; this is a quality result under different storage scopes and does not establish speed parity"
+  },
+  "records": {
+    "inventory": "<data>/records/quality-instruct/exl3-4.5-mul1-h6-inventory.json",
+    "results": "<data>/records/quality-instruct/teacher-v620/qwen35-exl3-qbench-results.json",
+    "log": "<data>/records/quality-instruct/teacher-v620/qwen35-exl3-qbench.log",
+    "q4_record": "<data>/records/quality-instruct/q4-km-imatrix32-quality-record.json"
+  }
+}

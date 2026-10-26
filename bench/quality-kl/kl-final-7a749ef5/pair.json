@@ -1,0 +1,196 @@
+{
+  "format": "actual-postfix-xe-exl3-versus-iquant-full6/1",
+  "status": "complete",
+  "metric": "KL(P_BF16 || P_candidate) only",
+  "positions": 2729,
+  "binary_sha256": "d400b894038ca0f924a6cac1b355276026e2d71070cd5dba89e9be8568d2d7c1",
+  "binary_source_provenance": {
+    "source_binary": "<checkout>/build/free/plain_model_logits",
+    "sha256": "d400b894038ca0f924a6cac1b355276026e2d71070cd5dba89e9be8568d2d7c1",
+    "revision": "7a749ef5-d400b894-final",
+    "note": "the coordinator's record of which binary produced this capture"
+  },
+  "revision": "7a749ef5-d400b894-final",
+  "trace_sha256": "8140f8a90d13533d8e0fc70e12fc52e465b7ac6af34091c844eed29c7d5711e4",
+  "teacher_cache": "logits_3e97fdf1bc08e9fe_8695b44c40270bea",
+  "eval_vocab": 248077,
+  "exl3": {
+    "positions": 2729,
+    "mean": 0.0089797445514184,
+    "median": 0.004925429721303047,
+    "p90": 0.021673412442913428,
+    "max": 0.19886886462222284
+  },
+  "xe_iquant": {
+    "positions": 2729,
+    "mean": 0.02184257088865589,
+    "median": 0.013000262499422627,
+    "p90": 0.05320558182546737,
+    "max": 0.3351166863330569
+  },
+  "mean_KL_reduction_fraction": 0.5888879291181744,
+  "storage": {
+    "exl3_text_plus_bootstrap_bytes": 20625925436,
+    "iquant_GGUF_bytes": 20605525120,
+    "exl3_used_text_payload_plus_bootstrap_bytes": 20531846811,
+    "iquant_larger_bytes": -20400316,
+    "iquant_larger_fraction": -0.0009890618514694083,
+    "exact_storage_match_claim": false,
+    "scope": "Primary near-budget comparison charges all EXL3 artifact metadata/header/padding and the small other4096B tensor to text, subtracts only separate MTP/vision payload, then adds actual metadata-only bootstrap. Also retain payload+bootstrap separately; no exact same-bpw claim.",
+    "proof_sha256": "96ac5cd993dbb26a7f3fcc8921c5251577e143a17855072a748f8184eb9e1781"
+  },
+  "embedding_head": {
+    "exl3": "BF16 embedding, EXL3 head6",
+    "iquant": {
+      "output.weight": {
+        "type_id": 8,
+        "shape": [
+          2048,
+          248320
+        ],
+        "offset": 0
+      },
+      "token_embd.weight": {
+        "type_id": 30,
+        "shape": [
+          2048,
+          248320
+        ],
+        "offset": 540352512
+      }
+    }
+  },
+  "pool_workers": {
+    "exl3": 48,
+    "iquant": 16
+  },
+  "capture_environment": {
+    "STRATA_ROUTE_TAIL_SKIP": "0",
+    "STRATA_HC_Q8": "0",
+    "STRATA_EXL3_GU_SPLIT_K": "8",
+    "STRATA_EXL3_CPU_INTDOT": "1",
+    "STRATA_EXL3_CPU_ROWPARALLEL": "1",
+    "STRATA_VRAM_LIMIT_MIB": "8192",
+    "STRATA_MAX_ALLOC_MIB": "4096",
+    "STRATA_NO_XMX": "1",
+    "STRATA_EXL3_WORD_TILE_PRELOAD": "1",
+    "STRATA_EXL3_DEVICE_HIT_PLAN": "1",
+    "ROCR_VISIBLE_DEVICES": "<gpu-uuid>",
+    "STRATA_GPU_PCI": "<gpu-pci>",
+    "ONEAPI_DEVICE_SELECTOR": "hip:*",
+    "LD_LIBRARY_PATH": "<checkout>/.tools/intel-llvm/install/lib:<rocm>"
+  },
+  "same_runtime_iquant_comparison": true,
+  "old43da_or_cross_runtime_cache_reused": false,
+  "performance_claim": false,
+  "rows": [
+    {
+      "id": "holdout-ja-narrative",
+      "exl3": {
+        "positions": 458,
+        "mean": 0.011338811855897501,
+        "median": 0.007335131524811391,
+        "p90": 0.02542188616644537,
+        "max": 0.19886886462222284
+      },
+      "xe_iquant": {
+        "positions": 458,
+        "mean": 0.02658269642457725,
+        "median": 0.02047855122372012,
+        "p90": 0.05493080058293515,
+        "max": 0.3193237492924558
+      }
+    },
+    {
+      "id": "holdout-ja-observation",
+      "exl3": {
+        "positions": 488,
+        "mean": 0.011221394705469099,
+        "median": 0.007296561348871173,
+        "p90": 0.023438058368432917,
+        "max": 0.17879444323917315
+      },
+      "xe_iquant": {
+        "positions": 488,
+        "mean": 0.026401896754281288,
+        "median": 0.0183714000105413,
+        "p90": 0.05816045398378334,
+        "max": 0.24841440139446078
+      }
+    },
+    {
+      "id": "holdout-ja-conversation",
+      "exl3": {
+        "positions": 493,
+        "mean": 0.012321629685778388,
+        "median": 0.008664870418072786,
+        "p90": 0.027552719778426854,
+        "max": 0.12735445982493793
+      },
+      "xe_iquant": {
+        "positions": 493,
+        "mean": 0.02713958426877502,
+        "median": 0.02186796700122423,
+        "p90": 0.05702426966793292,
+        "max": 0.30132267861376705
+      }
+    },
+    {
+      "id": "holdout-ja-debugging",
+      "exl3": {
+        "positions": 506,
+        "mean": 0.010680372082559269,
+        "median": 0.007661220985838841,
+        "p90": 0.02305055012175127,
+        "max": 0.14258270814663893
+      },
+      "xe_iquant": {
+        "positions": 506,
+        "mean": 0.02740858038686245,
+        "median": 0.018469236876919586,
+        "p90": 0.06339251111258376,
+        "max": 0.2104729942654136
+      }
+    },
+    {
+      "id": "holdout-code-python",
+      "exl3": {
+        "positions": 335,
+        "mean": 0.003632514456482623,
+        "median": 0.0004915214402971274,
+        "p90": 0.009598098414041538,
+        "max": 0.19275929297704456
+      },
+      "xe_iquant": {
+        "positions": 335,
+        "mean": 0.009672374011722744,
+        "median": 0.0016526137785222031,
+        "p90": 0.021141963343667004,
+        "max": 0.3351166863330569
+      }
+    },
+    {
+      "id": "holdout-code-typescript",
+      "exl3": {
+        "positions": 449,
+        "mean": 0.0025407180017047344,
+        "median": 0.0003560118299117597,
+        "p90": 0.007138354733376034,
+        "max": 0.07065282892420983
+      },
+      "xe_iquant": {
+        "positions": 449,
+        "mean": 0.009043593234767654,
+        "median": 0.000951099373427021,
+        "p90": 0.025671918988307188,
+        "max": 0.14454654810692463
+      }
+    }
+  ],
+  "input_record_sha256": {
+    "kl-final-7a749ef5/exl45-r9700/plan.json": "59e0098b243cfb72d4f5ba703a9bc386753291ddd7024e6a67672677aa9cf3bf",
+    "kl-final-7a749ef5/exl45-r9700/kl.json": "7efd26598f02068da405933f501ea68a6068ea8d0d9b596b73283ed09709d0dd",
+    "kl-final-7a749ef5/iq45-r9700/plan.json": "1a4b4116812198f75bc476725cae78d15df54371afb6ffc6866269cb63cf06bc",
+    "kl-final-7a749ef5/iq45-r9700/kl.json": "51c314e7ad3ae8c8295026f4e281b93c7bc011954aa4c6f694c2d13caf86124d"
+  }
+}

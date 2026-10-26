@@ -1,0 +1,76 @@
+{
+  "status": "complete",
+  "label": "calibrated Q4_K_M imatrix32 same-source baseline",
+  "source_repo": "Qwen/Qwen3.5-35B-A3B",
+  "source_revision": "59d61f3ce65a6d9863b86d2e96597125219dc754",
+  "source_bf16_sha256": "45c17e4d78b7c88a5ff5c75c3281201b04587bf5a89a8a9856be3e93bc4913ea",
+  "imatrix": {
+    "path": "<data>/models/quality-instruct/llama-imatrix-hip/outputs/qwen35-imatrix-32x1024.gguf",
+    "sha256": "1accfa1f9fc539351552c644ff9b02f146f9ad7bcd493e1134c0b88297565aa",
+    "chunks": 32,
+    "chunk_size": 1024,
+    "token_ids_sha256": "bc1019d675d4853147cad540a139b1e25012cd20c7bf9654fb415daf84f03ae4",
+    "holdout_used": false,
+    "partial_expert_entries": [
+      "blk.24.ffn_gate_exps.weight",
+      "blk.24.ffn_down_exps.weight",
+      "blk.24.ffn_up_exps.weight"
+    ],
+    "partial_expert_coverage": "99.61%; llama.cpp routed imatrix did not activate every expert, unlike EXL3 activate_all_experts"
+  },
+  "candidate": {
+    "path": "<data>/models/quality-instruct/qwen35-instruct-q4_k_m-imatrix32.gguf",
+    "sha256": "30e7c7d5f58e2f6f3441f90668da23ffc46cfcfdf7f506d036ca5f462fd495ee",
+    "size_bytes": 21166759040,
+    "coverage": "text-only 733 tensors; MTP/vision omitted",
+    "exact_storage": {
+      "layer_bpw": 4.862352436981338,
+      "head_bpw": 6.5625,
+      "weight_vram_gib": 19.431800842285156
+    },
+    "qbench_storage": {
+      "layer_bpw": 4.845425129624576,
+      "head_bpw": 6.5625,
+      "weight_vram_gib": 19.353675842285156
+    }
+  },
+  "qbench": {
+    "container": "<container>",
+    "gpu": "V620 gfx1030",
+    "llama_cpp_python": "0.3.36 ROCm/HIP",
+    "project": "<data>/records/quality-instruct/teacher-v620/qwen35-q4-k-m-imatrix32-qbench.yaml",
+    "data_key": "3e97fdf1bc08e9fe",
+    "reference_key": "8695b44c40270bea",
+    "candidate_key": "6d80be21b0983a7e",
+    "holdout_rows": 6,
+    "scored_positions": 2729,
+    "reference": {
+      "ppl": 7.750772897319353
+    },
+    "imatrix_candidate": {
+      "ppl": 7.911072421572921,
+      "kld_mean": 0.021190781146287918,
+      "kld_median": 0.011713970452547073,
+      "kld_p90": 0.04985390231013298
+    },
+    "old_no_imatrix_candidate": {
+      "path": "<data>/models/quality-instruct/qwen35-instruct-q4_k_m.gguf",
+      "sha256": "02df579f715a5af940f191f0dbee59de283701716387f8be45bcaf2b84a1329a",
+      "ppl": 7.924693937571325,
+      "kld_mean": 0.034014053642749786,
+      "kld_median": 0.01801943965256214,
+      "kld_p90": 0.07948534190654755
+    },
+    "relative_change_vs_old": {
+      "kld_mean_fraction": 0.37699924364043547,
+      "ppl_delta": -0.013621515998403666
+    }
+  },
+  "artifacts": {
+    "imatrix_log": "<data>/records/quality-instruct/imatrix-token-ids/llama-imatrix-32x1024.log",
+    "quantize_log": "<data>/records/quality-instruct/imatrix-token-ids/q4-km-imatrix32-quantize.log",
+    "qbench_log": "<data>/records/quality-instruct/teacher-v620/qwen35-q4-k-m-imatrix32-qbench.log",
+    "qbench_results": "<data>/records/quality-instruct/teacher-v620/qwen35-q4-k-m-imatrix32-qbench-results.json"
+  },
+  "exl3_status": "pending current host-session-93086 conversion completion; no EXL3 qbench launched"
+}

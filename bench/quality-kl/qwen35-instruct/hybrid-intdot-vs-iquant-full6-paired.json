@@ -1,0 +1,19 @@
+{
+  "scope": "Same BF16 source, frozen6 holdouts, sameV620 and VRAM8GiB, sameXe runtime; quality only. GPU F32GU8 CPUintdotROW32 vs matchedIQuantCPU8. Not speedgate.",
+  "quality_metric": "KL(P_BF16 || P_candidate)",
+  "exl3": {
+    "positions": 2729,
+    "mean": 0.009264844411142626,
+    "median": 0.004943927371462236,
+    "p90": 0.021353602067020333,
+    "max": 0.5450485513390187
+  },
+  "iquant": {
+    "positions": 2729,
+    "mean": 0.022406083267142125,
+    "median": 0.012763303982187278,
+    "p90": 0.05330804111434032,
+    "max": 0.6709947652922067
+  },
+  "exl3_passes_quality": true
+}

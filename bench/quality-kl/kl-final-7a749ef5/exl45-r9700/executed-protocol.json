@@ -1,0 +1,41 @@
+{
+  "data_key": "3e97fdf1bc08e9fe",
+  "reference_key": "8695b44c40270bea",
+  "trace_sha256": "8140f8a90d13533d8e0fc70e12fc52e465b7ac6af34091c844eed29c7d5711e4",
+  "holdout_manifest_sha256": "7e8eafc5ccd8ff7f67adbe3e6394744db536a106592fc03fa4e775af3e0352f4",
+  "eval_vocab": 248077,
+  "model_vocab": 248320,
+  "row_ids": [
+    "holdout-ja-narrative",
+    "holdout-ja-observation",
+    "holdout-ja-conversation",
+    "holdout-ja-debugging",
+    "holdout-code-python",
+    "holdout-code-typescript"
+  ],
+  "row_lengths": [
+    458,
+    488,
+    493,
+    506,
+    335,
+    449
+  ],
+  "positions": 2729,
+  "env": {
+    "STRATA_ROUTE_TAIL_SKIP": "0",
+    "STRATA_HC_Q8": "0",
+    "STRATA_EXL3_GU_SPLIT_K": "8",
+    "STRATA_EXL3_CPU_INTDOT": "1",
+    "STRATA_EXL3_CPU_ROWPARALLEL": "1",
+    "STRATA_VRAM_LIMIT_MIB": "8192",
+    "STRATA_MAX_ALLOC_MIB": "4096",
+    "STRATA_NO_XMX": "1",
+    "STRATA_EXL3_WORD_TILE_PRELOAD": "1",
+    "STRATA_EXL3_DEVICE_HIT_PLAN": "1"
+  },
+  "quality_metric": "KL(P_BF16 || P_candidate) only",
+  "performance_gate": false,
+  "format": "optimized45-frozen-full6-protocol/1",
+  "native_expert_profile_sha256": "3f033e6199c95b1c5145ffa01a36c813d786ab42c130fe2cea20924b3d6b2155"
+}
