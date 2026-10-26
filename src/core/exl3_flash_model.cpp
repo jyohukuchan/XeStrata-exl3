@@ -283,10 +283,12 @@ DeviceCachePlan plan_device_cache(const Exl3ExpertSource& source, int64_t layer_
 bool open_device_cache(Exl3ExpertSource& source, strata::kernels::cpu::ExpertPool& pool, Exl3ExpertRuntime& runtime,
                        size_t stage_index, int64_t layer_begin, int64_t layer_end, int64_t n_expert,
                        int64_t n_layers, int64_t max_rows, int64_t routed_k, bool allow_cpu_miss,
-                       const std::string& profile_path, bool miss_direct, bool miss_dma, bool record_heat, std::string& err) {
+                       const std::string& profile_path, bool miss_direct, bool miss_dma, bool record_heat, std::string& err,
+                       int64_t dma_staging_mib = -1) {
     runtime.set_miss_mode(miss_dma ? Exl3ExpertRuntime::MissMode::Dma
                                    : miss_direct ? Exl3ExpertRuntime::MissMode::Direct
                                                  : Exl3ExpertRuntime::MissMode::Cpu);
+    runtime.set_dma_staging_mib(dma_staging_mib);
     runtime.set_record_heat(record_heat);
     const auto no_cache = [&](const char* why) {
         if (!allow_cpu_miss) {
@@ -330,6 +332,31 @@ bool open_device_cache(Exl3ExpertSource& source, strata::kernels::cpu::ExpertPoo
     const int64_t asked_mib = device_cache_budget_mib();
     if (asked_mib >= 0 && (static_cast<uint64_t>(asked_mib) << 20) < room)
         room = static_cast<uint64_t>(asked_mib) << 20;
+    // DMA staging LRU share: reserved out of the resident room so the two do not
+    // compete.  The runtime derives the same share (an eighth of the card,
+    // clamped to [256 MiB, 4 GiB]) unless a MiB budget was given explicitly.
+    if (miss_dma) {
+        int64_t effective_mib = dma_staging_mib;
+        if (effective_mib == -1) {
+            const char* env = std::getenv("STRATA_EXL3_DMA_STAGING_MIB");
+            if (env != nullptr && env[0] != '\0') {
+                char* end = nullptr;
+                const long long v = std::strtoll(env, &end, 10);
+                if (end != env && (end == nullptr || *end == '\0') && v >= 0) effective_mib = static_cast<int64_t>(v);
+            }
+        }
+        uint64_t staging_reserve = 0;
+        if (effective_mib > 0) {
+            staging_reserve = static_cast<uint64_t>(effective_mib) << 20;
+        } else if (effective_mib == -1) {
+            staging_reserve = std::clamp<uint64_t>(static_cast<uint64_t>(total_b) / 8,
+                                                   256ull << 20, 4096ull << 20);
+            effective_mib = static_cast<int64_t>(staging_reserve >> 20);
+            runtime.set_dma_staging_mib(effective_mib);
+        }
+        if (staging_reserve > 0)
+            room = room > staging_reserve ? room - staging_reserve : 0;
+    }
     // The cache may still not fit: the free figure is what the driver reports, and the driver's own use can
     // grow.  Then the room is halved and the plan made again; a card with no room at all runs without a cache.
     for (int attempt = 0; attempt < 4; ++attempt) {
@@ -1537,7 +1564,8 @@ bool Exl3FlashModel::open(const std::filesystem::path& directory, const Exl3Flas
                                    impl_->geometry.n_layers, std::max<int64_t>(options.max_rows, options.prompt_chunk), routed_k,
                                    options.allow_cpu_expert_miss, options.expert_profile,
                                    options.expert_miss_direct, options.expert_miss_dma,
-                                   !options.expert_profile_save.empty(), err)) {
+                                   !options.expert_profile_save.empty(), err,
+                                   options.expert_dma_staging_mib)) {
                 return false;
             }
         }
@@ -2597,6 +2625,11 @@ Exl3FlashModel::ExpertCacheStats Exl3FlashModel::expert_cache_stats() const {
         stats.cpu_miss_entries += stage.runtime->total_cpu_miss_entries();
         stats.direct_miss_entries += stage.runtime->total_direct_miss_entries();
         stats.dma_miss_entries += stage.runtime->total_dma_miss_entries();
+        stats.dma_staging_hits += stage.runtime->total_dma_staging_hits();
+        stats.dma_staging_transfers += stage.runtime->total_dma_staging_transfers();
+        stats.dma_staging_evictions += stage.runtime->total_dma_staging_evictions();
+        stats.dma_staging_bytes += stage.runtime->total_dma_staging_bytes();
+        stats.dma_staging_capacity += stage.runtime->dma_staging_capacity();
         stats.resident_pairs += stage.runtime->cache().resident();
     }
     return stats;

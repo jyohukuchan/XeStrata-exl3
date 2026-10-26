@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -34,7 +35,9 @@ public:
     /// staging is unavailable or the device cannot read host memory.  `Dma` stages the same pinned
     /// blobs, copies them into a VRAM staging arena on the compute queue (ordered before the grouped
     /// kernel, so the copy engine overlaps the layers ahead of it), and computes from VRAM; it falls
-    /// back to `Cpu` per window when the staging is unavailable.
+    /// back to `Cpu` per window when the staging is unavailable.  The VRAM arena is an LRU cache
+    /// keyed by (layer, expert): a miss expert already staged is reused without a new transfer,
+    /// and the least recently used slot is evicted when the arena is full.
     enum class MissMode { Cpu, Direct, Dma };
 
     Exl3ExpertRuntime() = default;
@@ -123,6 +126,19 @@ public:
     int64_t total_direct_miss_entries() const { return total_direct_miss_entries_; }
     int64_t total_dma_miss_entries() const { return total_dma_miss_entries_; }
     bool dma_ready() const { return dma_ready_; }
+    /// DMA staging LRU capacity in slots (0 before open or when DMA is off).
+    int64_t dma_staging_capacity() const { return dma_lru_capacity_; }
+    /// Distinct miss experts served from the VRAM staging without a transfer.
+    int64_t total_dma_staging_hits() const { return total_dma_staging_hits_; }
+    /// Distinct miss experts transferred into the VRAM staging (one DMA each).
+    int64_t total_dma_staging_transfers() const { return total_dma_staging_transfers_; }
+    int64_t total_dma_staging_evictions() const { return total_dma_staging_evictions_; }
+    uint64_t total_dma_staging_bytes() const { return total_dma_staging_bytes_; }
+    /// Sets the DMA staging budget before open().  -1 (default) derives it from the
+    /// device's reported free VRAM at open(); 0 keeps only one window of slots;
+    /// a positive value is a budget in MiB.  An explicit slot count (tests) wins.
+    void set_dma_staging_mib(int64_t mib) { dma_staging_mib_ = mib; }
+    void set_dma_staging_slots(int64_t slots) { dma_staging_slots_ = slots; }
 
     /// True when the prepared window needs no CPU rows: every routed entry is computed by the
     /// grouped GPU plan (resident hits plus Direct/Dma misses).  Callers may then skip the
@@ -189,11 +205,25 @@ private:
     uint8_t* direct_staging_ = nullptr;   ///< pinned host arena the GPU reads miss blobs from (Direct/Dma)
     uint64_t direct_stride_ = 0;          ///< one staged blob's stride in direct_staging_
     int64_t direct_capacity_ = 0;         ///< distinct miss experts the arena holds
-    uint8_t* dma_staging_ = nullptr;      ///< VRAM arena Dma copies pinned miss blobs into
+    uint8_t* dma_staging_ = nullptr;      ///< VRAM LRU arena Dma copies pinned miss blobs into
     bool dma_ready_ = false;
     int64_t total_dma_miss_entries_ = 0;
     int64_t dma_entries_ = 0;             ///< this window's DMA entries (not CPU jobs)
-    std::vector<uint64_t> dma_sizes_;     ///< this window's staged blob byte counts, by miss group
+    std::vector<uint64_t> dma_sizes_;     ///< legacy per-group sizes (unused for LRU transfers)
+    int64_t dma_staging_mib_ = -1;
+    int64_t dma_staging_slots_ = 0;
+    int64_t dma_lru_capacity_ = 0;
+    std::vector<int64_t> dma_lru_pair_;        ///< per slot: pair index, or -1 when empty
+    std::vector<uint64_t> dma_lru_last_use_;   ///< per slot: last-use tick
+    std::unordered_map<int64_t, int32_t> dma_lru_index_;  ///< pair index -> slot
+    uint64_t dma_lru_clock_ = 0;
+    struct DmaTransfer { int32_t scratch = 0; int32_t slot = 0; uint64_t bytes = 0; };
+    std::vector<DmaTransfer> dma_transfers_;   ///< this window's pinned->VRAM transfers
+    std::vector<int32_t> dma_group_slot_;      ///< per miss group: its VRAM staging slot
+    int64_t total_dma_staging_hits_ = 0;
+    int64_t total_dma_staging_transfers_ = 0;
+    int64_t total_dma_staging_evictions_ = 0;
+    uint64_t total_dma_staging_bytes_ = 0;
     bool record_heat_ = false;
     std::vector<uint64_t> heat_;
     int64_t total_hit_entries_ = 0;

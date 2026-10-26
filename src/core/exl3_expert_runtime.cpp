@@ -78,6 +78,17 @@ void Exl3ExpertRuntime::close() {
     direct_ready_ = false;
     dma_ready_ = false;
     dma_sizes_.clear();
+    dma_transfers_.clear();
+    dma_group_slot_.clear();
+    dma_lru_pair_.clear();
+    dma_lru_last_use_.clear();
+    dma_lru_index_.clear();
+    dma_lru_capacity_ = 0;
+    dma_lru_clock_ = 0;
+    total_dma_staging_hits_ = 0;
+    total_dma_staging_transfers_ = 0;
+    total_dma_staging_evictions_ = 0;
+    total_dma_staging_bytes_ = 0;
     heat_.clear();
     total_hit_entries_ = 0;
     total_cpu_miss_entries_ = 0;
@@ -461,11 +472,73 @@ bool Exl3ExpertRuntime::open(Exl3ExpertSource& source, strata::kernels::cpu::Exp
         }
         direct_ready_ = direct_staging_ != nullptr && strata::gpu::kernels_read_host(direct_staging_);
         if (miss_mode_ == MissMode::Dma && direct_staging_ != nullptr) {
-            // VRAM twin of the pinned arena: the DMA copies land here and the grouped kernel reads
-            // VRAM instead of streaming every weight word over the bus during the kernel.
-            dma_staging_ = static_cast<uint8_t*>(strata::gpu::alloc_device(static_cast<size_t>(bytes)));
+            // VRAM LRU staging: slots keyed by (layer, expert), reused across tokens.
+            // Capacity comes from an explicit slot count, else a MiB budget, else the
+            // device's reported total VRAM: a sixteenth of the card, clamped to
+            // [256 MiB, 2 GiB] and to the largest allocation.  The flash model
+            // reserves the same share before planning the resident cache, so the
+            // two do not compete; a direct caller without that reserve still gets
+            // at most half of what is free here.
+            int64_t capacity = 0;
+            if (dma_staging_slots_ > 0) {
+                capacity = dma_staging_slots_;
+            } else if (dma_staging_mib_ == 0) {
+                capacity = direct_capacity_;
+            } else if (dma_staging_mib_ > 0) {
+                capacity = static_cast<int64_t>((static_cast<uint64_t>(dma_staging_mib_) << 20) / direct_stride_);
+            } else {
+                const char* env = std::getenv("STRATA_EXL3_DMA_STAGING_MIB");
+                int64_t env_mib = -1;
+                if (env != nullptr && env[0] != '\0') {
+                    char* end = nullptr;
+                    const long long v = std::strtoll(env, &end, 10);
+                    if (end != env && (end == nullptr || *end == '\0') && v >= 0) env_mib = static_cast<int64_t>(v);
+                }
+                if (env_mib == 0) {
+                    capacity = direct_capacity_;
+                } else if (env_mib > 0) {
+                    capacity = static_cast<int64_t>((static_cast<uint64_t>(env_mib) << 20) / direct_stride_);
+                } else {
+                    size_t free_b = 0, total_b = 0;
+                    uint64_t budget = 128ull * direct_stride_;
+                    if (strata::gpu::mem_info(&free_b, &total_b)) {
+                        budget = std::clamp<uint64_t>(static_cast<uint64_t>(total_b) / 8,
+                                                      256ull << 20, 4096ull << 20);
+                        if (budget > static_cast<uint64_t>(free_b) / 2) budget = static_cast<uint64_t>(free_b) / 2;
+                        const uint64_t max_alloc = max_alloc_bytes();
+                        if (max_alloc > 0 && budget > max_alloc) budget = max_alloc;
+                    }
+                    capacity = static_cast<int64_t>(budget / direct_stride_);
+                }
+            }
+            if (capacity < 1) capacity = 1;
+            if (capacity > pair_count_) capacity = pair_count_;
+            // Halve until the arena fits; at least one window must fit to stay ready.
+            while (capacity >= 1) {
+                const uint64_t want = direct_stride_ * static_cast<uint64_t>(capacity);
+                if (want > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) { capacity /= 2; continue; }
+                dma_staging_ = static_cast<uint8_t*>(strata::gpu::alloc_device(static_cast<size_t>(want)));
+                if (dma_staging_ != nullptr) break;
+                if (capacity <= direct_capacity_) break;
+                capacity = std::max<int64_t>(direct_capacity_, capacity / 2);
+                if (capacity == direct_capacity_) {
+                    const uint64_t want2 = direct_stride_ * static_cast<uint64_t>(capacity);
+                    dma_staging_ = static_cast<uint8_t*>(strata::gpu::alloc_device(static_cast<size_t>(want2)));
+                    break;
+                }
+            }
             dma_ready_ = dma_staging_ != nullptr;
-            if (!dma_ready_) {
+            if (dma_ready_) {
+                dma_lru_capacity_ = capacity;
+                dma_lru_pair_.assign(static_cast<size_t>(capacity), -1);
+                dma_lru_last_use_.assign(static_cast<size_t>(capacity), 0);
+                dma_lru_index_.clear();
+                dma_lru_clock_ = 0;
+                std::fprintf(stderr, "Exl3ExpertRuntime: DMA staging LRU %lld slots (%.2f GiB, stride %llu)\n",
+                             (long long) dma_lru_capacity_,
+                             (double) (direct_stride_ * static_cast<uint64_t>(capacity)) / 1073741824.0,
+                             (unsigned long long) direct_stride_);
+            } else {
                 std::fprintf(stderr, "Exl3ExpertRuntime: DMA miss staging unavailable (VRAM arena "
                                      "allocation failed); CPU misses stay in charge\n");
             }
@@ -521,6 +594,8 @@ bool Exl3ExpertRuntime::prepare_window(int64_t layer, const float* host_fp32_x, 
     direct_entries_ = 0;
     dma_entries_ = 0;
     dma_sizes_.clear();
+    dma_transfers_.clear();
+    dma_group_slot_.clear();
     miss_ids_.clear();
     if (record_heat_ && heat_.size() != static_cast<size_t>(pair_count_))
         heat_.assign(static_cast<size_t>(pair_count_), 0);
@@ -560,9 +635,76 @@ bool Exl3ExpertRuntime::prepare_window(int64_t layer, const float* host_fp32_x, 
     const bool direct_active = miss_mode_ == MissMode::Direct && direct_ready_ &&
                                static_cast<int64_t>(miss_group_experts.size()) <= direct_capacity_;
     const bool dma_active = miss_mode_ == MissMode::Dma && dma_ready_ && direct_staging_ != nullptr &&
-                            static_cast<int64_t>(miss_group_experts.size()) <= direct_capacity_;
+                            static_cast<int64_t>(miss_group_experts.size()) <= direct_capacity_ &&
+                            static_cast<int64_t>(miss_group_experts.size()) <= dma_lru_capacity_;
     const bool gpu_miss_active = direct_active || dma_active;
-    if (gpu_miss_active) {
+    if (dma_active) {
+        // LRU staging: reuse a slot already holding this (layer, expert); transfer only on a
+        // staging miss.  Slots of this window are never evicted within the window.
+        std::vector<int32_t> assigned(miss_group_experts.size(), -1);
+        std::vector<char> is_hit(miss_group_experts.size(), 0);
+        std::vector<char> in_window(static_cast<size_t>(dma_lru_capacity_), 0);
+        int64_t evictions = 0;
+        for (size_t group = 0; group < miss_group_experts.size(); ++group) {
+            const int64_t pair = static_cast<int64_t>(pair_index(layer, miss_group_experts[group]));
+            auto it = dma_lru_index_.find(pair);
+            int32_t slot = -1;
+            if (it != dma_lru_index_.end()) {
+                slot = it->second;
+                is_hit[group] = 1;
+            } else {
+                for (int64_t s = 0; s < dma_lru_capacity_; ++s)
+                    if (dma_lru_pair_[static_cast<size_t>(s)] == -1) { slot = static_cast<int32_t>(s); break; }
+                if (slot < 0) {
+                    uint64_t best = std::numeric_limits<uint64_t>::max();
+                    for (int64_t s = 0; s < dma_lru_capacity_; ++s) {
+                        if (in_window[static_cast<size_t>(s)] != 0) continue;
+                        if (dma_lru_last_use_[static_cast<size_t>(s)] < best) {
+                            best = dma_lru_last_use_[static_cast<size_t>(s)];
+                            slot = static_cast<int32_t>(s);
+                        }
+                    }
+                }
+                if (slot < 0) { err = "exl3 runtime: DMA staging has no evictable slot"; return false; }
+                if (dma_lru_pair_[static_cast<size_t>(slot)] != -1) {
+                    dma_lru_index_.erase(dma_lru_pair_[static_cast<size_t>(slot)]);
+                    ++evictions;
+                }
+                dma_lru_pair_[static_cast<size_t>(slot)] = pair;
+                dma_lru_index_[pair] = slot;
+            }
+            dma_lru_last_use_[static_cast<size_t>(slot)] = ++dma_lru_clock_;
+            in_window[static_cast<size_t>(slot)] = 1;
+            assigned[group] = slot;
+        }
+        int32_t scratch = 0;
+        uint64_t xfer_bytes = 0;
+        for (size_t group = 0; group < miss_group_experts.size(); ++group) {
+            if (is_hit[group] != 0) continue;
+            uint8_t* staged = direct_staging_ + static_cast<size_t>(scratch) * direct_stride_;
+            if (!source_->copy_blob(layer, miss_group_experts[group], staged)) {
+                err = "exl3 runtime: direct miss source copy failed";
+                return false;
+            }
+            const auto* layout = source_->exl3_layout(layer, miss_group_experts[group]);
+            const uint64_t bytes = layout != nullptr ? layout->total_bytes : 0;
+            dma_transfers_.push_back(DmaTransfer{scratch, assigned[group], bytes});
+            xfer_bytes += bytes;
+            ++scratch;
+        }
+        dma_group_slot_ = assigned;
+        int64_t staging_hits = 0;
+        for (char h : is_hit) staging_hits += h != 0 ? 1 : 0;
+        total_dma_staging_hits_ += staging_hits;
+        total_dma_staging_transfers_ += static_cast<int64_t>(dma_transfers_.size());
+        total_dma_staging_evictions_ += evictions;
+        total_dma_staging_bytes_ += xfer_bytes;
+        for (const auto& entries : miss_group_entries)
+            for (const int32_t entry : entries) {
+                std::fill(cpu_output + entry * ldy, cpu_output + entry * ldy + ldy, 0.0f);
+                ++dma_entries_;
+            }
+    } else if (direct_active) {
         for (size_t group = 0; group < miss_group_experts.size(); ++group) {
             uint8_t* staged = direct_staging_ + group * direct_stride_;
             if (!source_->copy_blob(layer, miss_group_experts[group], staged)) {
@@ -570,14 +712,10 @@ bool Exl3ExpertRuntime::prepare_window(int64_t layer, const float* host_fp32_x, 
                 return false;
             }
         }
-        for (size_t group = 0; group < miss_group_experts.size(); ++group) {
-            const auto* layout = source_->exl3_layout(layer, miss_group_experts[group]);
-            dma_sizes_.push_back(layout != nullptr ? layout->total_bytes : 0);
-        }
         for (const auto& entries : miss_group_entries)
             for (const int32_t entry : entries) {
                 std::fill(cpu_output + entry * ldy, cpu_output + entry * ldy + ldy, 0.0f);
-                if (dma_active) ++dma_entries_; else ++direct_entries_;
+                ++direct_entries_;
             }
     } else if (!miss_ids_.empty()) {
         source_->begin_layer(layer, miss_ids_.data(), static_cast<int64_t>(miss_ids_.size()));
@@ -625,7 +763,7 @@ bool Exl3ExpertRuntime::prepare_window(int64_t layer, const float* host_fp32_x, 
         for (size_t miss = 0; miss < miss_group_experts.size(); ++miss) {
             const size_t group = group_slots.size() + miss;
             const size_t at = pair_index(layer, miss_group_experts[miss]);
-            const uint8_t* staged = dma_active ? (dma_staging_ + miss * direct_stride_)
+            const uint8_t* staged = dma_active ? (dma_staging_ + static_cast<size_t>(dma_group_slot_[miss]) * direct_stride_)
                                                : (direct_staging_ + miss * direct_stride_);
             h_blob_base_[group] = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(staged));
             h_format_index_[group] = pair_format_index_[at];
@@ -683,14 +821,14 @@ bool Exl3ExpertRuntime::copy_plan(sycl::queue& queue, const std::vector<sycl::ev
         // the grouped kernel, which both depend on `copies`.  The copies therefore overlap whatever
         // the queue still holds from the previous layer while the host prepares the next window.
         if (dma_ready_ && dma_staging_ != nullptr && direct_staging_ != nullptr) {
-            for (size_t group = 0; group < dma_sizes_.size(); ++group) {
-                const uint64_t bytes = dma_sizes_[group];
-                if (bytes == 0) continue;
-                uint8_t* dst = dma_staging_ + group * direct_stride_;
-                const uint8_t* src = direct_staging_ + group * direct_stride_;
+            for (const auto& xfer : dma_transfers_) {
+                if (xfer.bytes == 0) continue;
+                uint8_t* dst = dma_staging_ + static_cast<size_t>(xfer.slot) * direct_stride_;
+                const uint8_t* src = direct_staging_ + static_cast<size_t>(xfer.scratch) * direct_stride_;
+                const size_t bytes = static_cast<size_t>(xfer.bytes);
                 copies.push_back(queue.submit([&](sycl::handler& h) {
                     if (!deps.empty()) h.depends_on(deps);
-                    h.memcpy(dst, src, static_cast<size_t>(bytes));
+                    h.memcpy(dst, src, bytes);
                 }));
             }
         }

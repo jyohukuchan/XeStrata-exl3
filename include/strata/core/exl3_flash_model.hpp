@@ -93,6 +93,8 @@ struct Exl3FlashModelOptions {
                                            ///< the bus instead of being computed on the CPU
     bool expert_miss_dma = false;          ///< misses are DMA-copied from pinned host memory into a
                                            ///< VRAM staging arena and computed by the GPU from VRAM
+    int64_t expert_dma_staging_mib = -1;   ///< DMA staging LRU budget: -1 derives it from the device's
+                                           ///< reported free VRAM, 0 keeps one window, >0 is MiB
     std::string embedding_name;            ///< empty: ModelMap's HF embedding prefix
     std::string ple_sidecar;              ///< empty: discover the specialized EXL3 sidecar
 };
@@ -244,6 +246,11 @@ public:
         int64_t cpu_miss_entries = 0;
         int64_t direct_miss_entries = 0;
         int64_t dma_miss_entries = 0;
+        int64_t dma_staging_hits = 0;
+        int64_t dma_staging_transfers = 0;
+        int64_t dma_staging_evictions = 0;
+        uint64_t dma_staging_bytes = 0;
+        int64_t dma_staging_capacity = 0;
         int64_t resident_pairs = 0;
     };
     ExpertCacheStats expert_cache_stats() const;

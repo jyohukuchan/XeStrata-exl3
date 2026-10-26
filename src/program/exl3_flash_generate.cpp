@@ -143,6 +143,8 @@ void usage() {
                  "  --expert-miss M     cpu (default): non-resident experts are computed on the CPU; direct: the GPU\n"
                  "                      reads non-resident experts from pinned host memory over the bus; dma: the GPU\n"
                  "                      DMA-copies non-resident experts from pinned memory into VRAM and computes there\n"
+                 "  --expert-dma-staging-mib N\n"
+                 "                      DMA staging LRU budget in MiB (-1: from the device's free VRAM, 0: one window)\n"
                  "  --spec 0..6         2..6 run the serial MTP draft loop with up to N-1 drafts per window; 0|1 stay plain AR\n"
                  "  --spec-window R     auto (default): size each window by expected tokens per ms (DraftPolicy);\n"
                  "                      min-p: size it by the --spec-min-p floor instead. The rules are alternatives:\n"
@@ -199,6 +201,7 @@ int exl3_flash_main(int argc, char** argv) {
     std::string expert_profile, expert_profile_save;
     bool expert_miss_direct = false;
     bool expert_miss_dma = false;
+    int64_t expert_dma_staging_mib = -1;
     int64_t max_new = 16, context = 0;
     bool stop_eos = false;
     int spec = 0, pool_workers = 0;
@@ -301,6 +304,12 @@ int exl3_flash_main(int argc, char** argv) {
                 return 2;
             }
         }
+        else if (argument == "--expert-dma-staging-mib") {
+            if (!parse_i64(next("--expert-dma-staging-mib"), expert_dma_staging_mib)) {
+                std::fprintf(stderr, "strata exl3-flash: --expert-dma-staging-mib must be an integer\n");
+                return 2;
+            }
+        }
         else if (argument == "--dump-logits") dump_path = next("--dump-logits");
         else if (argument == "--spec0") spec = 0;
         else if (argument == "--spec1") spec = 1;
@@ -395,6 +404,7 @@ int exl3_flash_main(int argc, char** argv) {
     options.expert_profile_save = expert_profile_save;
     options.expert_miss_direct = expert_miss_direct;
     options.expert_miss_dma = expert_miss_dma;
+    options.expert_dma_staging_mib = expert_dma_staging_mib;
     options.vision = false;
     std::string err;
     const Clock::time_point load_begin = Clock::now();
@@ -583,6 +593,16 @@ int exl3_flash_main(int argc, char** argv) {
                      (long long) cache.cpu_miss_entries, (long long) cache.direct_miss_entries,
                      (long long) cache.dma_miss_entries,
                      expert_miss_dma ? "dma" : expert_miss_direct ? "direct" : "cpu");
+        if (expert_miss_dma) {
+            const int64_t staged = cache.dma_staging_hits + cache.dma_staging_transfers;
+            std::fprintf(stderr,
+                         "strata (qwen4exp-exl3): dma staging: %lld slots, %lld hits (%.2f%%), %lld transfers, "
+                         "%lld evictions, %.2f GiB transferred\n",
+                         (long long) cache.dma_staging_capacity, (long long) cache.dma_staging_hits,
+                         staged > 0 ? 100.0 * static_cast<double>(cache.dma_staging_hits) / static_cast<double>(staged) : 0.0,
+                         (long long) cache.dma_staging_transfers, (long long) cache.dma_staging_evictions,
+                         (double) cache.dma_staging_bytes / 1073741824.0);
+        }
         if (!expert_profile_save.empty()) {
             std::string save_err;
             if (!model.save_expert_profile(expert_profile_save, save_err)) {

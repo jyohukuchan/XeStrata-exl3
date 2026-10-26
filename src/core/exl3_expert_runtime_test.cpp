@@ -348,6 +348,76 @@ int main() {
             }
         }
 
+        // DMA staging LRU: a second identical window reuses the staged expert (no new
+        // transfer), and a one-slot cache evicts across layers so each window transfers again.
+        {
+            strata::core::Exl3ExpertRuntime lru;
+            lru.set_miss_mode(strata::core::Exl3ExpertRuntime::MissMode::Dma);
+            lru.set_dma_staging_slots(4);
+            std::vector<float> lru_cpu(expected.size(), 24680.5f), lru_gpu(expected.size(), 24680.5f);
+            float* d_lru_gpu = device.upload(lru_gpu);
+            bool lru_ok = lru.open(source, pool, max_tokens, k, {{0, 0}, {1, 0}}, err);
+            for (int rep = 0; lru_ok && rep < 3; ++rep) {
+                std::fill(lru_cpu.begin(), lru_cpu.end(), 24680.5f);
+                std::fill(lru_gpu.begin(), lru_gpu.end(), 24680.5f);
+                strata::parity::copy_in(d_lru_gpu, lru_gpu.data(), lru_gpu.size());
+                sycl::event lru_done;
+                lru_ok = lru.prepare_window(0, x.data(), ldx, ids, max_tokens, lru_cpu.data(), ldy, err) &&
+                         lru.enqueue_hit_only(queue, d_x, ldx, d_lru_gpu, ldy, lru_done, {}, err) &&
+                         lru.run_cpu(err) && lru.wait_gpu(lru_done, err);
+                if (lru_ok) {
+                    strata::parity::copy_out(lru_gpu.data(), d_lru_gpu, lru_gpu.size());
+                    if (!compare_merged(lru_cpu, lru_gpu, expected, max_tokens * k, ldy, hidden,
+                                        "dma lru reuse merge"))
+                        lru_ok = false;
+                }
+            }
+            if (!lru_ok) {
+                std::fprintf(stderr, "dma lru reuse failed: %s\n", err.c_str());
+                ++failures;
+            } else if (lru.dma_staging_capacity() != 4 || lru.total_dma_staging_transfers() != 1 ||
+                       lru.total_dma_staging_hits() != 2 || lru.total_dma_staging_evictions() != 0) {
+                std::fprintf(stderr, "dma lru counters are wrong: cap=%lld xfer=%lld hits=%lld evict=%lld\n",
+                             (long long) lru.dma_staging_capacity(),
+                             (long long) lru.total_dma_staging_transfers(),
+                             (long long) lru.total_dma_staging_hits(),
+                             (long long) lru.total_dma_staging_evictions());
+                ++failures;
+            } else {
+                std::printf("dma lru reuse: OK\n");
+            }
+            // One slot: layer 0 and layer 1 misses (different pairs) evict each other.
+            strata::core::Exl3ExpertRuntime tiny;
+            tiny.set_miss_mode(strata::core::Exl3ExpertRuntime::MissMode::Dma);
+            tiny.set_dma_staging_slots(1);
+            bool tiny_ok = tiny.open(source, pool, max_tokens, k, {{0, 0}, {1, 0}}, err);
+            const int32_t ids_l1[] = {0, 1, 1, 0};
+            for (int rep = 0; tiny_ok && rep < 2; ++rep) {
+                for (int64_t layer = 0; layer < 2; ++layer) {
+                    std::vector<float> t_cpu(expected.size(), 24680.5f), t_gpu(expected.size(), 24680.5f);
+                    float* d_t_gpu = device.upload(t_gpu);
+                    sycl::event t_done;
+                    tiny_ok = tiny.prepare_window(layer, x.data(), ldx, ids_l1, max_tokens, t_cpu.data(), ldy, err) &&
+                              tiny.enqueue_hit_only(queue, d_x, ldx, d_t_gpu, ldy, t_done, {}, err) &&
+                              tiny.run_cpu(err) && tiny.wait_gpu(t_done, err);
+                    if (!tiny_ok) break;
+                }
+            }
+            if (!tiny_ok) {
+                std::fprintf(stderr, "dma lru eviction failed: %s\n", err.c_str());
+                ++failures;
+            } else if (tiny.total_dma_staging_transfers() != 4 || tiny.total_dma_staging_hits() != 0 ||
+                       tiny.total_dma_staging_evictions() != 3) {
+                std::fprintf(stderr, "dma lru eviction counters are wrong: xfer=%lld hits=%lld evict=%lld\n",
+                             (long long) tiny.total_dma_staging_transfers(),
+                             (long long) tiny.total_dma_staging_hits(),
+                             (long long) tiny.total_dma_staging_evictions());
+                ++failures;
+            } else {
+                std::printf("dma lru eviction: OK\n");
+            }
+        }
+
         // The all-resident graph reads device IDs on every replay, without a host plan update.
         strata::core::Exl3ExpertRuntime resident;
         if (!resident.open(source, pool, max_tokens, k, {{0, 0}, {0, 1}, {1, 0}, {1, 1}}, err) ||
