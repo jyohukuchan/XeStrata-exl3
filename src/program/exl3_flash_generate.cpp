@@ -442,10 +442,11 @@ int exl3_flash_main(int argc, char** argv) {
     const bool minp_rule = (spec_window == "min-p" || spec_min_p_given);
     strata::spec::DraftPolicy policy(spec > 1 ? spec : 1);
     policy.set_scale_all(minp_rule);
-    strata::core::Exl3FlashSnapshot snap;
     size_t spec_drafted = 0;
     size_t spec_accepted = 0;
     size_t spec_cut = 0;
+    size_t spec_windows = 0;
+    size_t spec_rejected = 0;
     const auto emit_token = [&](int32_t token) {
         generated.push_back(token);
         if (!dump_path.empty())
@@ -459,14 +460,18 @@ int exl3_flash_main(int argc, char** argv) {
         if (stop_eos && std::find(eos.begin(), eos.end(), emitted) != eos.end()) break;
         if (static_cast<int64_t>(generated.size()) >= max_new) break;
         if (use_spec && spec >= 2 && static_cast<int64_t>(generated.size()) + 1 < max_new) {
-            if (!model.save_snapshot(snap, err)) {
-                std::fprintf(stderr, "strata exl3-flash: snapshot: %s\n", err.c_str());
-                return 1;
-            }
+            // No snapshot is taken: every token emitted below is the output
+            // of a backbone forward run in AR order, so the KV state left by
+            // a verify IS the AR state.  A rejected verify's own output is
+            // the AR correction, which the old restore+replay recomputed
+            // with extra forwards; the MTP session keeps only draft-side
+            // state, which later drafts overwrite position by position.
+            ++spec_windows;
             int32_t cur = emitted;
             int64_t cur_pos = position;
             int attempted = 0;
             int accepted = 0;
+            int32_t rejected_fix = -1;
             bool window_done = false;
             std::vector<float> window_probs;
             for (int round = 1; round < spec && !window_done; ++round) {
@@ -485,7 +490,10 @@ int exl3_flash_main(int argc, char** argv) {
                     std::fprintf(stderr, "strata exl3-flash: verify position %lld: %s\n", (long long) cur_pos, err.c_str());
                     return 1;
                 }
-                if (draft != verified) break;
+                if (draft != verified) {
+                    rejected_fix = verified;
+                    break;
+                }
                 ++accepted;
                 ++spec_accepted;
                 cur = verified;
@@ -520,21 +528,20 @@ int exl3_flash_main(int argc, char** argv) {
                 position = cur_pos + 1;
                 continue;
             }
-            if (!model.restore_snapshot(snap, err)) {
-                std::fprintf(stderr, "strata exl3-flash: restore: %s\n", err.c_str());
-                return 1;
-            }
-            cur = emitted;
-            cur_pos = position;
-            for (int i = 0; i <= accepted; ++i) {
-                if (!model.forward(cur, cur_pos, cur, dump_path.empty() ? nullptr : logits.data(), err)) {
-                    std::fprintf(stderr, "strata exl3-flash: decode position %lld: %s\n", (long long) cur_pos, err.c_str());
+            if (attempted == 0) {
+                // No room was left for a draft; a plain AR step.
+                if (!model.forward(emitted, position, next_token, dump_path.empty() ? nullptr : logits.data(), err)) {
+                    std::fprintf(stderr, "strata exl3-flash: decode position %lld: %s\n", (long long) position, err.c_str());
                     return 1;
                 }
-                ++cur_pos;
+                ++position;
+                continue;
             }
-            next_token = cur;
-            position = cur_pos;
+            // A rejected verify already ran the AR correction in order, so
+            // it is emitted next with no restore and no replay.
+            ++spec_rejected;
+            next_token = rejected_fix;
+            position = cur_pos + 1;
             continue;
         }
         if (!model.forward(emitted, position, next_token, dump_path.empty() ? nullptr : logits.data(), err)) {
@@ -543,7 +550,6 @@ int exl3_flash_main(int argc, char** argv) {
         }
         ++position;
     }
-    strata::core::Exl3FlashModel::release_snapshot(snap);
     const Clock::time_point decode_end = Clock::now();
     if (!dump_path.empty() && !dump.good()) {
         std::fprintf(stderr, "strata exl3-flash: writing --dump-logits failed\n");
@@ -560,9 +566,11 @@ int exl3_flash_main(int argc, char** argv) {
                  load_s, prompt.size(), prompt_s, decode_tokens, decode_s,
                  static_cast<double>(decode_tokens) / std::max(decode_s, 1e-9));
     if (use_spec)
-        std::fprintf(stderr, "strata (qwen4exp-exl3): spec%d drafts %zu accepted %zu (%.1f %%)\n", spec,
-                     spec_drafted, spec_accepted,
-                     spec_drafted == 0 ? 0.0 : 100.0 * static_cast<double>(spec_accepted) / static_cast<double>(spec_drafted));
+        std::fprintf(stderr, "strata (qwen4exp-exl3): spec%d drafts %zu accepted %zu (%.1f %%), "
+                             "%zu windows, %zu rejected\n",
+                     spec, spec_drafted, spec_accepted,
+                     spec_drafted == 0 ? 0.0 : 100.0 * static_cast<double>(spec_accepted) / static_cast<double>(spec_drafted),
+                     spec_windows, spec_rejected);
     if (use_spec && minp_rule && spec_min_p > 0.0)
         std::fprintf(stderr, "strata (qwen4exp-exl3): spec-min-p %.3f cut %zu windows\n", spec_min_p, spec_cut);
     if (use_spec && !minp_rule)
